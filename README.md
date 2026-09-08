@@ -1,20 +1,9 @@
-# Tacho Bridge Application
+# Tacho Card Server
 
-![Tacho Bridge Application](src/assets/logo.svg 'Tacho Bridge Application')
+![Tacho Card Server](src/assets/logo.svg 'Tacho Card Server')
 
-The application is designed for use with the flespi platform. Communication with the server is organized through an MQTT channel 'tacho-bridge' that must be created in the user's account. Each card is should be represented in flespi as a separate device of type 'Tacho Bridge Card'.
-
-## Download
-
-You can always find the latest release here: [<kbd>↴ DOWNLOAD</kbd>](https://github.com/flespi-software/Tacho-Bridge-App/releases/latest)  
-### MAC
-- **tba_0.5.8_universal.dmg** _(All architectures machines)_
-
-### Windows
-- **tba_x.x.x_x64_en-US.msi** _(64-bit Windows machines)_
-
-### Linux
-- **tba_x.x.x_amd64.AppImage** _(64-bit Linux machines)_
+The application is based on [Tacho-Bridge-App](https://github.com/flespi-software/Tacho-Bridge-App/)
+It is designed for use with Astra Telematics vehicle tracking devices
 
 ## Specifications
 
@@ -32,13 +21,14 @@ Init project from the root directory
 npm install
 ```
 
-
 Cargo can be updated only from the ./src-tauri directory
+
 ```
 cargo update
 ```
 
 Then it is needed fetch Cargo dependeces from the rust directory
+
 ```
 cd src-tauri
 cargo fetch
@@ -51,9 +41,10 @@ npm run tauri dev
 ```
 
 Build
+
 ```
-# default build command for the current OS. 
-npm run tauri build 
+# default build command for the current OS.
+npm run tauri build
 
 # Build MacOS without signature and notarization.
 npm run tauri build -- --target aarch64-apple-darwin    # targets Apple silicon machines.
@@ -62,7 +53,9 @@ npm run tauri build -- --target universal-apple-darwin  # unversal app for x86 a
 ```
 
 ### MacOS code signing and notarization
+
 Сreate a .env file with the variables described below with the specified credentials. IMPORTANT: this file is added to .gitignore, it will not be sent to the repository for the security purposes.
+
 ```
 APPLE_IDENTITY="Developer ID Application: Your Name (YOUR_TEAM_ID)"
 APPLE_TEAM_ID=YOUR_TEAM_ID
@@ -72,36 +65,44 @@ APPLE_PASSWORD=your-app-specific-password
 # Enable notarization in Tauri 2.0
 ENABLE_NOTARIZE=true
 ```
-Then just run the *build-mac.sh* script which will check for the necessary variables, settings and start building a universal bundle that can run on all Mac architectures (x86 & ARM). The binary file will contain code for both architectures, the required one will be selected for launch.
+
+Then just run the _build-mac.sh_ script which will check for the necessary variables, settings and start building a universal bundle that can run on all Mac architectures (x86 & ARM). The binary file will contain code for both architectures, the required one will be selected for launch.
 
 If everything went well, you will see something like:
+
 ```
 🔄 Restoring original configuration
 ✅ Build completed successfully!
 📊 Application architecture information:
-Architectures in the fat file: ./src-tauri/target/universal-apple-darwin/release/bundle/macos/tba.app/Contents/MacOS/tacho-bridge-application are: x86_64 arm64 
+Architectures in the fat file: ./src-tauri/target/universal-apple-darwin/release/bundle/macos/tba.app/Contents/MacOS/tacho-bridge-application are: x86_64 arm64
 
 🏁 Script execution completed
 ```
 
 ### Linux building & using
+
 Minimum supported versions: **Ubuntu 22.04** / **Debian 12 (bookworm)** or newer.
 Tauri v2 requires `libwebkit2gtk-4.1-dev` which is not available on older distributions.
 
-To install system libraries you need *sudo* administrator rights. Please be careful when installing new packages and dependencies.
+To install system libraries you need _sudo_ administrator rights. Please be careful when installing new packages and dependencies.
 
 **[Tauri v2 Core Dependencies](https://v2.tauri.app/start/prerequisites/)**
+
 ```
 sudo apt install -y build-essential curl wget pkg-config file \
   libssl-dev libxdo-dev libudev-dev \
   libgtk-3-dev libwebkit2gtk-4.1-dev \
   libayatana-appindicator3-dev librsvg2-dev
 ```
+
 **PCSC Smart Card Support**
+
 ```
 sudo apt install -y pcscd libpcsclite-dev libccid usbutils
 ```
+
 **AppImage build dependencies**
+
 ```
 sudo apt install -y squashfs-tools fuse
 ```
@@ -125,13 +126,13 @@ npm run tauri icon src-tauri/icons/app-icon.png
 
 ## Usage
 
-TBA is a transparent APDU proxy between a remote Vehicle Unit (tachograph) and a physical tachograph card in a local smart card reader. The authentication ceremony is driven by the VU; TBA only relays bytes and extracts data that passes through.
+TCS is a transparent APDU proxy between a remote Vehicle Unit (tachograph) and a physical tachograph card in a local smart card reader. The authentication ceremony is driven by the VU; TCS only relays bytes and extracts data that passes through.
 
 ### Linking a card
 
-Before a card can be used, it must be linked in TBA:
+Before a card can be used, it must be linked in TCS:
 
-1. Insert the card into a reader. TBA detects it and shows its **ICCID**.
+1. Insert the card into a reader. TCS detects it and shows its **ICCID**.
 2. Click the **Add Card** button (or use link mode on the detected card) to bind the physical card to a **card number** in the config.
 3. Card numbers are 16 alphanumeric uppercase characters per Annex 1C regulation (EU 2016/799).
 
@@ -159,12 +160,12 @@ TBA does **not** hold any cryptographic keys (those are issued by EUR CA to cert
 
 Currently recognised files:
 
-| FID | File | Extracted fields |
-|-----|------|------------------|
-| `0520` | `EF_Identification` | cardExpiryDate → `expire`, companyName → `company_name`, companyAddress → `company_address` |
+| FID    | File                            | Extracted fields                                                                                                                             |
+| ------ | ------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------- |
+| `0520` | `EF_Identification`             | cardExpiryDate → `expire`, companyName → `company_name`, companyAddress → `company_address`                                                  |
 | `0501` | `EF_Application_Identification` | typeOfTachographCardId → `card_type`, cardStructureVersion → `structure_version` (keep highest on Gen2 cards that expose both Gen1 and Gen2) |
 
-If the card has never been authenticated through TBA, these fields stay `null` in the config and the UI shows only the fields that are available pre-auth (ICCID, card number, name).
+If the card has never been authenticated through TCS, these fields stay `null` in the config and the UI shows only the fields that are available pre-auth (ICCID, card number, name).
 
 ### Time storage and display
 

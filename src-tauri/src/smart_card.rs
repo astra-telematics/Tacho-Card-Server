@@ -7,7 +7,6 @@ use std::sync::Arc;
 use log::{debug, error, info, warn};
 use once_cell::sync::OnceCell;
 use lazy_static::lazy_static;
-use rumqttc::v5::AsyncClient;
 use tokio::time::Duration;
 
 use tauri::async_runtime::{JoinHandle, Mutex};
@@ -19,7 +18,6 @@ use pcsc::{Card, Protocols, State as PcscState};
 // ───── Local Modules ─────
 use crate::config::{get_from_cache, CacheSection};
 use crate::global_app_handle::card_emit_event;
-use crate::mqtt::{ensure_connection, remove_connections_all};
 
 // ───── Constants ─────
 const MAX_BUFFER_SIZE: usize = 260; // Buffer size for smart card communication.
@@ -33,12 +31,64 @@ type DynResult<T> = Result<T, DynError>;
 /// Represents a card currently being processed (i.e., connected and active).
 #[derive(Debug)]
 pub struct ProcessingCard {
-    pub client_id: String,              // It is Card number. Uses as client_id for mqtt connection
+    pub client_id: String,              // It is Card number. Was also used as the mqtt client_id before the MQTT client was removed.
     pub reader_name: Option<String>,    // Name of the smart card reader (e.g., "Alcor Micro AU9540 00 00").
     pub atr: Option<String>,            // ATR of the inserted card (hex-encoded).
-    #[allow(dead_code)] // to say the compiler does not warn about an unused field that is used in another file.
-    pub mqtt_client: AsyncClient,       // MQTT client instance.
     pub task_handle: JoinHandle<()>,    // Async task handle managing communication for this card.
+}
+
+/// Terminates the connections/tasks for the given client_ids and clears their entries
+/// from the task pool.
+pub async fn remove_connections(client_ids: Vec<String>) {
+    log::debug!("Removing connections for client_ids: {:?}", client_ids);
+
+    let mut task_pool = TASK_POOL.lock().await;
+
+    for client_id in client_ids {
+        if let Some(index) = task_pool.iter().position(|card| card.client_id == client_id) {
+            let card = task_pool.remove(index);
+            card.task_handle.abort();
+
+            // Drop any APDU sniffer state we accumulated for this client so the
+            // global HashMap does not grow without bound across reconnects.
+            crate::apdu_sniffer::forget(&card.client_id);
+
+            log::debug!(
+                "TASK_POOL: Connection terminated for client_id: {}, reader: {}, atr: {}",
+                card.client_id,
+                card.reader_name.as_deref().unwrap_or("unknown"),
+                card.atr.as_deref().unwrap_or("unknown"),
+            );
+        } else {
+            log::warn!(
+                "TASK_POOL: No active connection found for requested client_id: {}",
+                client_id
+            );
+            // Also clear any stale sniffer state, just in case (no-op if absent).
+            crate::apdu_sniffer::forget(&client_id);
+        }
+    }
+}
+
+/// Terminates all active card-related connections and clears the task pool.
+pub async fn remove_connections_all() {
+    log::info!("Removing all card connections...");
+
+    let mut task_pool = TASK_POOL.lock().await;
+
+    for card in task_pool.drain(..) {
+        log::debug!(
+            "TASK_POOL: Aborting task for client_id: {}, reader: {}, atr: {}",
+            card.client_id,
+            card.reader_name.as_deref().unwrap_or("unknown"),
+            card.atr.as_deref().unwrap_or("unknown"),
+        );
+        card.task_handle.abort();
+    }
+
+    crate::apdu_sniffer::forget_all();
+
+    log::info!("All card connections have been terminated and the task pool has been cleared.");
 }
 
 // ───── Statics ─────
@@ -166,13 +216,17 @@ async fn process_reader_states(reader_states: &mut [ReaderState]) -> Result<(), 
                         iccid = received_iccid;
                         card_number = get_from_cache(CacheSection::Cards, &iccid);
 
-                        ensure_connection(
-                            rs.name(),
-                            card_number.clone(),
-                            atr.clone(),
-                            managed_card,
-                        )
-                        .await;
+                        // TODO: this used to call mqtt::ensure_connection(), which opened an
+                        // MQTT connection for this card and relayed APDU commands over it
+                        // (publish/subscribe). Now that MQTT is gone, wire this up to the new
+                        // TCP server (socket_server) once its device protocol is defined —
+                        // `managed_card` is the live PCSC handle that relay needs.
+                        log::warn!(
+                            "Card {} (reader {:?}) detected but not relayed to any backend — TCP protocol not yet implemented",
+                            card_number,
+                            rs.name()
+                        );
+                        drop(managed_card);
                     }
                     Err(e) => {
                         log::error!("Failed to get ICCID: {}", e);

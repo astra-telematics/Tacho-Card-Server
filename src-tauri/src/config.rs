@@ -17,7 +17,7 @@ use tauri::Emitter;
 
 // ───── Local Modules ─────
 use crate::global_app_handle::emit_card_config_event;
-use crate::mqtt::remove_connections;
+use crate::smart_card::remove_connections;
 // use crate::smart_card::manual_sync_cards;
 
 /// Represents the configuration settings for the application.
@@ -29,6 +29,7 @@ pub struct ConfigurationFile {
     appearance: Option<AppearanceConfig>,   // Optional UI configuration settings.
     ident: Option<String>,                  // Optional ident for the application.
     server: Option<ServerConfig>,           // Optional server configuration settings.
+    tcp_server: Option<TcpServerConfig>,    // Optional TCP listen server configuration settings.
     cards: HashMap<String, CardConfig>,     // Hashmap of the cards with the CardConfig structure
 }
 
@@ -36,6 +37,27 @@ pub struct ConfigurationFile {
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct ServerConfig {
     pub host: String,
+}
+
+// TCP listen server configuration, part of ConfigurationFile. Edit config.yaml directly
+// to change these — there is no frontend/CLI for it yet.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct TcpServerConfig {
+    /// Address/port to bind, e.g. "0.0.0.0:7878".
+    pub bind_addr: String,
+    /// Soft cap on concurrent connections (see `socket_server::run`'s doc comment) —
+    /// not a hard limit, just the point past which new connections get flagged for a
+    /// "try again shortly" response.
+    pub soft_connection_limit: usize,
+}
+
+impl Default for TcpServerConfig {
+    fn default() -> Self {
+        TcpServerConfig {
+            bind_addr: "0.0.0.0:7878".to_string(),
+            soft_connection_limit: 1000,
+        }
+    }
 }
 
 // Dark Theme enum, part of AppearanceConfig that contains data about the theme.
@@ -378,7 +400,7 @@ pub async fn remove_card_from_config(
 /// Public function to update the server address in the configuration.
 /// This function is a Tauri command that updates the configuration file with a new server address.
 #[tauri::command]
-pub fn update_server(host: &str, ident: &str, theme: &str) -> bool {
+pub fn update_server(listenPort: &uint16, connectionLimit: &uint16, theme: &str) -> bool {
     let config_path = match get_config_path() {
         Ok(path) => path,
         Err(e) => {
@@ -387,9 +409,9 @@ pub fn update_server(host: &str, ident: &str, theme: &str) -> bool {
         }
     };
 
-    match update_server_config(&config_path, host, ident, theme) {
+    match update_server_config(&config_path, listenPort, connectionLimit, theme) {
         Ok(_) => {
-            log::info!("The server address is updated to '{}'.", host);
+            log::info!("The server configuration is updated: listenPort={}, connectionLimit={}, theme={}", listenPort, connectionLimit, theme);
             true
         }
         Err(e) => {
@@ -410,6 +432,7 @@ pub fn update_server(host: &str, ident: &str, theme: &str) -> bool {
 pub struct CacheConfigData {
     pub cards: HashMap<String, CardConfig>,
     pub server: Option<ServerConfig>,
+    pub tcp_server: Option<TcpServerConfig>,
     pub ident: Option<String>,
     pub appearance: Option<AppearanceConfig>,
 }
@@ -468,6 +491,17 @@ pub async fn record_auth_result_async(card_number: &str, success: bool) {
     {
         log::error!("record_auth_result_async: spawn_blocking failed: {:?}", e);
     }
+}
+
+/// Returns the TCP listen server config from the runtime cache, falling back to
+/// `TcpServerConfig::default()` if it's missing (e.g. an older config.yaml written
+/// before this section existed).
+pub fn get_tcp_server_config() -> TcpServerConfig {
+    let cache = CACHE.lock().unwrap();
+    cache.tcp_server.clone().unwrap_or_else(|| {
+        log::warn!("No tcp_server config found in cache; using defaults");
+        TcpServerConfig::default()
+    })
 }
 
 /// Retrieves a value from the cache by key.
@@ -580,6 +614,7 @@ pub fn load_config_to_cache(
     *cache = CacheConfigData {
         cards: config.cards.clone(),
         server: config.server.clone(),
+        tcp_server: config.tcp_server.clone(),
         ident: config.ident.clone(),
         appearance: config.appearance.clone(),
     };
@@ -685,6 +720,7 @@ fn generate_default_config() -> ConfigurationFile {
         }),
         ident: Some(generate_ident()),
         server: None,
+        tcp_server: Some(TcpServerConfig::default()),
         cards: HashMap::new(),
     }
 }
@@ -736,6 +772,7 @@ mod tests {
             server: Some(ServerConfig {
                 host: "mqtt.example.com:8883".to_string(),
             }),
+            tcp_server: Some(TcpServerConfig::default()),
             cards,
         }
     }

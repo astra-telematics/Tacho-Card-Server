@@ -134,8 +134,7 @@ pub async fn app_connection() {
     // Create a new asynchronous MQTT client and its associated event loop
     // `mqtt_options` specifies the configuration for the MQTT connection
     // `10` is the capacity of the internal channel used by the event loop for buffering operations
-    let (mqtt_client, mut eventloop) = AsyncClient::new(mqtt_options, 10);
-    let mqtt_clinet_cloned = mqtt_client.clone();
+    let (_mqtt_client, mut eventloop) = AsyncClient::new(mqtt_options, 10);
     let log_header: String = format!("{} |", client_id);
     let client_id_for_task = client_id.clone();
 
@@ -227,7 +226,6 @@ pub async fn app_connection() {
         client_id,
         reader_name: None,
         atr: None,
-        mqtt_client: mqtt_clinet_cloned,
         task_handle: handle,
     });
 

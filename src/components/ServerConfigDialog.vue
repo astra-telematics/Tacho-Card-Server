@@ -6,46 +6,21 @@
       </q-card-section>
 
       <q-card-section class="q-pt-none">
-        <q-input
-          label="App ident"
-          dense
-          v-model="identInput"
-          autofocus
-          @keyup.enter="$emit('update:modelValue', false)"
-          :error="!isIdentValid"
-          error-message="The identifier must have the prefix TBA + 13 digits. For example: TBA0000000000001."
-        />
-        <q-input
-          label="Server address"
-          dense
-          v-model="hostValue"
-          @keyup.enter="$emit('update:modelValue', false)"
-        />
+        <q-input label="Listen Port" dense v-model="hostValue" @keyup.enter="$emit('update:modelValue', false)" />
+        <q-input label="Connection Limit" dense v-model="connectionLimitValue"
+          @keyup.enter="$emit('update:modelValue', false)" />
         <div class="q-mt-md row items-center">
           <div class="text-caption text-grey q-mr-md">Theme</div>
-          <q-btn-toggle
-            v-model="selectedTheme"
-            no-caps
-            rounded
-            unelevated
-            toggle-color="primary"
-            :options="[
-              { icon: 'mdi-white-balance-sunny', value: 'Light' },
-              { icon: 'mdi-brightness-auto', value: 'Auto' },
-              { icon: 'mdi-weather-night', value: 'Dark' },
-            ]"
-            @update:model-value="changeTheme"
-          />
+          <q-btn-toggle v-model="selectedTheme" no-caps rounded unelevated toggle-color="primary" :options="[
+            { icon: 'mdi-white-balance-sunny', value: 'Light' },
+            { icon: 'mdi-brightness-auto', value: 'Auto' },
+            { icon: 'mdi-weather-night', value: 'Dark' },
+          ]" @update:model-value="changeTheme" />
         </div>
       </q-card-section>
       <q-card-actions align="right" class="text-primary">
         <q-btn flat label="Cancel" v-close-popup />
-        <q-btn
-          flat
-          label="Save"
-          v-close-popup
-          @click="saveServerConfig"
-        />
+        <q-btn flat label="Save" v-close-popup @click="saveServerConfig" />
       </q-card-actions>
     </q-card>
   </q-dialog>
@@ -65,17 +40,8 @@ defineEmits<{
   'update:modelValue': [value: boolean]
 }>()
 
-const TBA_IDENT_REGEXP = /^TBA\d{13}$/
-const ident = ref('')
-const identInput = computed({
-  get: () => `TBA${ident.value}`,
-  set: (val) => {
-    ident.value = val.replace(/^TBA/, '')
-  },
-})
-const isIdentValid = computed(() => TBA_IDENT_REGEXP.test(identInput.value))
-
-const hostValue = ref('')
+const listenPortValue = ref(7878)
+const connectionLimitValue = ref(1000)
 
 const $q = useQuasar()
 const selectedTheme = ref('')
@@ -97,12 +63,12 @@ const changeTheme = (value: string) => {
 }
 
 const saveServerConfig = async () => {
-  console.log(`server_address: ${hostValue.value}, ident: ${identInput.value}, theme: ${selectedTheme.value}`)
+  console.log(`listen_port: ${listenPortValue.value}, theme: ${selectedTheme.value}`)
 
   try {
     const response = await invoke('update_server', {
-      host: hostValue.value,
-      ident: identInput.value,
+      listenPort: listenPortValue.value,
+      connectionLimit: connectionLimitValue.value,
       theme: selectedTheme.value,
     })
 
@@ -136,14 +102,15 @@ const saveServerConfig = async () => {
 // Listen for config updates from backend
 listen('global-config-server', (event) => {
   const payload = event.payload as {
-    host: string
-    ident: string
+    listenPort: number
+    connectionLimit: number
     dark_theme: string
   }
-  console.log('host:', payload.host, 'ident:', payload.ident, 'dark_theme:', payload.dark_theme)
+  console.log('listenPort:', payload.listenPort, 'connectionLimit:', payload.connectionLimit, 'dark_theme:', payload.dark_theme)
 
-  hostValue.value = payload.host
-  identInput.value = payload.ident
+  listenPortValue.value = payload.listenPort
+  connectionLimitValue.value = payload.connectionLimit
+
 
   changeTheme(payload.dark_theme)
   selectedTheme.value = payload.dark_theme

@@ -1,8 +1,8 @@
 {
-  "name": "tacho-bridge-application",
-  "version": "0.7.3",
+  "name": "tacho-card-server",
+  "version": "0.0.1",
   "description": "Tachograph authentication application",
-  "productName": "Tacho Bridge Application",
+  "productName": "Tacho Card Server",
   "author": "shev <shev@gurtam.com>",
   "type": "module",
   "private": true,
