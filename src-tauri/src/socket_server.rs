@@ -25,12 +25,12 @@ use tokio::net::{TcpListener, TcpStream};
 /// as over the soft limit. `handle_connection` currently just logs and closes those —
 /// once the device protocol is defined, that's where a "try again shortly" / busy
 /// response should be written before closing.
-pub async fn run(bind_addr: &str, soft_connection_limit: usize) -> io::Result<()> {
-    let listener = TcpListener::bind(bind_addr).await?;
+pub async fn run(listen_port: u16, connection_limit: u16) -> io::Result<()> {
+    let listener = TcpListener::bind(("0.0.0.0", listen_port)).await?;
     log::info!(
-        "[TCP] phase=listen status=bound addr={} soft_connection_limit={}",
-        bind_addr,
-        soft_connection_limit
+        "[TCP] phase=listen status=bound addr=0.0.0.0:{} connection_limit={}",
+        listen_port,
+        connection_limit
     );
 
     let active_connections = Arc::new(AtomicUsize::new(0));
@@ -55,7 +55,7 @@ pub async fn run(bind_addr: &str, soft_connection_limit: usize) -> io::Result<()
         }
 
         let count = active_connections.fetch_add(1, Ordering::Relaxed) + 1;
-        let over_soft_limit = count > soft_connection_limit;
+        let over_soft_limit = count > connection_limit as usize;
         log::info!(
             "[TCP] phase=connect status=accepted peer={} active_connections={} over_soft_limit={}",
             peer_addr,

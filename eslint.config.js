@@ -15,7 +15,7 @@ export default [
      *
      * ESLint requires "ignores" key to be the only one in this object
      */
-    ignores: ['src-tauri/target/**'],
+    ignores: ['src-tauri/target/**', 'src-tauri/check/**'],
   },
 
   ...pluginQuasar.configs.recommended(),

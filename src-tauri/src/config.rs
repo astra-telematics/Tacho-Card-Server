@@ -27,37 +27,15 @@ pub struct ConfigurationFile {
     version: String,                        // The version of the application.
     description: String,                    // A brief description of the application.
     appearance: Option<AppearanceConfig>,   // Optional UI configuration settings.
-    ident: Option<String>,                  // Optional ident for the application.
     server: Option<ServerConfig>,           // Optional server configuration settings.
-    tcp_server: Option<TcpServerConfig>,    // Optional TCP listen server configuration settings.
     cards: HashMap<String, CardConfig>,     // Hashmap of the cards with the CardConfig structure
 }
 
 // Server Configuration structure, part of ConfigurationFile that contains data about the server.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct ServerConfig {
-    pub host: String,
-}
-
-// TCP listen server configuration, part of ConfigurationFile. Edit config.yaml directly
-// to change these — there is no frontend/CLI for it yet.
-#[derive(Serialize, Deserialize, Clone, Debug)]
-pub struct TcpServerConfig {
-    /// Address/port to bind, e.g. "0.0.0.0:7878".
-    pub bind_addr: String,
-    /// Soft cap on concurrent connections (see `socket_server::run`'s doc comment) —
-    /// not a hard limit, just the point past which new connections get flagged for a
-    /// "try again shortly" response.
-    pub soft_connection_limit: usize,
-}
-
-impl Default for TcpServerConfig {
-    fn default() -> Self {
-        TcpServerConfig {
-            bind_addr: "0.0.0.0:7878".to_string(),
-            soft_connection_limit: 1000,
-        }
-    }
+    pub listen_port: u16,
+    pub connection_limit: u16,
 }
 
 // Dark Theme enum, part of AppearanceConfig that contains data about the theme.
@@ -309,16 +287,16 @@ pub fn update_card(cardnumber: &str, content: CardConfig) -> bool {
 /// This function updates the configuration file with a new server address.
 pub fn update_server_config(
     config_path: &Path,
-    host: &str,
-    ident: &str,
+    listen_port: u16,
+    connection_limit: u16,
     theme: &str,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut config = load_config(config_path)?;
 
     config.server = Some(ServerConfig {
-        host: host.to_string(),
+        listen_port,
+        connection_limit,
     });
-    config.ident = Some(ident.to_string());
     config.appearance = Some(AppearanceConfig {
         dark_theme: match theme {
             "Auto" => DarkTheme::Auto,
@@ -400,7 +378,7 @@ pub async fn remove_card_from_config(
 /// Public function to update the server address in the configuration.
 /// This function is a Tauri command that updates the configuration file with a new server address.
 #[tauri::command]
-pub fn update_server(listenPort: &uint16, connectionLimit: &uint16, theme: &str) -> bool {
+pub fn update_server(listenPort: u16, connectionLimit: u16, theme: &str) -> bool {
     let config_path = match get_config_path() {
         Ok(path) => path,
         Err(e) => {
@@ -432,8 +410,6 @@ pub fn update_server(listenPort: &uint16, connectionLimit: &uint16, theme: &str)
 pub struct CacheConfigData {
     pub cards: HashMap<String, CardConfig>,
     pub server: Option<ServerConfig>,
-    pub tcp_server: Option<TcpServerConfig>,
-    pub ident: Option<String>,
     pub appearance: Option<AppearanceConfig>,
 }
 
@@ -448,7 +424,6 @@ lazy_static! {
 pub enum CacheSection {
     Cards,
     Server,
-    Ident,
     Appearance
 }
 
@@ -493,17 +468,6 @@ pub async fn record_auth_result_async(card_number: &str, success: bool) {
     }
 }
 
-/// Returns the TCP listen server config from the runtime cache, falling back to
-/// `TcpServerConfig::default()` if it's missing (e.g. an older config.yaml written
-/// before this section existed).
-pub fn get_tcp_server_config() -> TcpServerConfig {
-    let cache = CACHE.lock().unwrap();
-    cache.tcp_server.clone().unwrap_or_else(|| {
-        log::warn!("No tcp_server config found in cache; using defaults");
-        TcpServerConfig::default()
-    })
-}
-
 /// Retrieves a value from the cache by key.
 /// This function locks the cache, retrieves the value for the given key, and returns it.
 pub fn get_from_cache(section: CacheSection, key: &str) -> String {
@@ -541,9 +505,10 @@ pub fn get_from_cache(section: CacheSection, key: &str) -> String {
         CacheSection::Server => {
             log::debug!("Accessing Server config");
             if let Some(server) = &cache.server {
-                log::debug!("Server config: host = {}", server.host);
+                log::debug!("Server config: listen port = {}, connection limit = {}", server.listen_port, server.connection_limit);
                 match key {
-                    "host" => server.host.clone(),
+                    "listen_port" => server.listen_port.to_string(),
+                    "connection_limit" => server.connection_limit.to_string(),
                     _ => {
                         log::debug!("Unknown key for server section: {}", key);
                         "".to_string()
@@ -551,17 +516,6 @@ pub fn get_from_cache(section: CacheSection, key: &str) -> String {
                 }
             } else {
                 log::debug!("No server config found");
-                "".to_string()
-            }
-        }
-
-        CacheSection::Ident => {
-            log::debug!("Accessing Ident config");
-            if let Some(ident) = &cache.ident {
-                log::debug!("Ident: {}", ident);
-                ident.clone()
-            } else {
-                log::debug!("No ident found");
                 "".to_string()
             }
         }
@@ -614,8 +568,6 @@ pub fn load_config_to_cache(
     *cache = CacheConfigData {
         cards: config.cards.clone(),
         server: config.server.clone(),
-        tcp_server: config.tcp_server.clone(),
-        ident: config.ident.clone(),
         appearance: config.appearance.clone(),
     };
 
@@ -718,9 +670,7 @@ fn generate_default_config() -> ConfigurationFile {
         appearance: Some(AppearanceConfig {
             dark_theme: DarkTheme::Auto,
         }),
-        ident: Some(generate_ident()),
         server: None,
-        tcp_server: Some(TcpServerConfig::default()),
         cards: HashMap::new(),
     }
 }
@@ -768,11 +718,10 @@ mod tests {
             appearance: Some(AppearanceConfig {
                 dark_theme: DarkTheme::Auto,
             }),
-            ident: Some("TBA0000000000001".to_string()),
             server: Some(ServerConfig {
-                host: "mqtt.example.com:8883".to_string(),
+                listen_port: 7878,
+                connection_limit: 1000,
             }),
-            tcp_server: Some(TcpServerConfig::default()),
             cards,
         }
     }
@@ -792,8 +741,12 @@ mod tests {
         assert_eq!(card.card_type, Some(4));
         assert_eq!(card.last_auth, Some((1_700_000_500, true)));
         assert_eq!(
-            loaded.server.as_ref().map(|s| s.host.as_str()),
-            Some("mqtt.example.com:8883")
+            loaded.server.as_ref().map(|s| s.listen_port),
+            Some(7878)
+        );
+        assert_eq!(
+            loaded.server.as_ref().map(|s| s.connection_limit),
+            Some(1000)
         );
 
         let _ = fs::remove_dir_all(&dir);
@@ -866,9 +819,6 @@ mod tests {
         assert!(!cfg.name.is_empty());
         assert!(!cfg.version.is_empty());
         assert!(cfg.cards.is_empty());
-        let ident = cfg.ident.expect("default ident");
-        assert!(ident.starts_with("TBA"));
-        assert_eq!(ident.len(), 3 + 13);
     }
 
     #[test]
@@ -904,13 +854,11 @@ pub fn emit_global_config_server(app: &tauri::AppHandle) -> Result<(), Box<dyn E
     // so the value cannot be fully transferred to ownership.
 
     // Gettting Host value from the "operation cahce" with the ServerConfig structure
-    let host = get_from_cache(CacheSection::Server, "host");
-    let ident = get_from_cache(CacheSection::Ident, "ident");
+    let listen_port = get_from_cache(CacheSection::Server, "listen_port");
     let appearance = get_from_cache(CacheSection::Appearance, "dark_theme");
 
     let mut config_app_payload = HashMap::new();
-    config_app_payload.insert("host", host);
-    config_app_payload.insert("ident", ident);
+    config_app_payload.insert("listen_port", listen_port);
     config_app_payload.insert("dark_theme", appearance);
 
     // Emit this data as a global event to update fornt-end fields

@@ -1,7 +1,6 @@
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 
 // ───── Modules ─────
-mod app_connect;        // Application connection to the MQTT broker.
 mod config;             // Configuration handling.
 mod logger;             // Logging functionality.
 mod smart_card;         // PCSC module for smart card operations.
@@ -11,7 +10,9 @@ mod socket_server;      // TCP listen server (replacement for the outbound MQTT 
 // mod com_port;          // COM port handling.
 
 // ───── External Crates ─────
-use tauri::{async_runtime, Listener, Manager, WindowEvent}; // Tauri application framework and async runtime.
+use tauri::{async_runtime, Listener, Manager, WindowEvent};
+
+use crate::config::{CacheSection, get_from_cache}; // Tauri application framework and async runtime.
 
 pub fn run() {
     // Headless mode: run the card-monitoring / MQTT backend with no window or tray,
@@ -85,18 +86,14 @@ pub fn run() {
                     });
 
                     async_runtime::spawn(async {
-                        // Start Main MQTT App client connection
-                        app_connect::app_connection().await;
-                    });
-
-                    async_runtime::spawn(async {
                         // Start the TCP listen server (replacement for the outbound MQTT client).
                         // bind_addr / soft_connection_limit are configurable via the
                         // `tcp_server` section of config.yaml.
-                        let tcp_server_config = config::get_tcp_server_config();
+                        let listen_port: u16 = get_from_cache(CacheSection::Server, "listen_port").parse().expect("Invalid listen_port in cache");
+                        let max_connections: u16 = get_from_cache(CacheSection::Server, "connection_limit").parse().expect("Invalid connection_limit in cache");
                         if let Err(e) = socket_server::run(
-                            &tcp_server_config.bind_addr,
-                            tcp_server_config.soft_connection_limit,
+                            listen_port,
+                            max_connections,
                         )
                         .await
                         {
@@ -136,7 +133,6 @@ pub fn run() {
             config::update_server,         // update server config from the frontend
             config::remove_card,            // remove card from config
             smart_card::manual_sync_cards, // manual sync cards from the frontend
-            app_connect::app_connection,     // App connection to the MQTT broker
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -166,14 +162,14 @@ fn run_headless() {
     });
 
     async_runtime::spawn(async {
-        app_connect::app_connection().await;
-    });
-
-    async_runtime::spawn(async {
-        let tcp_server_config = config::get_tcp_server_config();
+        // Start the TCP listen server (replacement for the outbound MQTT client).
+        // bind_addr / soft_connection_limit are configurable via the
+        // `tcp_server` section of config.yaml.
+        let listen_port: u16 = get_from_cache(CacheSection::Server, "listen_port").parse().expect("Invalid listen_port in cache");
+        let max_connections: u16 = get_from_cache(CacheSection::Server, "connection_limit").parse().expect("Invalid connection_limit in cache");
         if let Err(e) = socket_server::run(
-            &tcp_server_config.bind_addr,
-            tcp_server_config.soft_connection_limit,
+            listen_port,
+            max_connections,
         )
         .await
         {
