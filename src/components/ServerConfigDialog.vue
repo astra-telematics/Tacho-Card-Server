@@ -4,18 +4,12 @@
     persistent
     @update:model-value="$emit('update:modelValue', $event)"
   >
-    <q-card style="width: 560px; max-width: 95vw">
-      <q-card-section class="row items-center q-pb-sm">
-        <q-icon name="mdi-cog" size="28px" color="primary" class="q-mr-sm" />
-        <div class="text-h6">Settings</div>
-        <q-space />
-        <q-btn flat round dense icon="mdi-close" v-close-popup />
+    <q-card style="min-width: 350px">
+      <q-card-section>
+        <div class="text-h6">Server configuration</div>
       </q-card-section>
 
-      <q-separator />
-
-      <q-card-section class="q-pt-md q-pb-sm">
-        <div class="text-subtitle2 text-grey-7 q-mb-sm">Server</div>
+      <q-card-section class="q-pt-none">
         <q-input
           label="Listen Port"
           dense
@@ -27,162 +21,43 @@
           dense
           v-model="connectionLimitValue"
           @keyup.enter="$emit('update:modelValue', false)"
-        >
-          <template v-slot:prepend>
-            <q-icon name="mdi-server-network" size="xs" />
-          </template>
-        </q-input>
-      </q-card-section>
-
-      <q-separator inset />
-
-      <q-card-section class="q-py-sm">
-        <div class="text-subtitle2 text-grey-7 q-mb-sm">Appearance</div>
-        <q-btn-toggle
-          :model-value="themeMode"
-          dense
-          unelevated
-          toggle-color="primary"
-          :options="[
-            { label: 'Auto', value: 'Auto', icon: 'mdi-brightness-auto' },
-            { label: 'Light', value: 'Light', icon: 'mdi-white-balance-sunny' },
-            { label: 'Dark', value: 'Dark', icon: 'mdi-weather-night' },
-          ]"
-          @update:model-value="onThemeSelected"
         />
-      </q-card-section>
-
-      <q-separator inset />
-
-      <q-card-section class="q-py-sm">
-        <div class="text-subtitle2 text-grey-7 q-mb-sm">System</div>
-        <!-- Applies immediately (like the theme), no Save needed: the OS is
-             the source of truth, the state is re-read every dialog open. -->
-        <q-toggle
-          :model-value="autostartEnabled"
-          label="Launch at system startup"
-          dense
-          class="q-mb-sm"
-          @update:model-value="onAutostartToggled"
-        >
-          <q-tooltip anchor="bottom middle" self="top middle" max-width="320px">
-            Starts the application automatically when you log in, minimized to the tray. Recommended
-            for unattended machines with a card rack.
-          </q-tooltip>
-        </q-toggle>
-      </q-card-section>
-
-      <q-separator inset />
-
-      <q-card-section class="q-py-sm">
-        <div class="text-subtitle2 text-grey-7 q-mb-sm">Updates</div>
-        <q-toggle
-          v-model="betaUpdates"
-          label="Receive pre-release updates (alpha/beta)"
-          dense
-          class="q-mb-sm"
-        />
-        <q-toggle
-          v-model="autoInstallUpdates"
-          label="Automatically install new updates"
-          dense
-          class="q-mb-sm"
-        >
-          <q-tooltip anchor="bottom middle" self="top middle" max-width="320px">
-            Checks for updates hourly and installs them without asking. The application restarts on
-            its own, waiting for a pause in card activity so an authentication in progress is never
-            interrupted.
-          </q-tooltip>
-        </q-toggle>
-        <div class="row q-gutter-sm">
-          <q-btn
-            outline
-            dense
+        <div class="q-mt-md row items-center">
+          <div class="text-caption text-grey q-mr-md">Theme</div>
+          <q-btn-toggle
+            v-model="selectedTheme"
             no-caps
-            color="primary"
-            icon="mdi-update"
-            label="Check for updates"
-            :loading="checking"
-            @click="checkForUpdates"
-          />
-          <q-btn
-            outline
-            dense
-            no-caps
-            color="grey-7"
-            icon="mdi-text-box-outline"
-            label="Changelog"
-            @click="openChangelog"
+            rounded
+            unelevated
+            toggle-color="primary"
+            :options="[
+              { icon: 'mdi-white-balance-sunny', value: 'Light' },
+              { icon: 'mdi-brightness-auto', value: 'Auto' },
+              { icon: 'mdi-weather-night', value: 'Dark' },
+            ]"
+            @update:model-value="changeTheme"
           />
         </div>
       </q-card-section>
-
-      <q-card-actions align="right" class="q-px-md q-pb-md">
-        <q-btn flat label="Cancel" color="grey-7" v-close-popup />
-        <!-- No v-close-popup: the dialog closes from saveServerConfig only after
-             the settings are confirmed persisted; on failure it stays open so
-             the user can see the error and retry. -->
-        <q-btn
-          unelevated
-          rounded
-          label="Save"
-          color="primary"
-          :loading="saving"
-          @click="saveServerConfig"
-        />
+      <q-card-actions align="right" class="text-primary">
+        <q-btn flat label="Cancel" v-close-popup />
+        <q-btn flat label="Save" v-close-popup @click="saveServerConfig" />
       </q-card-actions>
-    </q-card>
-  </q-dialog>
-
-  <q-dialog v-model="changelogOpen">
-    <!-- A dialog cannot outgrow the app window (it is part of the webview
-         page), so it takes nearly the whole window instead. -->
-    <q-card class="column no-wrap" style="width: 95vw; max-width: 95vw; height: 90vh">
-      <q-card-section class="row items-center q-pb-sm col-auto">
-        <q-icon name="mdi-text-box-outline" size="24px" color="primary" class="q-mr-sm" />
-        <div class="text-h6">Changelog</div>
-        <q-space />
-        <q-btn flat round dense icon="mdi-close" v-close-popup />
-      </q-card-section>
-      <q-separator />
-      <q-card-section class="col q-pt-sm" style="overflow-y: auto">
-        <div v-for="section in changelogSections" :key="section.title" class="q-mb-md">
-          <div class="text-subtitle2 text-primary">{{ section.title }}</div>
-          <!-- Group headers (🛠 Fixes / 🆕 Features) in bold; entries as a
-               bulleted list with a hanging indent so multi-line entries stay
-               visually separated. overflow-wrap: long unbreakable strings
-               (URLs) must wrap instead of stretching the card sideways. -->
-          <template v-for="(item, i) in section.lines" :key="i">
-            <div v-if="/^[🛠🆕]/u.test(item.text)" class="text-body2 text-weight-bold q-mt-sm">
-              {{ item.text }}
-            </div>
-            <div v-else-if="item.bullet" class="row no-wrap q-ml-sm q-mb-xs">
-              <span class="q-mr-sm">•</span>
-              <span class="text-body2" style="overflow-wrap: anywhere">{{ item.text }}</span>
-            </div>
-            <div v-else class="text-body2 q-ml-sm" style="overflow-wrap: anywhere">
-              {{ item.text }}
-            </div>
-          </template>
-        </div>
-      </q-card-section>
     </q-card>
   </q-dialog>
 </template>
 
 <script setup lang="ts">
-import { useQuasar } from 'quasar'
-import { ref, computed, watch, onMounted } from 'vue'
+import { useQuasar, Notify } from 'quasar'
+import { ref } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
-import { useTauriListeners } from 'src/composables/useTauriListeners'
-import { notifyError, notifyWarn, notifySuccess, TOAST_SHORT } from 'src/composables/notify'
-import { TBA_IDENT_REGEXP } from 'src/components/models'
+import { listen } from '@tauri-apps/api/event'
 
-const props = defineProps<{
+defineProps<{
   modelValue: boolean
 }>()
 
-const emit = defineEmits<{
+defineEmits<{
   'update:modelValue': [value: boolean]
 }>()
 
@@ -190,93 +65,27 @@ const listenPortValue = ref(7878)
 const connectionLimitValue = ref(1000)
 
 const $q = useQuasar()
+const selectedTheme = ref('')
 
-// Theme selector. Applies and persists immediately on a user's choice (like
-// the old header button did). Persistence hangs off the control's update
-// event — not a watcher — so seeding the ref from the config on mount cannot
-// trigger a redundant re-persist.
-type ThemeMode = 'Auto' | 'Light' | 'Dark'
-const themeMode = ref<ThemeMode>('Auto')
-function onThemeSelected(mode: ThemeMode) {
-  themeMode.value = mode
-  if (mode === 'Auto') $q.dark.set('auto')
-  else $q.dark.set(mode === 'Dark')
-  // update_theme resolves with `false` on a persistence failure instead of
-  // rejecting — check the value, or a read-only config dir would fail silently.
-  invoke<boolean>('update_theme', { theme: mode })
-    .then((ok) => {
-      if (!ok) throw new Error('the backend could not persist the theme')
-    })
-    .catch((error) => {
-      console.error('Failed to persist theme:', error)
-      notifyError('Theme was applied but not saved', error)
-    })
-}
-
-// Forced update check. An available update raises the standard `update`
-// notification from the backend; here we only need to voice "up to date".
-const checking = ref(false)
-const checkForUpdates = async () => {
-  checking.value = true
-  try {
-    // Pass the on-screen channel toggle so the check honors it before Save.
-    const result = await invoke<{ status: string; version: string }>('check_updates_now', {
-      betaUpdates: betaUpdates.value,
-    })
-    if (result.status === 'up_to_date') {
-      notifySuccess(`You are running the latest version (${result.version}).`)
-    }
-  } catch (error) {
-    console.error('Update check failed:', error)
-    // A channel without a published manifest yet (e.g. the stable channel
-    // before the first stable release ships one) is not a scary failure.
-    const raw = String(error)
-    const noManifest = raw.includes('Could not fetch a valid release JSON')
-    if (noManifest) {
-      notifyWarn('No update information is published for this channel yet.')
-    } else {
-      notifyError(`Update check failed: ${raw}`)
-    }
-  } finally {
-    checking.value = false
+const changeTheme = (value: string) => {
+  switch (value) {
+    case 'Auto':
+      $q.dark.set('auto')
+      break
+    case 'Dark':
+      $q.dark.set(true)
+      break
+    case 'Light':
+      $q.dark.set(false)
+      break
+    default:
+      console.log('Unknown theme value:', value)
   }
 }
 
-// Changelog viewer: the file is bundled into the binary at build time.
-const changelogOpen = ref(false)
-type ChangelogLine = { text: string; bullet: boolean }
-const changelogSections = ref<{ title: string; lines: ChangelogLine[] }[]>([])
-const openChangelog = async () => {
-  try {
-    const text = await invoke<string>('get_changelog')
-    const sections: { title: string; lines: ChangelogLine[] }[] = []
-    for (const rawLine of text.split('\n')) {
-      const line = rawLine.trimEnd()
-      if (line.startsWith('### ')) {
-        sections.push({ title: line.slice(4), lines: [] })
-      } else if (sections.length > 0 && line.trim().length > 0) {
-        // `- ` is markdown list syntax; the dialog draws its own bullet dot.
-        sections[sections.length - 1]!.lines.push({
-          text: line.replace(/^-\s+/, ''),
-          bullet: /^-\s/.test(line),
-        })
-      }
-    }
-    // The file is oldest-first; the dialog shows the newest release on top.
-    changelogSections.value = sections.reverse()
-    changelogOpen.value = true
-  } catch (error) {
-    console.error('Failed to load changelog:', error)
-    notifyError('Failed to open the changelog', error)
-  }
-}
-
-const saving = ref(false)
 const saveServerConfig = async () => {
-  const theme = themeMode.value
-  console.log(`listen_port: ${listenPortValue.value}, theme: ${theme}`)
+  console.log(`listen_port: ${listenPortValue.value}, theme: ${selectedTheme.value}`)
 
-  saving.value = true
   try {
     const response = await invoke('update_server', {
       listenPort: listenPortValue.value,
@@ -300,75 +109,39 @@ const saveServerConfig = async () => {
     console.log('Server configuration updated successfully_1')
     await invoke('app_connection')
     console.log('Server configuration updated successfully_2')
-    // update_server resolves with `false` on a persistence failure (read-only
-    // config dir, disk error) instead of rejecting — a bare await would show
-    // the green toast over an unsaved config.
-    const ok = await invoke<boolean>('update_server', {
-      host: hostValue.value,
-      ident: identInput.value,
-      theme,
-      betaUpdates: betaUpdates.value,
-      autoInstallUpdates: autoInstallUpdates.value,
-    })
-    if (!ok) {
-      throw new Error('the backend could not persist the settings')
-    }
-
-    notifySuccess('Settings have been updated.', TOAST_SHORT)
-    emit('update:modelValue', false)
   } catch (error) {
     console.error('Error updating server configuration:', error)
-    notifyError('Failed to update settings', error)
-    return
-  } finally {
-    saving.value = false
-  }
-
-  // Reconnect steps run after a confirmed save, each on its own: a PCSC sync
-  // failure (e.g. the smart-card service is down) must not prevent the app
-  // connection from moving to the new broker.
-  try {
-    await invoke('manual_sync_cards', { readername: '', restart: true })
-  } catch (error) {
-    console.error('Card sync after settings save failed:', error)
-    notifyWarn('Settings saved, but card sync failed', error)
-  }
-  try {
-    await invoke('app_connection')
-  } catch (error) {
-    console.error('App reconnect after settings save failed:', error)
-    notifyWarn('Settings saved, but reconnect failed', error)
+    Notify.create({
+      message: 'Failed to update server configuration.',
+      color: 'red',
+      position: 'bottom',
+      timeout: 3000,
+    })
   }
 }
 
-const { on } = useTauriListeners()
+// Listen for config updates from backend
+listen('global-config-server', (event) => {
+  const payload = event.payload as {
+    listenPort: number
+    connectionLimit: number
+    dark_theme: string
+  }
+  console.log(
+    'listenPort:',
+    payload.listenPort,
+    'connectionLimit:',
+    payload.connectionLimit,
+    'dark_theme:',
+    payload.dark_theme,
+  )
 
-onMounted(async () => {
-  await on('global-config-server', (raw) => {
-    const payload = raw as {
-      host: string
-      ident: string
-      dark_theme?: string
-      beta_updates?: string
-      auto_install_updates?: string
-    }
-    hostValue.value = payload.host
-    // Seed the backing ref directly, NOT through the identInput setter: the
-    // setter strips dashes/non-digits, so a non-conforming persisted ident
-    // would be silently rewritten here and the next Save would persist the
-    // mangled identity of a device already registered on the server. The
-    // faithful value renders as-is and isIdentValid flags it instead.
-    ident.value = payload.ident.replace(/^TBA/i, '')
-    betaUpdates.value = payload.beta_updates === 'true'
-    autoInstallUpdates.value = payload.auto_install_updates === 'true'
-    if (
-      payload.dark_theme === 'Auto' ||
-      payload.dark_theme === 'Light' ||
-      payload.dark_theme === 'Dark'
-    ) {
-      // Reflect the persisted mode; no watcher, so nothing re-persists.
-      themeMode.value = payload.dark_theme
-    }
-  })
+  listenPortValue.value = payload.listenPort
+  connectionLimitValue.value = payload.connectionLimit
+
+  changeTheme(payload.dark_theme)
+  selectedTheme.value = payload.dark_theme
+}).catch((error) => {
+  console.error('Error listening to global-config-server:', error)
 })
 </script>

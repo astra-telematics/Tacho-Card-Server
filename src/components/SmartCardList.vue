@@ -29,7 +29,7 @@
       (name, number, generation/type, expire, company name/address, ICCID).
       In link mode the list below is filtered to cards that have no ICCID yet.
     -->
-    <q-card flat class="smart-card-list">
+    <q-card flat bordered>
       <q-expansion-item v-model="isExpanded">
         <!-- Header of the collapsible card: icon + title with count + Add button -->
         <template v-slot:header>
@@ -39,17 +39,16 @@
 
           <q-item-section>Smart cards ({{ Object.keys(cardsList).length }})</q-item-section>
 
-          <q-item-section side>
-            <q-btn
-              label="Add Card"
-              icon="mdi-card-plus"
-              color="positive"
-              rounded
-              unelevated
-              size="sm"
-              padding="xs md"
-              @click.stop="openAddDialog()"
-            />
+          <q-item-section>
+            <div>
+              <q-btn
+                label="Add Card"
+                dense
+                icon="mdi-card-plus"
+                color="green"
+                @click.stop="openAddDialog()"
+              />
+            </div>
           </q-item-section>
         </template>
         <q-separator />
@@ -119,9 +118,8 @@
                 v-if="card.iccid"
                 dense
                 size="sm"
-                color="blue-grey-2"
-                text-color="blue-grey-9"
-                class="text-bold q-ma-none"
+                color="grey"
+                class="text-dark text-bold q-ma-none"
               >
                 ICCID: {{ card.iccid }}
               </q-chip>
@@ -142,30 +140,14 @@
         - Add    → all fields empty (ICCID pre-filled if coming from link flow)
         - Edit   → card number and ICCID locked (they identify the record)
     -->
-    <!-- @hide also covers ESC and backdrop dismissal: without it, link mode
-         survived an ESC and the next card click silently bound the stale ICCID. -->
-    <q-dialog v-model="isDialogOpen" @hide="closeCard">
-      <q-card style="min-width: 420px">
-        <q-card-section class="row items-center q-pb-sm">
-          <q-icon
-            :name="isEditMode ? 'mdi-smart-card' : 'mdi-card-plus'"
-            size="28px"
-            color="primary"
-            class="q-mr-sm"
-          />
+    <q-dialog v-model="isDialogOpen">
+      <q-card style="min-width: 400px">
+        <q-card-section>
           <div class="text-h6">{{ isEditMode ? 'Edit Card' : 'Add Card' }}</div>
-          <q-space />
-          <q-btn flat round dense icon="mdi-close" v-close-popup @click="closeCard" />
         </q-card-section>
 
-        <q-separator />
-
-        <q-card-section class="q-pt-md q-pb-sm">
-          <q-input v-model="dialogCardICCID" label="ICCID" outlined dense disable class="q-mb-sm">
-            <template v-slot:prepend>
-              <q-icon name="mdi-chip" size="xs" />
-            </template>
-          </q-input>
+        <q-card-section class="q-py-none">
+          <q-input v-model="dialogCardICCID" label="ICCID" outlined dense disable />
           <q-input
             v-model="dialogCardNumber"
             label="Card Number"
@@ -175,13 +157,7 @@
             :disable="isEditMode"
             :error="!!cardNumberError"
             :error-message="cardNumberError"
-            hide-bottom-space
-            class="q-mb-sm"
-          >
-            <template v-slot:prepend>
-              <q-icon name="mdi-numeric" size="xs" />
-            </template>
-          </q-input>
+          />
           <q-input
             v-model="dialogCardName"
             label="Card Name"
@@ -189,16 +165,13 @@
             dense
             type="textarea"
             autogrow
-          >
-            <template v-slot:prepend>
-              <q-icon name="mdi-tag-outline" size="xs" />
-            </template>
-          </q-input>
+            class="q-mt-xs"
+          />
         </q-card-section>
 
-        <q-card-actions align="right" class="q-px-md q-pb-md">
-          <q-btn flat label="Cancel" color="grey-7" v-close-popup @click="closeCard" />
-          <q-btn unelevated label="Save" color="primary" rounded @click="saveCard" />
+        <q-card-actions align="right">
+          <q-btn flat label="Cancel" color="primary" v-close-popup @click="closeCard" />
+          <q-btn flat label="Save" color="primary" @click="saveCard" />
         </q-card-actions>
       </q-card>
     </q-dialog>
@@ -280,10 +253,7 @@ function linkMode(iccid: string) {
 
 function cardClick(number: string) {
   if (isLinkMode.value) {
-    // Send only the fields this action owns: echoing the whole card snapshot
-    // back would overwrite backend-owned metadata (last_auth, company data)
-    // written concurrently by the sniffer. Absent fields are preserved.
-    const cardData: SmartCard = { name: props.cards[number]?.name ?? '', iccid: linkICCID.value }
+    const cardData: SmartCard = { ...props.cards[number], iccid: linkICCID.value }
     emit('update-card', number, cardData)
     isLinkMode.value = false
     linkICCID.value = ''
@@ -327,10 +297,7 @@ function saveCard(): void {
 
   if (!validateCardNumber()) return
 
-  // Only the form-owned fields: the backend preserves absent metadata fields,
-  // so a save cannot clobber a concurrent sniffer/auth write with this
-  // dialog's stale snapshot.
-  const cardData: SmartCard = { name, iccid: dialogCardICCID.value || '' }
+  const cardData: SmartCard = { ...props.cards[number], name, iccid: dialogCardICCID.value || '' }
 
   if (isEditMode.value) {
     emit('update-card', number, cardData)
@@ -364,6 +331,7 @@ function removeCard(number: string): void {
     emit('delete-card', number)
   })
 }
+
 
 defineExpose({
   linkMode,
