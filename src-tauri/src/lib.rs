@@ -7,6 +7,7 @@ mod smart_card;         // PCSC module for smart card operations.
 mod apdu_sniffer;       // Passive sniffer for plaintext EF data in proxied APDUs.
 mod global_app_handle;  // Global access to app state and emitters.
 mod socket_server;      // TCP listen server (replacement for the outbound MQTT client).
+mod device_protocol;    // Device protocol message definitions and parsing.
 // mod com_port;          // COM port handling.
 
 // ───── External Crates ─────

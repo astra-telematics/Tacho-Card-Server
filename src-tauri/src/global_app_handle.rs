@@ -114,11 +114,11 @@ pub struct NotificationPayload {
     pub message: String,
 }
 
-/// Emits the app connection status to the frontend.
-pub fn app_emit_event(online: bool) {
+/// Emits the server status to the frontend.
+pub fn server_emit_event(connections: u16) {
     if let Some(app_handle) = get_app_handle() {
-        if let Err(e) = app_handle.emit("app-connection-status", online) {
-            log::error!("[CONN] failed to emit app connection status: {:?}", e);
+        if let Err(e) = app_handle.emit("server-status", connections) {
+            log::error!("[CONN] failed to emit server status: {:?}", e);
         }
     }
 }

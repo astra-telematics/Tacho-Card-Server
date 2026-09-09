@@ -7,8 +7,9 @@
           <q-icon
             name="mdi-record-circle-outline"
             class="q-ml-md"
-            :color="appConnected ? 'green' : undefined"
+            :color="serverStatus >= 0 ? 'green' : undefined"
           />
+          <span class="q-ml-xs">{{ serverStatus }}</span>
         </q-toolbar-title>
 
         <div class="q-pa-xs q-gutter-sm">
@@ -36,7 +37,7 @@ defineOptions({
 })
 
 const configOpen = ref(false)
-const appConnected = ref(false)
+const serverStatus = ref(-1)
 
 // Registered Tauri listeners. Stored so we can detach them on unmount —
 // otherwise stale handlers keep mutating dead reactive state and pile up
@@ -48,12 +49,13 @@ const ACCESS_NOTIFICATION_TEXT =
 
 onMounted(async () => {
   try {
-    const unlisten = await listen('app-connection-status', (event) => {
-      appConnected.value = event.payload === true
+    const unlisten = await listen('server-status', (event) => {
+      serverStatus.value = event.payload as number
+      console.log('server-status:', serverStatus.value)
     })
     unlistenFns.push(unlisten)
   } catch (error) {
-    console.error('Error listening to app-connection-status:', error)
+    console.error('Error listening to server-status:', error)
   }
 
   try {
