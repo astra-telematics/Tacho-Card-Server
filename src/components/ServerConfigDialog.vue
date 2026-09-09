@@ -106,11 +106,8 @@ const saveServerConfig = async () => {
       readername: '',
       restart: true,
     })
-    console.log('Server configuration updated successfully_1')
-    await invoke('app_connection')
-    console.log('Server configuration updated successfully_2')
   } catch (error) {
-    console.error('Error updating server configuration:', error)
+    console.log('Error updating server configuration:', error)
     Notify.create({
       message: 'Failed to update server configuration.',
       color: 'red',
@@ -123,21 +120,21 @@ const saveServerConfig = async () => {
 // Listen for config updates from backend
 listen('global-config-server', (event) => {
   const payload = event.payload as {
-    listenPort: number
-    connectionLimit: number
+    listen_port: number
+    connection_limit: number
     dark_theme: string
   }
   console.log(
-    'listenPort:',
-    payload.listenPort,
-    'connectionLimit:',
-    payload.connectionLimit,
+    'listen_port:',
+    payload.listen_port,
+    'connection_limit:',
+    payload.connection_limit,
     'dark_theme:',
     payload.dark_theme,
   )
 
-  listenPortValue.value = payload.listenPort
-  connectionLimitValue.value = payload.connectionLimit
+  listenPortValue.value = payload.listen_port
+  connectionLimitValue.value = payload.connection_limit
 
   changeTheme(payload.dark_theme)
   selectedTheme.value = payload.dark_theme

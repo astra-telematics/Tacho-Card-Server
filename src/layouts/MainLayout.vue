@@ -3,8 +3,12 @@
     <q-header elevated>
       <q-toolbar>
         <q-toolbar-title class="q-ml-md">
-          Tacho Bridge Application
-          <q-icon name="mdi-record-circle-outline" class="q-ml-md" :color="appConnected ? 'green' : undefined" />
+          Tacho Card Server
+          <q-icon
+            name="mdi-record-circle-outline"
+            class="q-ml-md"
+            :color="appConnected ? 'green' : undefined"
+          />
         </q-toolbar-title>
 
         <div class="q-pa-xs q-gutter-sm">

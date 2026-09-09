@@ -89,11 +89,11 @@ pub fn run() {
                         // Start the TCP listen server (replacement for the outbound MQTT client).
                         // bind_addr / soft_connection_limit are configurable via the
                         // `tcp_server` section of config.yaml.
-                        let listen_port: u16 = get_from_cache(CacheSection::Server, "listen_port").parse().expect("Invalid listen_port in cache");
-                        let max_connections: u16 = get_from_cache(CacheSection::Server, "connection_limit").parse().expect("Invalid connection_limit in cache");
+                        let listen_port: u16 = get_from_cache(CacheSection::Server, "listen_port").parse().unwrap_or(7878);
+                        let connection_limit: u16 = get_from_cache(CacheSection::Server, "connection_limit").parse().unwrap_or(1000);
                         if let Err(e) = socket_server::run(
                             listen_port,
-                            max_connections,
+                            connection_limit,
                         )
                         .await
                         {
@@ -178,7 +178,7 @@ fn run_headless() {
     });
 
     log::info!("-== Application is running in headless mode ==-");
-    println!("Tacho Bridge Application running in headless mode (no UI). Press Ctrl+C to exit.");
+    println!("Tacho Card Server running in headless mode (no UI). Press Ctrl+C to exit.");
 
     // Keep the process alive; the monitoring/MQTT tasks run in the background.
     async_runtime::block_on(async {

@@ -378,7 +378,7 @@ pub async fn remove_card_from_config(
 /// Public function to update the server address in the configuration.
 /// This function is a Tauri command that updates the configuration file with a new server address.
 #[tauri::command]
-pub fn update_server(listenPort: u16, connectionLimit: u16, theme: &str) -> bool {
+pub fn update_server(listen_port: String, connection_limit: String, theme: &str) -> bool {
     let config_path = match get_config_path() {
         Ok(path) => path,
         Err(e) => {
@@ -386,10 +386,11 @@ pub fn update_server(listenPort: u16, connectionLimit: u16, theme: &str) -> bool
             return false;
         }
     };
+    log::info!("Updating server configuration: listen_port={}, connection_limit={}, theme={}", listen_port, connection_limit, theme);
 
-    match update_server_config(&config_path, listenPort, connectionLimit, theme) {
+    match update_server_config(&config_path, listen_port.parse().unwrap_or(7878), connection_limit.parse().unwrap_or(1000), theme) {
         Ok(_) => {
-            log::info!("The server configuration is updated: listenPort={}, connectionLimit={}, theme={}", listenPort, connectionLimit, theme);
+            log::info!("The server configuration is updated: listen_port={}, connection_limit={}, theme={}", listen_port, connection_limit, theme);
             true
         }
         Err(e) => {
@@ -855,10 +856,12 @@ pub fn emit_global_config_server(app: &tauri::AppHandle) -> Result<(), Box<dyn E
 
     // Gettting Host value from the "operation cahce" with the ServerConfig structure
     let listen_port = get_from_cache(CacheSection::Server, "listen_port");
+    let connection_limit = get_from_cache(CacheSection::Server, "connection_limit");
     let appearance = get_from_cache(CacheSection::Appearance, "dark_theme");
 
     let mut config_app_payload = HashMap::new();
     config_app_payload.insert("listen_port", listen_port);
+    config_app_payload.insert("connection_limit", connection_limit);
     config_app_payload.insert("dark_theme", appearance);
 
     // Emit this data as a global event to update fornt-end fields
