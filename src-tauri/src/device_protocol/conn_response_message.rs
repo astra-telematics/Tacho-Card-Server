@@ -9,8 +9,8 @@ pub enum ConnResponseStatus {
 
 #[derive(Debug)]
 pub struct ConnResponseMessage {
-    status: ConnResponseStatus,
-    retry_after_seconds: Option<u16>,
+    pub status: ConnResponseStatus,
+    pub retry_after_seconds: Option<u16>,
 }
 
 impl TryFrom<u8> for ConnResponseStatus {

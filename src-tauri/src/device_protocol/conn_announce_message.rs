@@ -2,8 +2,8 @@ use crate::device_protocol::common::{ProtocolError, Result};
 
 #[derive(Debug)]
 pub struct ConnAnnounceMessage {
-    imei: String,
-    vin: Option<String>,
+    pub imei: String,
+    pub vin: Option<String>,
 }
 
 

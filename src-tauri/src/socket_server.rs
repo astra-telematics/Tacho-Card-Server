@@ -13,10 +13,11 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::tcp::WriteHalf;
 use tokio::net::{TcpListener, TcpStream};
 
-use crate::device_protocol::abort_message::{AbortMessage, AbortReason};
-use crate::device_protocol::message::Message;
+use crate::device_protocol::{AbortMessage, AbortReason};
+use crate::device_protocol::Message;
 use crate::global_app_handle::server_emit_event;
 
 pub async fn server_status_updater(active_connections: Arc<AtomicUsize>) {
@@ -43,7 +44,7 @@ pub async fn run(listen_port: u16, connection_limit: u16) -> io::Result<()> {
     let active_connections = Arc::new(AtomicUsize::new(0));
     let updater = tokio::spawn(server_status_updater(Arc::clone(&active_connections)));
     let listener = TcpListener::bind(("0.0.0.0", listen_port)).await?;
-    log::info!(
+    println!(
         "[TCP] phase=listen status=bound addr=0.0.0.0:{} connection_limit={}",
         listen_port,
         connection_limit
@@ -61,7 +62,7 @@ pub async fn run(listen_port: u16, connection_limit: u16) -> io::Result<()> {
         };
 
         if let Err(e) = stream.set_nodelay(true) {
-            log::warn!(
+            println!(
                 "[TCP] phase=accept status=nodelay_failed peer={} err={:?}",
                 peer_addr,
                 e
@@ -70,7 +71,7 @@ pub async fn run(listen_port: u16, connection_limit: u16) -> io::Result<()> {
 
         let count = active_connections.fetch_add(1, Ordering::Relaxed) + 1;
         let over_soft_limit = count > connection_limit as usize;
-        log::info!(
+        println!(
             "[TCP] phase=connect status=accepted peer={} active_connections={} over_soft_limit={}",
             peer_addr,
             count,
@@ -82,7 +83,7 @@ pub async fn run(listen_port: u16, connection_limit: u16) -> io::Result<()> {
             handle_connection(stream, peer_addr, over_soft_limit).await;
 
             let remaining = active_connections.fetch_sub(1, Ordering::Relaxed) - 1;
-            log::info!(
+            println!(
                 "[TCP] phase=disconnect status=closed peer={} active_connections={}",
                 peer_addr,
                 remaining
@@ -92,12 +93,24 @@ pub async fn run(listen_port: u16, connection_limit: u16) -> io::Result<()> {
     updater.abort();
 }
 
+async fn send_abort_message(stream: &mut WriteHalf<'_>, reason: AbortReason) {
+    let abort_message = AbortMessage { reason };
+    let abort_bytes: Vec<u8> = Message::Abort(abort_message).into();
+    if let Err(e) = stream.write_all(&abort_bytes).await {
+        println!(
+            "[TCP] peer={} action=send_abort err={:?}",
+            stream.peer_addr().unwrap(),
+            e
+        );
+    }
+}
+
 /// Per-connection handler. Placeholder: reads and logs incoming bytes until the peer
 /// disconnects or errors. Replace the body with real protocol parsing/dispatch once
 /// the device protocol is defined.
 async fn handle_connection(mut stream: TcpStream, peer_addr: SocketAddr, over_soft_limit: bool) {
     if over_soft_limit {
-        log::warn!(
+        println!(
             "[TCP] phase=connect status=over_soft_limit peer={} action=reject",
             peer_addr
         );
@@ -108,51 +121,61 @@ async fn handle_connection(mut stream: TcpStream, peer_addr: SocketAddr, over_so
         return;
     }
 
-    let mut buf = [0u8; 4096];
-    let (mut read_half, mut write_half) = stream.split();
+    let (read_half, mut write_half) = stream.split();
     let mut message_reader = crate::device_protocol::message::MessageReader::new(read_half);
 
     loop {
-
-        match message_reader.read_message().await {
-            Some(Ok(message)) => {
-                log::debug!("[TCP] peer={} received message", peer_addr);
+        match tokio::time::timeout(std::time::Duration::from_secs(300), message_reader.read_message()).await {
+            Ok(Some(Ok(message))) => {
+                println!("[TCP] peer={} received message", peer_addr);
                 match message {
                     Message::Ping(_) => {
-                        log::debug!("[TCP] peer={} message=Ping", peer_addr);
-                    }
-                    Message::Pong(_) => {
-                        log::debug!("[TCP] peer={} message=Pong", peer_addr);
-                    },
-                    Message::ConnAnnounce(conn_announce_message) => {
-                        // conn_announce_message.handle(&mut write_half, peer_addr).await;
-                    },
-                    Message::ConnResponse(conn_response_message) => {
-                        let reply = Message::Abort(AbortMessage{reason: AbortReason::ProtocolViolation});
+                        let reply = Message::Pong(crate::device_protocol::PongMessage {});
                         let reply_bytes: Vec<u8> = reply.into();
-                        
+                        println!("[TCP] peer={} message=Ping action=reply Pong, {:?}", peer_addr, reply_bytes);
                         write_half.write_all(&reply_bytes).await.unwrap();
                     },
-                    Message::Ready(ready_message) => {
-                        
+                    Message::Pong(_) => {
+                        println!("[TCP] peer={} message=Pong", peer_addr);
                     },
-                        Message::TachoToCard(tacho_to_card_message) => {
+                    Message::ConnAnnounce(conn_announce_message) => {
+                        let reply = Message::ConnResponse(crate::device_protocol::ConnResponseMessage {
+                            status: crate::device_protocol::ConnResponseStatus::Accepted,
+                            retry_after_seconds: None,
+                        });
+                        let reply_bytes: Vec<u8> = reply.into();
+                        write_half.write_all(&reply_bytes).await.unwrap();
+                        println!("[TCP] peer={} IMEI={} message=ConnAnnounce action=reply status=Accepted", peer_addr, conn_announce_message.imei);
+                    },
+                    Message::ConnResponse(conn_response_message) => {
+                        self::send_abort_message(&mut write_half, AbortReason::ProtocolViolation).await;
+                        println!("[TCP] peer={} message=ConnResponse action=unexpected status={:?}", peer_addr, conn_response_message.status);
+                    },
+                    Message::Ready(ready_message) => {
+                        self::send_abort_message(&mut write_half, AbortReason::ProtocolViolation).await;
+                    },
+                    Message::TachoToCard(tacho_to_card_message) => {
                         
                     },
                     Message::CardToTacho(card_to_tacho_message) => {
-                        
+                        self::send_abort_message(&mut write_half, AbortReason::ProtocolViolation).await;
                     },
                     Message::Abort(abort_message) => {
-                        log::info!("[TCP] peer={} message=Abort action=close reason={}", peer_addr, abort_message.reason.to_string());
+                        println!("[TCP] peer={} message=Abort action=close reason={}", peer_addr, abort_message.reason.to_string());
+                        break;
                     },
                 }
             }
-            Some(Err(e)) => {
-                log::warn!("[TCP] peer={} read error: {:?}", peer_addr, e.message);
+            Ok(Some(Err(e))) => {
+                println!("[TCP] peer={} read error: {:?}", peer_addr, e.message);
                 break;
             }
-            None => {
-                log::debug!("[TCP] peer={} closed the connection", peer_addr);
+            Ok(None) => {
+                println!("[TCP] peer={} closed the connection", peer_addr);
+                break;
+            }
+            Err(_) => {
+                println!("[TCP] peer={} read timeout after 300 seconds", peer_addr);
                 break;
             }
         }

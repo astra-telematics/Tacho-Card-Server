@@ -5,25 +5,9 @@ use std::time::Duration;
 
 use tokio::{io::AsyncReadExt, time::timeout};
 
-use crate::device_protocol::{abort_message::AbortMessage, common::{ProtocolError, Result}, conn_announce_message::ConnAnnounceMessage, conn_response_message::ConnResponseMessage};
-
-
-
-pub struct PingMessage {}
-
-pub struct PongMessage {}
-
-pub struct ReadyMessage {
-
-}
-
-pub struct TachoToCardMessage {
-
-}
-
-pub struct CardToTachoMessage {
-
-}
+use crate::device_protocol::{
+    AbortMessage, CardToTachoMessage, ConnAnnounceMessage, ConnResponseMessage, PingMessage, PongMessage, ReadyMessage, TachoToCardMessage, ready_message};
+use crate::device_protocol::{ProtocolError, Result};
 
 pub enum Message {
     Ping(PingMessage),
@@ -52,19 +36,56 @@ impl MessageReader<'_> {
 
     pub async fn read_message(&mut self) -> Option<Result<Message>> {
         loop {
-            // Try to parse a message from the buffer
-            if let Ok(message) = Message::try_from(self.buffer.clone()) {
-                // Remove the parsed message from the buffer
-                let payload_length = u16::from_be_bytes([self.buffer[3], self.buffer[4]]) as usize;
-                self.buffer.drain(0..5 + payload_length);
-                return Some(Ok(message));
+            // Find the start byte `$` and discard any leading garbage
+            if let Some(pos) = self.buffer.iter().position(|&b| b == b'$') {
+                if pos > 0 {
+                    self.buffer.drain(0..pos);
+                }
             }
 
-            let mut temp_buffer = [0u8; 1024];
-            match self.stream.read(&mut temp_buffer).await {
-                Ok(0) => return None, // Connection closed
-                Ok(n) => self.buffer.extend_from_slice(&temp_buffer[..n]),
-                Err(_) => return None, // Read error
+            // Need at least 5 bytes for header ('$' + 2 type + 2 length)
+            if self.buffer.len() < 5 {
+                let mut temp_buffer = [0u8; 1024];
+                match self.stream.read(&mut temp_buffer).await {
+                    Ok(0) => return None, // Connection closed
+                    Ok(n) => {
+                        self.buffer.extend_from_slice(&temp_buffer[..n]);
+                        continue;
+                    }
+                    Err(_) => return None, // Read error
+                }
+            }
+            println!("[TCP] peer={} buffer_len={} buffer={:?}", self.stream.as_ref().peer_addr().unwrap(), self.buffer.len(), self.buffer);
+
+            // We have header; read payload length and ensure full message present
+            let payload_length = u16::from_be_bytes([self.buffer[3], self.buffer[4]]) as usize;
+            let full_len = 5 + payload_length;
+            while self.buffer.len() < full_len {
+                let mut temp_buffer = [0u8; 1024];
+                match self.stream.read(&mut temp_buffer).await {
+                    Ok(0) => return None, // Connection closed
+                    Ok(n) => {
+                        self.buffer.extend_from_slice(&temp_buffer[..n]);
+                        continue;
+                    }
+                    Err(_) => return None, // Read error
+                }
+            }
+
+            // We have a full message slice; parse only that slice
+            let msg_bytes = self.buffer[..full_len].to_vec();
+            match Message::try_from(msg_bytes) {
+                Ok(message) => {
+                    // Remove the parsed message from the buffer and return it
+                    self.buffer.drain(0..full_len);
+                    return Some(Ok(message));
+                }
+                Err(e) => {
+                    // If parsing failed despite having a full-looking message, drop
+                    // the leading byte to try to resynchronize and surface the error.
+                    self.buffer.drain(0..1);
+                    return Some(Err(e));
+                }
             }
         }
     }
@@ -74,13 +95,17 @@ impl Into<Vec<u8>> for Message {
     fn into(self) -> Vec<u8> {
         let mut bytes = vec![b'$'];
         match self {
-            Message::Ping(_) => {
+            Message::Ping(ping_message) => {
+                let payload: Vec<u8> = ping_message.into();
                 bytes.extend_from_slice(&0x0000u16.to_be_bytes());  // Message Type
-                bytes.extend_from_slice(&0u16.to_be_bytes());       // Payload Length
+                bytes.extend_from_slice(&(payload.len() as u16).to_be_bytes());       // Payload Length
+                bytes.extend_from_slice(&payload);                  // Payload
             },
-            Message::Pong(_) => {
+            Message::Pong(pong_message) => {
+                let payload: Vec<u8> = pong_message.into();
                 bytes.extend_from_slice(&0x0001u16.to_be_bytes());  // Message Type
-                bytes.extend_from_slice(&0u16.to_be_bytes());       // Payload Length
+                bytes.extend_from_slice(&(payload.len() as u16).to_be_bytes());       // Payload Length
+                bytes.extend_from_slice(&payload);                  // Payload
             },
             Message::ConnAnnounce(conn_announce) => {
                 let payload: Vec<u8> = conn_announce.into();
@@ -94,17 +119,23 @@ impl Into<Vec<u8>> for Message {
                 bytes.extend_from_slice(&(payload.len() as u16).to_be_bytes()); // Payload Length
                 bytes.extend_from_slice(&payload);                  // Payload
             },
-            Message::Ready(_) => {
+            Message::Ready(ready_message) => {
+                let payload: Vec<u8> = ready_message.into();
                 bytes.extend_from_slice(&0x0004u16.to_be_bytes());  // Message Type
-                bytes.extend_from_slice(&0u16.to_be_bytes());       // Payload Length
+                bytes.extend_from_slice(&(payload.len() as u16).to_be_bytes()); // Payload Length
+                bytes.extend_from_slice(&payload);                  // Payload
             },
-            Message::TachoToCard(_) => {
+            Message::TachoToCard(tacho_to_card_message) => {
+                let payload: Vec<u8> = tacho_to_card_message.into();
                 bytes.extend_from_slice(&0x0005u16.to_be_bytes());  // Message Type
-                bytes.extend_from_slice(&0u16.to_be_bytes());       // Payload Length
+                bytes.extend_from_slice(&(payload.len() as u16).to_be_bytes());       // Payload Length
+                bytes.extend_from_slice(&payload);                  // Payload
             },
-            Message::CardToTacho(_) => {
+            Message::CardToTacho(card_to_tacho_message) => {
+                let payload: Vec<u8> = card_to_tacho_message.into();
                 bytes.extend_from_slice(&0x0006u16.to_be_bytes());  // Message Type
-                bytes.extend_from_slice(&0u16.to_be_bytes());       // Payload Length
+                bytes.extend_from_slice(&(payload.len() as u16).to_be_bytes());       // Payload Length
+                bytes.extend_from_slice(&payload);                  // Payload
             },
             Message::Abort(abort_message) => {
                 let payload: Vec<u8> = abort_message.into();
@@ -132,32 +163,54 @@ impl TryFrom<Vec<u8>> for Message {
         let payload = &bytes[5..5 + payload_length];
         match message_type {
             0x0000 => {
-                if payload_length != 0 {
-                    return Err(ProtocolError { message: "Ping message should have no payload".to_string() });
+                match PingMessage::try_from(payload.to_vec()) {
+                    Ok(ping_message) => Ok(Message::Ping(ping_message)),
+                    Err(e) => Err(e),
                 }
-                Ok(Message::Ping(PingMessage {}))
             },
+
             0x0001 => {
-                if payload_length != 0 {
-                    return Err(ProtocolError { message: "Pong message should have no payload".to_string() });
+                match PongMessage::try_from(payload.to_vec()) {
+                    Ok(pong_message) => Ok(Message::Pong(pong_message)),
+                    Err(e) => Err(e),
                 }
-                Ok(Message::Pong(PongMessage {}))
             },
+
             0x0002 => {
                 match ConnAnnounceMessage::try_from(payload.to_vec()) {
                     Ok(conn_announce) => Ok(Message::ConnAnnounce(conn_announce)),
                     Err(e) => Err(e),
                 }
             },
+
             0x0003 => {
                 match ConnResponseMessage::try_from(payload.to_vec()) {
                     Ok(conn_response) => Ok(Message::ConnResponse(conn_response)),
                     Err(e) => Err(e),
                 }
             },
-            0x0004 => Ok(Message::Ready(ReadyMessage {})),
-            0x0005 => Ok(Message::TachoToCard(TachoToCardMessage {})),
-            0x0006 => Ok(Message::CardToTacho(CardToTachoMessage {})),
+
+            0x0004 => {
+                match ReadyMessage::try_from(payload.to_vec()) {
+                    Ok(ready_message) => Ok(Message::Ready(ready_message)),
+                    Err(e) => Err(e),
+                }
+            },
+
+            0x0005 => {
+                match TachoToCardMessage::try_from(payload.to_vec()) {
+                    Ok(tacho_to_card_message) => Ok(Message::TachoToCard(tacho_to_card_message)),
+                    Err(e) => Err(e),
+                }
+            },
+
+            0x0006 => {
+                match CardToTachoMessage::try_from(payload.to_vec()) {
+                    Ok(card_to_tacho_message) => Ok(Message::CardToTacho(card_to_tacho_message)),
+                    Err(e) => Err(e),
+                }
+            },
+            
             0x0007 => {
                 match AbortMessage::try_from(payload.to_vec()) {
                     Ok(abort_message) => Ok(Message::Abort(abort_message)),
