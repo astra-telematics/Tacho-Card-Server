@@ -24,6 +24,32 @@ use crate::global_app_handle::server_emit_event;
 /// turned away because the auth queue (see `card_pool`) was already full.
 const AUTH_QUEUE_FULL_RETRY_SECONDS: u16 = 5;
 
+/// How long a freshly-accepted connection has to send `ConnAnnounce` before it's
+/// dropped.
+const CONN_ANNOUNCE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+/// How long an announced-and-accepted device may go without a card (queued, or
+/// waiting for a replacement after one was pulled) before it's dropped.
+const AWAITING_CARD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+/// How long a device holding a card has, after `Ready` (or after any message), to
+/// send its next message before it's dropped — keeps a device that goes silent
+/// mid-authentication from sitting on a card forever.
+const AUTHENTICATING_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// The read timeout for the connection's *current* phase. Any fully-received
+/// message (Ping, Pong, or anything else) implicitly resets the clock: the caller
+/// reconstructs this timeout fresh on every loop iteration, so receiving a message —
+/// or a background card event like being granted/re-granted a card — always starts a
+/// brand new window rather than counting down from when the connection first opened.
+fn current_read_timeout(announced: bool, has_card: bool) -> std::time::Duration {
+    if !announced {
+        CONN_ANNOUNCE_TIMEOUT
+    } else if has_card {
+        AUTHENTICATING_TIMEOUT
+    } else {
+        AWAITING_CARD_TIMEOUT
+    }
+}
+
 pub async fn server_status_updater(active_connections: Arc<AtomicUsize>) {
     // Update the connection count on the frontend every 5 seconds.
     // This avoids spamming the frontend with every single connection change, which would be
@@ -183,13 +209,15 @@ async fn handle_connection(mut stream: TcpStream, peer_addr: SocketAddr, over_so
         // the exact same future across iterations (rather than constructing a fresh
         // one each time) matters here: `wait_after_reserving`'s semaphore wait would
         // otherwise silently lose the device's place in line on every single poll.
+        let has_card = card.as_ref().map(|g| g.has_card()).unwrap_or(false);
+
         if pending.is_none() {
             pending = if awaiting_first_card {
                 Some(Box::pin(async {
                     CardEvent::Acquired(crate::card_pool::CARD_POOL.wait_after_reserving().await)
                 }))
             } else if let Some(guard) = &card {
-                if guard.has_card() {
+                if has_card {
                     let (revoked, notify) = guard.revoked_signal();
                     Some(Box::pin(async move {
                         crate::card_pool::wait_for_revocation_signal(revoked, notify).await;
@@ -205,7 +233,15 @@ async fn handle_connection(mut stream: TcpStream, peer_addr: SocketAddr, over_so
             };
         }
 
-        let read_fut = tokio::time::timeout(std::time::Duration::from_secs(300), message_reader.read_message());
+        // Reconstructed fresh every iteration with whichever duration applies to the
+        // connection's current phase — this is what makes "any message resets the
+        // timeout" work for free: a new window starts as soon as the previous read
+        // (or card event) completes, using this loop pass's phase, not the phase the
+        // connection was in when it first opened.
+        let read_fut = tokio::time::timeout(
+            current_read_timeout(announced, has_card),
+            message_reader.read_message(),
+        );
 
         tokio::select! {
             result = read_fut => match result {
@@ -335,7 +371,10 @@ async fn handle_connection(mut stream: TcpStream, peer_addr: SocketAddr, over_so
                 break;
             }
             Err(_) => {
-                println!("[TCP] peer={} read timeout after 300 seconds", peer_addr);
+                println!(
+                    "[TCP] peer={} read timeout after {:?} (announced={} has_card={})",
+                    peer_addr, current_read_timeout(announced, has_card), announced, has_card
+                );
                 break;
             }
             },
