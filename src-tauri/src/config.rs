@@ -17,7 +17,6 @@ use tauri::Emitter;
 
 // ───── Local Modules ─────
 use crate::global_app_handle::emit_card_config_event;
-use crate::smart_card::remove_connections;
 // use crate::smart_card::manual_sync_cards;
 
 /// Represents the configuration settings for the application.
@@ -36,6 +35,15 @@ pub struct ConfigurationFile {
 pub struct ServerConfig {
     pub listen_port: u16,
     pub connection_limit: u16,
+    /// Max number of devices allowed to queue for a card once all cards are checked
+    /// out (see `card_pool`). `#[serde(default)]` so config.yaml files written before
+    /// this field existed still load instead of failing to parse.
+    #[serde(default = "default_max_auth_queue")]
+    pub max_auth_queue: u16,
+}
+
+fn default_max_auth_queue() -> u16 {
+    50
 }
 
 // Dark Theme enum, part of AppearanceConfig that contains data about the theme.
@@ -293,9 +301,19 @@ pub fn update_server_config(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut config = load_config(config_path)?;
 
+    // max_auth_queue isn't editable from this command yet (no settings-UI field for
+    // it) — preserve whatever was already on disk instead of resetting it to the
+    // default every time listen_port/connection_limit are saved from the UI.
+    let max_auth_queue = config
+        .server
+        .as_ref()
+        .map(|s| s.max_auth_queue)
+        .unwrap_or_else(default_max_auth_queue);
+
     config.server = Some(ServerConfig {
         listen_port,
         connection_limit,
+        max_auth_queue,
     });
     config.appearance = Some(AppearanceConfig {
         dark_theme: match theme {
@@ -347,10 +365,6 @@ pub async fn remove_card_from_config(
 
         load_config_to_cache(&config)?;
         log::debug!("Configuration loaded to cache successfully");
-
-        // Kill card task with the specified client_id (card number)
-        remove_connections(vec![card_number.to_string()]).await;
-        log::debug!("Removed connection for card {}", card_number);
 
         emit_card_config_event("global-card-config-updated", card_number.to_string(), None);
 
@@ -510,6 +524,7 @@ pub fn get_from_cache(section: CacheSection, key: &str) -> String {
                 match key {
                     "listen_port" => server.listen_port.to_string(),
                     "connection_limit" => server.connection_limit.to_string(),
+                    "max_auth_queue" => server.max_auth_queue.to_string(),
                     _ => {
                         log::debug!("Unknown key for server section: {}", key);
                         "".to_string()
@@ -722,6 +737,7 @@ mod tests {
             server: Some(ServerConfig {
                 listen_port: 7878,
                 connection_limit: 1000,
+                max_auth_queue: 50,
             }),
             cards,
         }

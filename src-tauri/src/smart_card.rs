@@ -1,15 +1,15 @@
 // ───── Std Lib ─────
 use std::error::Error as StdError;
 use std::ffi::CStr;
+use std::panic::{self, AssertUnwindSafe};
 use std::sync::Arc;
 
 // ───── Crates ─────
 use log::{debug, error, info, warn};
 use once_cell::sync::OnceCell;
-use lazy_static::lazy_static;
 use tokio::time::Duration;
 
-use tauri::async_runtime::{JoinHandle, Mutex};
+use tauri::async_runtime::Mutex;
 
 // ───── PCSC ─────
 use pcsc::*;
@@ -28,75 +28,6 @@ const SW_TECHNICAL_PROBLEM: &str = "6F00";
 type DynError = Box<dyn StdError + Send + Sync>;
 type DynResult<T> = Result<T, DynError>;
 
-/// Represents a card currently being processed (i.e., connected and active).
-#[derive(Debug)]
-pub struct ProcessingCard {
-    pub client_id: String,              // It is Card number. Was also used as the mqtt client_id before the MQTT client was removed.
-    pub reader_name: Option<String>,    // Name of the smart card reader (e.g., "Alcor Micro AU9540 00 00").
-    pub atr: Option<String>,            // ATR of the inserted card (hex-encoded).
-    pub task_handle: JoinHandle<()>,    // Async task handle managing communication for this card.
-}
-
-/// Terminates the connections/tasks for the given client_ids and clears their entries
-/// from the task pool.
-pub async fn remove_connections(client_ids: Vec<String>) {
-    log::debug!("Removing connections for client_ids: {:?}", client_ids);
-
-    let mut task_pool = TASK_POOL.lock().await;
-
-    for client_id in client_ids {
-        if let Some(index) = task_pool.iter().position(|card| card.client_id == client_id) {
-            let card = task_pool.remove(index);
-            card.task_handle.abort();
-
-            // Drop any APDU sniffer state we accumulated for this client so the
-            // global HashMap does not grow without bound across reconnects.
-            crate::apdu_sniffer::forget(&card.client_id);
-
-            log::debug!(
-                "TASK_POOL: Connection terminated for client_id: {}, reader: {}, atr: {}",
-                card.client_id,
-                card.reader_name.as_deref().unwrap_or("unknown"),
-                card.atr.as_deref().unwrap_or("unknown"),
-            );
-        } else {
-            log::warn!(
-                "TASK_POOL: No active connection found for requested client_id: {}",
-                client_id
-            );
-            // Also clear any stale sniffer state, just in case (no-op if absent).
-            crate::apdu_sniffer::forget(&client_id);
-        }
-    }
-}
-
-/// Terminates all active card-related connections and clears the task pool.
-pub async fn remove_connections_all() {
-    log::info!("Removing all card connections...");
-
-    let mut task_pool = TASK_POOL.lock().await;
-
-    for card in task_pool.drain(..) {
-        log::debug!(
-            "TASK_POOL: Aborting task for client_id: {}, reader: {}, atr: {}",
-            card.client_id,
-            card.reader_name.as_deref().unwrap_or("unknown"),
-            card.atr.as_deref().unwrap_or("unknown"),
-        );
-        card.task_handle.abort();
-    }
-
-    crate::apdu_sniffer::forget_all();
-
-    log::info!("All card connections have been terminated and the task pool has been cleared.");
-}
-
-// ───── Statics ─────
-lazy_static! {
-    /// Global list of cards currently being processed (i.e., connected and active).
-    pub static ref TASK_POOL: Arc<Mutex<Vec<ProcessingCard>>> =
-        Arc::new(Mutex::new(Vec::new()));
-}
 
 /// Represents errors that can occur while interacting with smart card readers.
 #[derive(Debug)] // Enables use of `{:?}` for logging and debugging
@@ -150,6 +81,11 @@ fn setup_reader_states(
     for rs in reader_states.iter() {
         if is_dead(rs) {
             log::debug!("Removing {:?}", rs.name());
+            // The reader itself is gone (e.g. unplugged), not just its card —
+            // make sure CARD_POOL doesn't keep believing a card from this reader
+            // is still available/checked-out once the reader can't be monitored
+            // any more.
+            crate::card_pool::CARD_POOL.remove_by_reader(rs.name());
         }
     }
 
@@ -216,17 +152,12 @@ async fn process_reader_states(reader_states: &mut [ReaderState]) -> Result<(), 
                         iccid = received_iccid;
                         card_number = get_from_cache(CacheSection::Cards, &iccid);
 
-                        // TODO: this used to call mqtt::ensure_connection(), which opened an
-                        // MQTT connection for this card and relayed APDU commands over it
-                        // (publish/subscribe). Now that MQTT is gone, wire this up to the new
-                        // TCP server (socket_server) once its device protocol is defined —
-                        // `managed_card` is the live PCSC handle that relay needs.
-                        log::warn!(
-                            "Card {} (reader {:?}) detected but not relayed to any backend — TCP protocol not yet implemented",
+                        log::info!(
+                            "Card {} (reader {:?}) detected — added to the card pool for devices to check out",
                             card_number,
                             rs.name()
                         );
-                        drop(managed_card);
+                        crate::card_pool::CARD_POOL.add_card(managed_card);
                     }
                     Err(e) => {
                         log::error!("Failed to get ICCID: {}", e);
@@ -242,6 +173,10 @@ async fn process_reader_states(reader_states: &mut [ReaderState]) -> Result<(), 
             },
             CardProcessingResult::Delete => {
                 log::debug!("CARD DELETED {}", card_state_string);
+                // Drops the card if it's idle in the pool, or flags + wakes the
+                // holding session immediately if it was checked out — see
+                // CardGuard::revoked/replace_dead_card in card_pool.rs.
+                crate::card_pool::CARD_POOL.remove_by_reader(rs.name());
             }
             CardProcessingResult::Ignore => {}
         }
@@ -279,58 +214,19 @@ pub enum CardProcessingResult {
 }
 
 /// Determines what action should be taken for a card with the given reader name and ATR.
-/// Also removes any stale entries with the same reader name but a previously stored ATR.
 pub async fn should_register_new_card(reader_name: &str, atr: &str) -> CardProcessingResult {
     log::debug!("should_register_new_card");
-    let mut pool = TASK_POOL.lock().await;
 
-    // Log the current contents of the task pool
-    for (i, card) in pool.iter().enumerate() {
-        log::debug!(
-            "Checking index {}: client_id = {}, reader_name = {:?}, atr = {:?}",
-            i,
-            card.client_id,
-            card.reader_name,
-            card.atr
-        );
-    }
-
-    log::debug!("Case 1");
-    // Case 1: Both reader_name and atr are provided and not found in the pool → register new card
+    // Case 1: Both reader_name and atr are provided and not already known to
+    // CARD_POOL (idle or checked out) → register new card.
     if !reader_name.is_empty() && !atr.is_empty() {
-        let exists = pool.iter().any(|c| {
-            c.reader_name.as_deref() == Some(reader_name) &&
-            c.atr.as_deref() == Some(atr)
-        });
-
-        if !exists {
+        if !crate::card_pool::CARD_POOL.contains_reader(reader_name) {
             return CardProcessingResult::Create;
         }
     }
 
-    log::debug!("Case 2");
-    // Case 2: ATR is empty, but a card with the same reader name and filled ATR exists → remove it
+    // Case 2: ATR is empty → the card for this reader has been removed.
     if atr.is_empty() {
-        log::debug!("ATR is empty. Checking for stale entries with reader_name = '{}'", reader_name);
-
-        log::debug!("Case 2_1");
-
-        let to_remove = pool.iter().position(|c| {
-            c.reader_name.as_deref() == Some(reader_name)
-                && c.atr.as_ref().map(|s| !s.is_empty()).unwrap_or(false)
-        });
-        log::debug!("Case 2_2");
-        if let Some(index) = to_remove {
-            let removed = pool.remove(index);
-            removed.task_handle.abort();
-            log::debug!("Case 2_3");
-            log::warn!(
-                "Removed stale ProcessingCard for reader {} with old ATR {}",
-                removed.reader_name.as_deref().unwrap_or("unknown"),
-                removed.atr.as_deref().unwrap_or("unknown"),
-            );
-        }
-
         return CardProcessingResult::Delete;
     }
 
@@ -516,9 +412,6 @@ pub async fn manual_sync_cards(
     log::debug!("Manual sync cards function is called. Restart: {}", restart);
 
     if restart {
-        // remove all connections
-        remove_connections_all().await;
-
         return Ok(());
     }
 
@@ -560,6 +453,28 @@ pub async fn manual_sync_cards(
 
     Ok(())
 }
+/// Runs a pcsc call that is known to `panic!()` on certain real-hardware conditions
+/// instead of returning a `Result` — e.g. `pcsc::Error::from_raw` panics (in debug
+/// builds) on a raw SCard status code it doesn't recognize, and `Card::transmit()`
+/// panics unconditionally if the card's negotiated protocol came back undefined
+/// (which can happen if a card is pulled mid-connect/transmit, or a flaky
+/// reader/driver reports a bogus status). Converts either kind of panic into a
+/// plain `Err` so a single misbehaving card/reader can't take down the caller
+/// (the sc_monitor loop, or an in-flight APDU transmit) — callers already have
+/// retry/recreate logic that treats this exactly like any other pcsc error.
+fn catch_pcsc_panic<T>(f: impl FnOnce() -> T) -> DynResult<T> {
+    panic::catch_unwind(AssertUnwindSafe(f)).map_err(|payload| {
+        let msg = if let Some(s) = payload.downcast_ref::<&str>() {
+            s.to_string()
+        } else if let Some(s) = payload.downcast_ref::<String>() {
+            s.clone()
+        } else {
+            "non-string panic payload".to_string()
+        };
+        format!("pcsc call panicked: {}", msg).into()
+    })
+}
+
 //////////////////////////////////////////////////
 /// CARD WRAPER //////////////////////////////////
 /// //////////////////////////////////////////////
@@ -572,6 +487,12 @@ pub struct ManagedCard {
 }
 
 impl ManagedCard {
+    /// Name of the reader this card is seated in — used by `card_pool` to drop a
+    /// pooled-but-idle card when its reader reports the card removed.
+    pub fn reader_name(&self) -> &CStr {
+        &self.reader_name
+    }
+
     pub fn new(reader_name: &CStr, protocol: Protocols) -> DynResult<Self> {
         debug!(
             "ManagedCard::new() called. Reader: '{}', Protocol: {:?}",
@@ -600,7 +521,7 @@ impl ManagedCard {
                 Box::<dyn StdError + Send + Sync>::from(err)
             })?;
 
-        let card = ctx.connect(reader_name, ShareMode::Shared, protocol)
+        let card = catch_pcsc_panic(|| ctx.connect(reader_name, ShareMode::Shared, protocol))?
             .map_err(|err| {
                 log::error!("Failed to connect to card: {}", err);
                 Box::<dyn StdError + Send + Sync>::from(err)
@@ -615,9 +536,15 @@ impl ManagedCard {
             self.reader_name.to_string_lossy()
         );
 
-        let reconnect_result = {
+        let reconnect_result: Result<(), String> = {
             let mut card = self.inner.lock().await;
-            card.reconnect(ShareMode::Shared, Protocols::ANY, Disposition::ResetCard)
+            match catch_pcsc_panic(move || {
+                card.reconnect(ShareMode::Shared, Protocols::ANY, Disposition::ResetCard)
+            }) {
+                Ok(Ok(())) => Ok(()),
+                Ok(Err(pcsc_err)) => Err(pcsc_err.to_string()),
+                Err(panic_err) => Err(panic_err.to_string()),
+            }
         };
 
         match reconnect_result {
@@ -731,15 +658,19 @@ impl ManagedCard {
             let locked = card.blocking_lock();
             debug!("Lock acquired. Transmitting...");
 
-            match locked.transmit(&apdu, &mut rapdu_buf) {
-                Ok(response) => {
+            match catch_pcsc_panic(|| locked.transmit(&apdu, &mut rapdu_buf)) {
+                Ok(Ok(response)) => {
                     let encoded = hex::encode(response);
                     debug!("APDU transmit success. Encoded response: {}", encoded);
                     Ok(encoded)
                 }
-                Err(err) => {
+                Ok(Err(err)) => {
                     error!("APDU transmit failed: {}", err);
                     Err(format!("Transmit error: {}", err))
+                }
+                Err(panic_err) => {
+                    error!("APDU transmit panicked: {}", panic_err);
+                    Err(format!("Transmit panicked: {}", panic_err))
                 }
             }
         })
@@ -865,4 +796,31 @@ impl ManagedCard {
         Ok(iccid)
     }
 
+}
+
+#[cfg(test)]
+mod panic_guard_tests {
+    use super::catch_pcsc_panic;
+
+    #[test]
+    fn catch_pcsc_panic_converts_str_panic_to_err() {
+        let result = catch_pcsc_panic(|| -> u32 {
+            panic!("pcsc::Card::transmit() does not work with direct connections");
+        });
+        let err = result.expect_err("panic must be converted to Err, not propagated");
+        assert!(err.to_string().contains("does not work with direct connections"));
+    }
+
+    #[test]
+    fn catch_pcsc_panic_converts_string_panic_to_err() {
+        let result = catch_pcsc_panic(|| -> u32 { panic!("{}", "unknown PCSC error code: 0x1b1") });
+        let err = result.expect_err("panic must be converted to Err, not propagated");
+        assert!(err.to_string().contains("0x1b1"));
+    }
+
+    #[test]
+    fn catch_pcsc_panic_passes_through_ok_value() {
+        let result = catch_pcsc_panic(|| 42u32);
+        assert_eq!(result.unwrap(), 42);
+    }
 }

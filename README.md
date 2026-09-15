@@ -152,11 +152,11 @@ Once linked and authenticated at least once, the reader block shows, under the r
 
 Tachograph cards protect their content with access conditions. Files like `EF_Identification` (card number, company name/address, expiry date) and `EF_Application_Identification` (card type, structure version) are readable **only** over Secure Messaging established by the Vehicle Unit during mutual authentication.
 
-TBA does **not** hold any cryptographic keys (those are issued by EUR CA to certified VU/workshop manufacturers only), so it cannot originate SM commands on its own. Instead it passively observes the APDU stream passing through:
+TCS does **not** hold any cryptographic keys (those are issued by EUR CA to certified VU/workshop manufacturers only), so it cannot originate SM commands on its own. Instead it passively observes the APDU stream passing through:
 
 - VU issues `SELECT EF` + `READ BINARY` wrapped in SM after auth
 - The card's response contains `DO'81` (plain value) + `DO'8E` (MAC) — tachograph SM protects integrity but **does not encrypt** the file content
-- TBA parses the plaintext from `DO'81` and persists recognised fields
+- TCS parses the plaintext from `DO'81` and persists recognised fields
 
 Currently recognised files:
 

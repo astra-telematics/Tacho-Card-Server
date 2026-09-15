@@ -8,6 +8,7 @@ mod apdu_sniffer;       // Passive sniffer for plaintext EF data in proxied APDU
 mod global_app_handle;  // Global access to app state and emitters.
 mod socket_server;      // TCP listen server (replacement for the outbound MQTT client).
 mod device_protocol;    // Device protocol message definitions and parsing.
+mod card_pool;          // Bounded pool of physical cards shared across authenticating devices.
 // mod com_port;          // COM port handling.
 
 // ───── External Crates ─────

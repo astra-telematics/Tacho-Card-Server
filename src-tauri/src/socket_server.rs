@@ -20,6 +20,10 @@ use crate::device_protocol::{AbortMessage, AbortReason};
 use crate::device_protocol::Message;
 use crate::global_app_handle::server_emit_event;
 
+/// Suggested wait before a device retries (reconnects and re-announces) after being
+/// turned away because the auth queue (see `card_pool`) was already full.
+const AUTH_QUEUE_FULL_RETRY_SECONDS: u16 = 5;
+
 pub async fn server_status_updater(active_connections: Arc<AtomicUsize>) {
     // Update the connection count on the frontend every 5 seconds.
     // This avoids spamming the frontend with every single connection change, which would be
@@ -105,9 +109,44 @@ async fn send_abort_message(stream: &mut WriteHalf<'_>, reason: AbortReason) {
     }
 }
 
-/// Per-connection handler. Placeholder: reads and logs incoming bytes until the peer
-/// disconnects or errors. Replace the body with real protocol parsing/dispatch once
-/// the device protocol is defined.
+/// Outcome of whichever card-related background wait is currently pending — see
+/// `handle_connection`'s `pending` variable.
+enum CardEvent {
+    /// The device's first `try_reserve` wait resolved with a card.
+    Acquired(crate::card_pool::CardGuard),
+    /// A priority replacement for a revoked card arrived.
+    Replaced(crate::smart_card::ManagedCard),
+    /// The currently-held card was pulled.
+    Revoked,
+}
+
+/// A boxed, pinned card-related wait, re-armed only at actual state transitions (not
+/// every loop tick) — see the comment at its construction site in `handle_connection`
+/// for why that matters (recreating a semaphore-wait future on every poll would
+/// silently reset the device's place in the queue).
+type PendingCardEvent = std::pin::Pin<Box<dyn std::future::Future<Output = CardEvent> + Send>>;
+
+/// Polls `pending` if it's armed, or never resolves if it's `None`. A plain
+/// `pending.as_mut().unwrap()` guarded by `if pending.is_some()` looks equivalent but
+/// isn't: `tokio::select!`'s `if` precondition only skips *polling* that branch — the
+/// branch expression itself is still evaluated every iteration regardless, which
+/// would unwrap a `None` and panic. Routing through `std::future::pending()` in the
+/// `None` case sidesteps that entirely.
+async fn poll_pending(pending: &mut Option<PendingCardEvent>) -> CardEvent {
+    match pending {
+        Some(fut) => fut.as_mut().await,
+        None => std::future::pending().await,
+    }
+}
+
+/// Per-connection handler.
+///
+/// `Ready`/`Abort(CardRemoved)` are server-initiated: the device announces itself
+/// once (`ConnAnnounce`) and then just waits — indefinitely — for the server to send
+/// `Ready` when a card is actually available. It never asks for one itself. So this
+/// handler does the admission decision (queue-full or not) synchronously right when
+/// `ConnAnnounce` arrives, then separately waits for an actual card concurrently with
+/// continuing to read whatever else the device sends meanwhile (Ping, Abort, ...).
 async fn handle_connection(mut stream: TcpStream, peer_addr: SocketAddr, over_soft_limit: bool) {
     if over_soft_limit {
         println!(
@@ -124,8 +163,52 @@ async fn handle_connection(mut stream: TcpStream, peer_addr: SocketAddr, over_so
     let (read_half, mut write_half) = stream.split();
     let mut message_reader = crate::device_protocol::message::MessageReader::new(read_half);
 
+    let mut announced = false;
+    // Set once ConnAnnounce is admitted (ahead of actually holding a card) and stays
+    // set until the first card is acquired. Distinct from `card` because there's a
+    // real waiting period between admission and having a card in hand.
+    let mut awaiting_first_card = false;
+    // Dropping this — on any exit from this function, including disconnect, Abort,
+    // timeout, or the task being cancelled — returns the card to `CARD_POOL`
+    // automatically, which is what lets a waiting device in the queue immediately
+    // take its place.
+    let mut card: Option<crate::card_pool::CardGuard> = None;
+    let mut pending: Option<PendingCardEvent> = None;
+
     loop {
-        match tokio::time::timeout(std::time::Duration::from_secs(300), message_reader.read_message()).await {
+        // (Re)arm `pending` if nothing is currently in flight for the connection's
+        // present state. This only runs right after a transition (ConnAnnounce
+        // admitted, card acquired, card replaced, card revoked) since `pending` is
+        // only ever reset to `None` at those points — NOT every loop tick. Polling
+        // the exact same future across iterations (rather than constructing a fresh
+        // one each time) matters here: `wait_after_reserving`'s semaphore wait would
+        // otherwise silently lose the device's place in line on every single poll.
+        if pending.is_none() {
+            pending = if awaiting_first_card {
+                Some(Box::pin(async {
+                    CardEvent::Acquired(crate::card_pool::CARD_POOL.wait_after_reserving().await)
+                }))
+            } else if let Some(guard) = &card {
+                if guard.has_card() {
+                    let (revoked, notify) = guard.revoked_signal();
+                    Some(Box::pin(async move {
+                        crate::card_pool::wait_for_revocation_signal(revoked, notify).await;
+                        CardEvent::Revoked
+                    }))
+                } else {
+                    Some(Box::pin(async {
+                        CardEvent::Replaced(crate::card_pool::CARD_POOL.wait_for_replacement_card().await)
+                    }))
+                }
+            } else {
+                None // Not announced yet — nothing to wait for.
+            };
+        }
+
+        let read_fut = tokio::time::timeout(std::time::Duration::from_secs(300), message_reader.read_message());
+
+        tokio::select! {
+            result = read_fut => match result {
             Ok(Some(Ok(message))) => {
                 println!("[TCP] peer={} received message", peer_addr);
                 match message {
@@ -139,25 +222,102 @@ async fn handle_connection(mut stream: TcpStream, peer_addr: SocketAddr, over_so
                         println!("[TCP] peer={} message=Pong", peer_addr);
                     },
                     Message::ConnAnnounce(conn_announce_message) => {
-                        let reply = Message::ConnResponse(crate::device_protocol::ConnResponseMessage {
-                            status: crate::device_protocol::ConnResponseStatus::Accepted,
-                            retry_after_seconds: None,
-                        });
-                        let reply_bytes: Vec<u8> = reply.into();
-                        write_half.write_all(&reply_bytes).await.unwrap();
-                        println!("[TCP] peer={} IMEI={} message=ConnAnnounce action=reply status=Accepted", peer_addr, conn_announce_message.imei);
+                        if announced {
+                            // Duplicate announce — just re-ack, don't reserve a second queue slot.
+                            let reply = Message::ConnResponse(crate::device_protocol::ConnResponseMessage {
+                                status: crate::device_protocol::ConnResponseStatus::Accepted,
+                                retry_after_seconds: None,
+                            });
+                            let reply_bytes: Vec<u8> = reply.into();
+                            let _ = write_half.write_all(&reply_bytes).await;
+                            println!("[TCP] peer={} IMEI={} message=ConnAnnounce action=reply status=Accepted note=duplicate", peer_addr, conn_announce_message.imei);
+                        } else {
+                            match crate::card_pool::CARD_POOL.try_reserve() {
+                                Ok(()) => {
+                                    announced = true;
+                                    awaiting_first_card = true;
+                                    pending = None; // arm as "Acquired" wait next loop
+                                    let reply = Message::ConnResponse(crate::device_protocol::ConnResponseMessage {
+                                        status: crate::device_protocol::ConnResponseStatus::Accepted,
+                                        retry_after_seconds: None,
+                                    });
+                                    let reply_bytes: Vec<u8> = reply.into();
+                                    write_half.write_all(&reply_bytes).await.unwrap();
+                                    println!("[TCP] peer={} IMEI={} message=ConnAnnounce action=reply status=Accepted", peer_addr, conn_announce_message.imei);
+                                }
+                                Err(crate::card_pool::QueueFull) => {
+                                    let reply = Message::ConnResponse(crate::device_protocol::ConnResponseMessage {
+                                        status: crate::device_protocol::ConnResponseStatus::TryAgainLater,
+                                        retry_after_seconds: Some(AUTH_QUEUE_FULL_RETRY_SECONDS),
+                                    });
+                                    let reply_bytes: Vec<u8> = reply.into();
+                                    let _ = write_half.write_all(&reply_bytes).await;
+                                    println!("[TCP] peer={} IMEI={} message=ConnAnnounce action=reject reason=queue_full", peer_addr, conn_announce_message.imei);
+                                    return; // Close the connection; device is expected to reconnect later.
+                                }
+                            }
+                        }
                     },
                     Message::ConnResponse(conn_response_message) => {
                         self::send_abort_message(&mut write_half, AbortReason::ProtocolViolation).await;
                         println!("[TCP] peer={} message=ConnResponse action=unexpected status={:?}", peer_addr, conn_response_message.status);
                     },
-                    Message::Ready(ready_message) => {
+                    Message::Ready(_) => {
+                        // Ready is server -> device only; a device sending it is a protocol error.
                         self::send_abort_message(&mut write_half, AbortReason::ProtocolViolation).await;
+                        println!("[TCP] peer={} message=Ready action=abort reason=unexpected_direction", peer_addr);
                     },
                     Message::TachoToCard(tacho_to_card_message) => {
-                        
+                        let has_card = card.as_ref().map(|g| g.has_card()).unwrap_or(false);
+                        if !has_card {
+                            // Device must have received Ready before relaying APDUs.
+                            self::send_abort_message(&mut write_half, AbortReason::ProtocolViolation).await;
+                            println!("[TCP] peer={} message=TachoToCard action=abort reason=no_card_assigned", peer_addr);
+                        } else {
+                            let guard = card.as_ref().unwrap();
+                            let apdu_hex = hex::encode(&tacho_to_card_message.data);
+                            match guard.apdu_transmit(&apdu_hex).await {
+                                Ok(response_hex) => {
+                                    // Passive sniffer: extract useful plaintext EF data as it
+                                    // flows through (see apdu_sniffer.rs). We stay transparent —
+                                    // the device drives its own authentication against the card
+                                    // and we only relay + observe, never inject APDUs of our own.
+                                    // Reading the ICCID via `guard.iccid.get()` (sync, cache-only)
+                                    // rather than `get_iccid().await` (which can itself talk to
+                                    // the card if uncached) makes that a structural guarantee
+                                    // here, not just an invariant we're trusting holds elsewhere.
+                                    if let Some(iccid) = guard.iccid.get() {
+                                        let card_number = crate::config::get_from_cache(crate::config::CacheSection::Cards, iccid);
+                                        crate::apdu_sniffer::sniff(&card_number, &apdu_hex, &response_hex);
+                                    }
+
+                                    match hex::decode(&response_hex) {
+                                        Ok(response_bytes) => {
+                                            let reply = Message::CardToTacho(crate::device_protocol::CardToTachoMessage {
+                                                data: response_bytes,
+                                            });
+                                            let reply_bytes: Vec<u8> = reply.into();
+                                            let _ = write_half.write_all(&reply_bytes).await;
+                                        }
+                                        Err(e) => {
+                                            log::error!(
+                                                "[TCP] peer={} action=tacho_to_card status=bad_response_hex err={:?}",
+                                                peer_addr, e
+                                            );
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    // Not necessarily a removed card (could be a bad APDU) —
+                                    // card removal is handled separately via the pending
+                                    // Revoked wait. Just log for now; there's no defined
+                                    // "transmit failed" signal in the protocol yet.
+                                    log::error!("[TCP] peer={} action=tacho_to_card status=transmit_failed err={}", peer_addr, e);
+                                }
+                            }
+                        }
                     },
-                    Message::CardToTacho(card_to_tacho_message) => {
+                    Message::CardToTacho(_card_to_tacho_message) => {
                         self::send_abort_message(&mut write_half, AbortReason::ProtocolViolation).await;
                     },
                     Message::Abort(abort_message) => {
@@ -177,6 +337,40 @@ async fn handle_connection(mut stream: TcpStream, peer_addr: SocketAddr, over_so
             Err(_) => {
                 println!("[TCP] peer={} read timeout after 300 seconds", peer_addr);
                 break;
+            }
+            },
+            event = poll_pending(&mut pending) => {
+                pending = None; // consumed; re-armed for the new state at the top of the next iteration
+                match event {
+                    CardEvent::Acquired(guard) => {
+                        card = Some(guard);
+                        awaiting_first_card = false;
+                        let reply_bytes: Vec<u8> = Message::Ready(crate::device_protocol::ReadyMessage {}).into();
+                        if write_half.write_all(&reply_bytes).await.is_ok() {
+                            println!("[TCP] peer={} action=card_assigned status=ready_sent", peer_addr);
+                        }
+                    }
+                    CardEvent::Replaced(new_card) => {
+                        if let Some(guard) = card.as_mut() {
+                            guard.install_replacement(new_card);
+                        }
+                        let reply_bytes: Vec<u8> = Message::Ready(crate::device_protocol::ReadyMessage {}).into();
+                        if write_half.write_all(&reply_bytes).await.is_ok() {
+                            println!("[TCP] peer={} action=card_reassigned status=ready_sent", peer_addr);
+                        }
+                    }
+                    CardEvent::Revoked => {
+                        // Tell the device (it resets to "connected" and waits for the
+                        // next Ready) and drop the dead card — but keep this
+                        // session's slot reserved: `pending` re-arms as "Replaced"
+                        // above, which bypasses the M-capped queue entirely.
+                        if let Some(guard) = card.as_mut() {
+                            guard.discard_dead_card();
+                        }
+                        self::send_abort_message(&mut write_half, AbortReason::CardRemoved).await;
+                        println!("[TCP] peer={} action=card_removed status=notified", peer_addr);
+                    }
+                }
             }
         }
     }
