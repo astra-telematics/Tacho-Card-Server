@@ -2,6 +2,7 @@
 use std::error::Error as StdError;
 use std::ffi::CStr;
 use std::panic::{self, AssertUnwindSafe};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
 // ───── Crates ─────
@@ -132,8 +133,8 @@ async fn process_reader_states(reader_states: &mut [ReaderState]) -> Result<(), 
             continue;
         };
 
-        let atr = hex::encode(rs.atr());
-        let protocol = parse_atr_and_get_protocol(&atr);
+        let atr_bytes = rs.atr();
+        let atr = hex::encode(atr_bytes);
 
         let card_state_string = format!("{:?}", rs.event_state());
         log::debug!("card_state_string {}", card_state_string);
@@ -144,7 +145,7 @@ async fn process_reader_states(reader_states: &mut [ReaderState]) -> Result<(), 
         let action = should_register_new_card(reader_name_string, &atr).await;
 
         match action {
-            CardProcessingResult::Create => match ManagedCard::new(reader_name, protocol) {
+            CardProcessingResult::Create => match ManagedCard::new(reader_name, atr_bytes) {
                 Ok(managed_card) => match managed_card.get_iccid().await {
                     Ok(received_iccid) => {
                         log::info!("ICCID: {}", received_iccid);
@@ -193,12 +194,11 @@ async fn process_reader_states(reader_states: &mut [ReaderState]) -> Result<(), 
             );
 
             log::info!(
-                "{:?} {:?} {:?}, {:?}, Protocol: {:?}",
+                "{:?} {:?} {:?}, {:?}",
                 rs.name(),
                 rs.event_state(),
                 atr,
                 card_number,
-                protocol
             );
         }
     }
@@ -323,82 +323,86 @@ pub async fn sc_monitor() -> ! {
     }
 }
 
-/// Parses the ATR and extracts the communication protocol (T=0 or T=1).
-///
-/// # Arguments
-/// - `atr`: A string containing the ATR in hexadecimal format.
-///
-/// # Returns
-/// - `String`: The communication protocol ("T0", "T1", or "Unknown").
-pub fn parse_atr_and_get_protocol(atr: &str) -> Protocols {
-    fn protocol_from_td(td: u8) -> Protocols {
-        match td & 0x0F {
-            0x00 => Protocols::T0,
-            0x01 => Protocols::T1,
-            _ => Protocols::T0,
-        }
-    }
-
-    let atr_bytes = match hex::decode(atr) {
-        Ok(bytes) => bytes,
-        Err(_) => {
-            log::error!("Invalid ATR format: {}", atr);
-            return Protocols::T0;
-        }
-    };
-
-    if atr_bytes.len() < 2 {
-        log::warn!("ATR is too short: {:?}", atr_bytes);
+/// The protocol a terminal uses by default, absent any PPS — `TD1`'s low
+/// nibble, per ISO/IEC 7816-3 (defaults to T=0 if `TD1` itself is absent).
+/// Bit mapping for the presence nibble (T0/TDi's high nibble) is
+/// b5=TA(i+1) (0x10), b6=TB(i+1) (0x20), b7=TC(i+1) (0x40), b8=TD(i+1)
+/// (0x80) — confirmed against the ISO 7816-3 spec text, not assumed.
+pub fn atr_default_protocol(atr: &[u8]) -> Protocols {
+    if atr.len() < 2 {
+        log::warn!("ATR too short to determine default protocol: {:?}", atr);
         return Protocols::T0;
     }
 
-    let mut index = 1;
-    let y1 = atr_bytes[index] >> 4;
-    index += 1;
+    let t0 = atr[1];
+    let mut index = 2;
 
-    // Skip TA1, TB1, TC1 depends on Y1
-    if y1 & 0x1 != 0 { index += 1; } // TA1
-    if y1 & 0x2 != 0 { index += 1; } // TB1
-    if y1 & 0x4 != 0 { index += 1; } // TC1
+    if t0 & 0x10 != 0 { index += 1; } // TA1
+    if t0 & 0x20 != 0 { index += 1; } // TB1
+    if t0 & 0x40 != 0 { index += 1; } // TC1
 
-    // TD1
-    let td1 = if y1 & 0x8 != 0 && index < atr_bytes.len() {
-        let td1 = atr_bytes[index];
-        index += 1;
-        Some(td1)
+    let td1 = if t0 & 0x80 != 0 && index < atr.len() {
+        Some(atr[index])
     } else {
         None
     };
 
-    // TD2 (if was TD1)
-    let td2 = if let Some(td1) = td1 {
-        let y2 = td1 >> 4;
-        // Skip TA2, TB2, TC2
-        if y2 & 0x1 != 0 { index += 1; } // TA2
-        if y2 & 0x2 != 0 { index += 1; } // TB2
-        if y2 & 0x4 != 0 { index += 1; } // TC2
+    match td1 {
+        None => Protocols::T0, // No TD1 → protocol defaults to T=0.
+        Some(td1) => match td1 & 0x0F {
+            0x00 => Protocols::T0,
+            0x01 => Protocols::T1,
+            other => {
+                log::warn!("Unexpected default protocol T={} in TD1; defaulting to T0", other);
+                Protocols::T0
+            }
+        },
+    }
+}
 
-        if y2 & 0x8 != 0 && index < atr_bytes.len() {
-            Some(atr_bytes[index])
+/// Every protocol the ATR declares as available — walks the *full* TDi
+/// chain (unlike `atr_default_protocol`, which stops at `TD1`), OR-ing in
+/// each `TDi & 0x0F` encountered. A card can declare more than one (e.g.
+/// `TD1` offering T=0 and `TD2` additionally offering T=1), which is exactly
+/// the case that made PCSC's own auto-negotiation land on the wrong protocol
+/// for a real company card this session — this is the telemetry field that
+/// lets that be told apart from a single-protocol card in the field.
+pub fn atr_supported_protocols(atr: &[u8]) -> Protocols {
+    if atr.len() < 2 {
+        log::warn!("ATR too short to determine supported protocols: {:?}", atr);
+        return Protocols::T0;
+    }
+
+    let mut supported = Protocols::empty();
+    let mut current = atr[1]; // T0
+    let mut index = 2;
+    let mut saw_td = false;
+
+    loop {
+        if current & 0x10 != 0 { index += 1; } // TA(i+1)
+        if current & 0x20 != 0 { index += 1; } // TB(i+1)
+        if current & 0x40 != 0 { index += 1; } // TC(i+1)
+
+        if current & 0x80 != 0 && index < atr.len() {
+            let td = atr[index];
+            index += 1;
+            saw_td = true;
+            match td & 0x0F {
+                0x00 => supported |= Protocols::T0,
+                0x01 => supported |= Protocols::T1,
+                other => log::warn!("Unexpected protocol T={} in TDi; ignoring", other),
+            }
+            current = td;
         } else {
-            None
+            break;
         }
-    } else {
-        None
-    };
-
-    // If TD2 exists — it is default protocol
-    if let Some(td2) = td2 {
-        return protocol_from_td(td2);
     }
 
-    // If TD2 is not presented, but TD1 it is — use it
-    if let Some(td1) = td1 {
-        return protocol_from_td(td1);
+    if !saw_td {
+        supported = Protocols::T0; // No TD1 at all → T=0 is the only protocol.
     }
 
-    // Default value if have no TD1 and TD2
-    Protocols::T0
+    supported
 }
 
 // Manual card sync function.
@@ -482,7 +486,8 @@ fn catch_pcsc_panic<T>(f: impl FnOnce() -> T) -> DynResult<T> {
 pub struct ManagedCard {
     inner: Arc<Mutex<Card>>,
     reader_name: Arc<CStr>,
-    protocol: Protocols,
+    protocol: Arc<AtomicU32>,
+    atr: Arc<[u8]>,
     pub iccid: OnceCell<String>,
 }
 
@@ -493,41 +498,79 @@ impl ManagedCard {
         &self.reader_name
     }
 
-    pub fn new(reader_name: &CStr, protocol: Protocols) -> DynResult<Self> {
+    /// Raw ATR (Answer To Reset) exactly as read from the physical reader.
+    /// Sent to the device in the `Ready` message — the device never touches
+    /// the card directly, so this is the only way it ever sees the ATR.
+    pub fn atr(&self) -> &[u8] {
+        &self.atr
+    }
+
+    /// The protocol PCSC actually negotiated with the card at connect time.
+    pub fn protocol(&self) -> Protocols {
+        Protocols::from_bits_retain(self.protocol.load(Ordering::Relaxed))
+    }
+
+    /// Connects using the protocol the ATR itself declares as the default
+    /// (`TD1`'s low nibble — the protocol a terminal uses absent any PPS),
+    /// rather than letting PCSC auto-negotiate (`Protocols::ANY`). Real-world
+    /// testing against a Stoneridge SE5000 (see TACHOGRAPH_RDL_HANDOFF.md)
+    /// found PCSC's own auto-negotiation doesn't reliably land on the ATR's
+    /// declared default for a dual-protocol card — it landed on T=1 here even
+    /// though this card's `TD1` declares T=0 first — and the VU expects
+    /// whichever protocol matches its own state, which starting from the
+    /// ATR's default is the best available guess absent a per-VU cache.
+    pub fn new(reader_name: &CStr, atr: &[u8]) -> DynResult<Self> {
         debug!(
-            "ManagedCard::new() called. Reader: '{}', Protocol: {:?}",
+            "ManagedCard::new() called. Reader: '{}'",
             reader_name.to_string_lossy(),
-            protocol
         );
 
-        let card = Self::create_card(reader_name, protocol)?;
+        let (card, protocol) = Self::create_card(reader_name, atr)?;
         debug!(
-            "Card successfully created for reader: '{}'",
-            reader_name.to_string_lossy()
+            "Card successfully created for reader: '{}' (protocol: {:?})",
+            reader_name.to_string_lossy(),
+            protocol
         );
 
         Ok(Self {
             inner: Arc::new(Mutex::new(card)),
             reader_name: Arc::from(reader_name.to_owned()),
-            protocol,
+            protocol: Arc::new(AtomicU32::new(protocol.bits())),
+            atr: Arc::from(atr),
             iccid: OnceCell::new(),
         })
     }
 
-    fn create_card(reader_name: &CStr, protocol: Protocols) -> DynResult<Card> {
+    fn create_card(reader_name: &CStr, atr: &[u8]) -> DynResult<(Card, Protocols)> {
         let ctx = Context::establish(Scope::User)
             .map_err(|err| {
                 log::error!("Failed to establish context: {}", err);
                 Box::<dyn StdError + Send + Sync>::from(err)
             })?;
 
-        let card = catch_pcsc_panic(|| ctx.connect(reader_name, ShareMode::Shared, protocol))?
+        let requested = atr_default_protocol(atr);
+
+        let card = catch_pcsc_panic(|| ctx.connect(reader_name, ShareMode::Shared, requested))?
             .map_err(|err| {
                 log::error!("Failed to connect to card: {}", err);
                 Box::<dyn StdError + Send + Sync>::from(err)
             })?;
 
-        Ok(card)
+        let negotiated = card.status2_owned().map_err(|err| {
+            log::error!("Failed to read negotiated protocol after connect: {}", err);
+            Box::<dyn StdError + Send + Sync>::from(err)
+        })?;
+
+        let protocol = match negotiated.protocol2() {
+            Some(Protocol::T0) => Protocols::T0,
+            Some(Protocol::T1) => Protocols::T1,
+            other => {
+                log::warn!("Unexpected negotiated protocol {:?}; defaulting to requested {:?}", other, requested);
+                requested
+            }
+        };
+
+        Ok((card, protocol))
     }
 
     pub async fn reconnect(&self) {
@@ -536,10 +579,11 @@ impl ManagedCard {
             self.reader_name.to_string_lossy()
         );
 
+        let requested = atr_default_protocol(&self.atr);
         let reconnect_result: Result<(), String> = {
             let mut card = self.inner.lock().await;
             match catch_pcsc_panic(move || {
-                card.reconnect(ShareMode::Shared, Protocols::ANY, Disposition::ResetCard)
+                card.reconnect(ShareMode::Shared, requested, Disposition::ResetCard)
             }) {
                 Ok(Ok(())) => Ok(()),
                 Ok(Err(pcsc_err)) => Err(pcsc_err.to_string()),
@@ -549,6 +593,7 @@ impl ManagedCard {
 
         match reconnect_result {
             Ok(_) => {
+                self.protocol.store(requested.bits(), Ordering::Relaxed);
                 debug!(
                     "Card reconnected successfully for reader: {}",
                     self.reader_name.to_string_lossy()
@@ -572,10 +617,38 @@ impl ManagedCard {
         }
     }
 
+    /// Force the card connection onto a specific protocol, rather than letting
+    /// PCSC auto-negotiate — used once the far-end VU reveals which protocol it
+    /// actually wants to talk (inferred from the length of its first APDU),
+    /// which can differ from whatever `Protocols::ANY` settled on at connect
+    /// time for a card that declares both T=0 and T=1 in its ATR.
+    pub async fn reconnect_to_protocol(&self, protocol: Protocols) -> DynResult<()> {
+        let mut card = self.inner.lock().await;
+        // `ResetCard` (not `LeaveCard`) — a plain reconnect without a reset isn't
+        // guaranteed to make the reader actually renegotiate T=0/T=1 with the
+        // card; matches the disposition `reconnect()` already uses for the same
+        // reason when recovering a stale card.
+        match catch_pcsc_panic(move || {
+            card.reconnect(ShareMode::Shared, protocol, Disposition::ResetCard)
+        })? {
+            Ok(()) => {
+                self.protocol.store(protocol.bits(), Ordering::Relaxed);
+                debug!(
+                    "Reconnected reader '{}' onto protocol {:?}",
+                    self.reader_name.to_string_lossy(),
+                    protocol
+                );
+                Ok(())
+            }
+            Err(pcsc_err) => Err(Box::<dyn StdError + Send + Sync>::from(pcsc_err)),
+        }
+    }
+
     pub async fn recreate(&self) -> DynResult<()> {
-        let new_card = Self::create_card(&self.reader_name, self.protocol)?;
+        let (new_card, protocol) = Self::create_card(&self.reader_name, &self.atr)?;
         let mut lock = self.inner.lock().await;
         *lock = new_card;
+        self.protocol.store(protocol.bits(), Ordering::Relaxed);
 
         info!(
             "Successfully recreated card object for reader: {}",
@@ -645,6 +718,7 @@ impl ManagedCard {
         };
 
         let card = Arc::clone(&self.inner);
+        let reader_name = self.reader_name.to_string_lossy().into_owned();
 
         debug!(
             "Cloned card for blocking transmission. Sending to spawn_blocking..."
@@ -655,7 +729,7 @@ impl ManagedCard {
 
             let mut rapdu_buf = [0u8; MAX_BUFFER_SIZE];
 
-            let locked = card.blocking_lock();
+            let mut locked = card.blocking_lock();
             debug!("Lock acquired. Transmitting...");
 
             match catch_pcsc_panic(|| locked.transmit(&apdu, &mut rapdu_buf)) {
@@ -663,6 +737,41 @@ impl ManagedCard {
                     let encoded = hex::encode(response);
                     debug!("APDU transmit success. Encoded response: {}", encoded);
                     Ok(encoded)
+                }
+                // The card can be reset by something entirely outside our control —
+                // on Windows, most commonly the OS's own Smart Card Plug and Play
+                // service probing a freshly-inserted card for a minidriver match.
+                // That invalidates our handle's cached state without us having done
+                // anything wrong; PCSC's own docs call this out as the transient
+                // error to recover from by reconnecting (without forcing another
+                // reset) and retrying the exact same transmit once.
+                Ok(Err(pcsc::Error::ResetCard)) => {
+                    warn!("Card for reader {} was reset externally; reconnecting and retrying transmit once", reader_name);
+                    match catch_pcsc_panic(|| locked.reconnect(ShareMode::Shared, Protocols::ANY, Disposition::LeaveCard)) {
+                        Ok(Ok(())) => match catch_pcsc_panic(|| locked.transmit(&apdu, &mut rapdu_buf)) {
+                            Ok(Ok(response)) => {
+                                let encoded = hex::encode(response);
+                                debug!("APDU transmit succeeded after reset-recovery. Encoded response: {}", encoded);
+                                Ok(encoded)
+                            }
+                            Ok(Err(err)) => {
+                                error!("APDU transmit failed again after reset-recovery: {}", err);
+                                Err(format!("Transmit error after reset-recovery: {}", err))
+                            }
+                            Err(panic_err) => {
+                                error!("APDU transmit panicked after reset-recovery: {}", panic_err);
+                                Err(format!("Transmit panicked after reset-recovery: {}", panic_err))
+                            }
+                        },
+                        Ok(Err(err)) => {
+                            error!("Reconnect after card reset failed: {}", err);
+                            Err(format!("Reconnect after reset failed: {}", err))
+                        }
+                        Err(panic_err) => {
+                            error!("Reconnect after card reset panicked: {}", panic_err);
+                            Err(format!("Reconnect panicked after reset: {}", panic_err))
+                        }
+                    }
                 }
                 Ok(Err(err)) => {
                     error!("APDU transmit failed: {}", err);

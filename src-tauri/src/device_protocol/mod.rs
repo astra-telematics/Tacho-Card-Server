@@ -8,8 +8,11 @@ mod pong_message;
 mod ready_message;
 mod tacho_to_card_message;
 mod card_to_tacho_message;
-
-
+mod auth_outcome_message;
+mod download_start_message;
+mod download_chunk_message;
+mod download_complete_message;
+mod download_ack_message;
 
 
 pub use message::{Message, MessageReader};
@@ -23,3 +26,8 @@ pub use pong_message::PongMessage;
 pub use ready_message::ReadyMessage;
 pub use tacho_to_card_message::TachoToCardMessage;
 pub use card_to_tacho_message::CardToTachoMessage;
+pub use auth_outcome_message::AuthOutcomeMessage;
+pub use download_start_message::DownloadStartMessage;
+pub use download_chunk_message::DownloadChunkMessage;
+pub use download_complete_message::DownloadCompleteMessage;
+pub use download_ack_message::DownloadAckMessage;

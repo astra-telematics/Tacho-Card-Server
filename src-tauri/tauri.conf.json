@@ -1,6 +1,6 @@
 {
   "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
-  "productName": "tba",
+  "productName": "Tacho Card Server",
   "version": "0.7.3",
   "identifier": "com.astra.tcs",
   "build": {

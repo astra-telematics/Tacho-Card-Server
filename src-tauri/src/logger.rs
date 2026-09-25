@@ -1,15 +1,11 @@
 use std::env;
 use std::path::PathBuf;
-// use std::fs;
-// use std::error::Error; // Импортируем трэйт Error
 
-use fern;
-use log;
-use sys_info;
+use flexi_logger::{Age, Cleanup, Criterion, Duplicate, FileSpec, Logger, LoggerHandle, Naming};
+use once_cell::sync::OnceCell;
 use reqwest;
 use serde::Deserialize;
 use tauri::async_runtime;
-// use tauri::Emitter;
 
 use crate::global_app_handle::emit_notification_event;
 use crate::global_app_handle::NotificationPayload;
@@ -19,23 +15,14 @@ struct Release {
     tag_name: String,
 }
 
-/// Sets up logging for the application.
-///
-/// This function configures the logging system using the `fern` crate. It sets the log file path
-/// based on the operating system and initializes the logging format and level.
-///
-/// # Platform-specific behavior
-///
-/// * On macOS, the log file is created in the `~/Documents/tba` directory.
-/// * On Windows, the log file is created in the `%USERPROFILE%\Documents\tba` directory.
-///
+/// Keeps the flexi_logger handle alive for the program's lifetime — dropping it
+/// flushes and shuts down the file writer, so it must live at least as long as
+/// logging is needed (in practice, forever — nothing ever clears this).
+static LOGGER_HANDLE: OnceCell<LoggerHandle> = OnceCell::new();
 
-pub fn setup_logging() {
+fn log_directory() -> PathBuf {
     let mut log_path = PathBuf::new();
 
-    // Resolve the home directory without panicking if the env var is missing —
-    // fall back to the current working directory so the app still starts and
-    // we just lose persistent logging.
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     let home_var = "HOME";
     #[cfg(target_os = "windows")]
@@ -45,7 +32,7 @@ pub fn setup_logging() {
         Ok(home) => {
             log_path.push(home);
             log_path.push("Documents");
-            log_path.push("tba");
+            log_path.push("tcs");
         }
         Err(e) => {
             eprintln!(
@@ -53,25 +40,55 @@ pub fn setup_logging() {
                 home_var, e
             );
             log_path.push(".");
-            log_path.push("tba-logs");
+            log_path.push("tcs-logs");
         }
     }
+    log_path.push("logs");
+    log_path
+}
 
-    if let Err(e) = std::fs::create_dir_all(&log_path) {
-        eprintln!("Failed to create log directory {:?}: {}", log_path, e);
+/// Sets up logging: a fresh log file every time the process starts, an
+/// additional rollover once per calendar day if it keeps running that long,
+/// older rotated files compressed, and anything past the retention window
+/// deleted. Everything is also duplicated to stdout, so running interactively
+/// (or in `--headless` mode with a console attached) still shows live output
+/// — tailing the file and watching the console both work.
+///
+/// Must be called *after* `config::init_config()` — it reads
+/// `log_retention_days` from the config cache (falling back to
+/// `config::DEFAULT_LOG_RETENTION_DAYS` if that cache isn't populated yet, so
+/// a config load failure here is degraded, not fatal).
+pub fn setup_logging() {
+    let log_dir = log_directory();
+    if let Err(e) = std::fs::create_dir_all(&log_dir) {
+        eprintln!("Failed to create log directory {:?}: {}", log_dir, e);
         return;
     }
 
-    log_path.push("log.txt");
+    let retention_days: usize = crate::config::get_from_cache(crate::config::CacheSection::Logging, "retention_days")
+        .parse()
+        .unwrap_or(crate::config::DEFAULT_LOG_RETENTION_DAYS as usize);
 
-    // Open the log file exactly once. Reusing the same handle eliminates the
-    // race where the file could be removed between two open() calls and the
-    // second one would panic via .unwrap().
-    let log_file = match fern::log_file(&log_path) {
-        Ok(file) => file,
+    let logger_result = Logger::try_with_str("debug")
+        .map(|logger| {
+            logger
+                .log_to_file(FileSpec::default().directory(&log_dir).basename("tacho-card-server"))
+                .rotate(
+                    Criterion::Age(Age::Day),
+                    Naming::Timestamps,
+                    Cleanup::KeepCompressedFiles(retention_days),
+                )
+                .duplicate_to_stdout(Duplicate::All)
+                .format(flexi_logger::opt_format)
+        })
+        .and_then(|logger| logger.start());
+
+    match logger_result {
+        Ok(handle) => {
+            let _ = LOGGER_HANDLE.set(handle);
+        }
         Err(e) => {
-            eprintln!("Failed to create log file: {}", e);
-            log::warn!("No permission to write log file at: {:?}", log_path);
+            eprintln!("Failed to initialize logging at {:?}: {}", log_dir, e);
 
             let payload = NotificationPayload {
                 notification_type: "access".to_string(),
@@ -81,31 +98,10 @@ pub fn setup_logging() {
 
             return;
         }
-    };
-
-    let init_log_result = fern::Dispatch::new()
-        .format(|out, message, record| {
-            out.finish(format_args!(
-                "{}[{}][{}] {}",
-                chrono::Local::now().format("[%Y-%m-%d][%H:%M:%S%.3f]"),
-                record.target(),
-                record.level(),
-                message
-            ))
-        })
-        .level(log::LevelFilter::Info)  // Change to Debug / Info if needed
-        .chain(log_file)
-        .apply();
-
-    if let Err(e) = init_log_result {
-        eprintln!(
-            "Failed to initialize logging at {:?}: {}",
-            log_path, e
-        );
     }
 
-    // Log the application launch
     log::info!("-== Application is launched ==-");
+    log::info!("Log directory: {:?}, retention: {} day(s)", log_dir, retention_days);
 
     // Check for the latest version asynchronously
     async_runtime::spawn(async {
@@ -133,7 +129,7 @@ fn log_system_info() {
 }
 
 async fn check_latest_version() -> Result<(), reqwest::Error> {
-    let url = "https://api.github.com/repos/flespi-software/Tacho-Bridge-App/releases/latest";
+    let url = "https://api.github.com/repos/astra-telematics/Tacho-Card-Server/releases/latest";
     let client = reqwest::Client::new();
     let response = client
         .get(url)
@@ -178,7 +174,7 @@ async fn check_latest_version() -> Result<(), reqwest::Error> {
             );
         }
     } else {
-        log::warn!("Versioin. Failed to fetch the latest release info: {}", response.status());
+        log::warn!("Version. Failed to fetch the latest release info: {}", response.status());
     }
 
     Ok(())

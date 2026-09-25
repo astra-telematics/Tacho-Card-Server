@@ -194,7 +194,7 @@ export default defineConfig((/* ctx */) => {
       builder: {
         // https://www.electron.build/configuration/configuration
 
-        appId: 'tba-2',
+        appId: 'tcs-2',
       },
     },
 

@@ -12,7 +12,7 @@ use std::net::SocketAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncWriteExt;
 use tokio::net::tcp::WriteHalf;
 use tokio::net::{TcpListener, TcpStream};
 
@@ -20,9 +20,11 @@ use crate::device_protocol::{AbortMessage, AbortReason};
 use crate::device_protocol::Message;
 use crate::global_app_handle::server_emit_event;
 
-/// Suggested wait before a device retries (reconnects and re-announces) after being
-/// turned away because the auth queue (see `card_pool`) was already full.
-const AUTH_QUEUE_FULL_RETRY_SECONDS: u16 = 5;
+/// Suggested wait before a device retries after being turned away because the raw
+/// TCP connection count (`connection_limit`) was already over its soft limit — the
+/// one and only admission gate in the system, checked at accept time before the
+/// device has said anything at all.
+const CONNECTION_LIMIT_RETRY_SECONDS: u16 = 5;
 
 /// How long a freshly-accepted connection has to send `ConnAnnounce` before it's
 /// dropped.
@@ -64,17 +66,20 @@ pub async fn server_status_updater(active_connections: Arc<AtomicUsize>) {
 /// itself errors out. Each connection is handed to its own task immediately, so a slow
 /// or idle client can never block others from being accepted.
 ///
-/// `soft_connection_limit` is not a hard cap: connections are always accepted (so the
+/// `connection_limit` is not a hard cap: connections are always accepted (so the
 /// TCP handshake never fails and the client isn't left hanging at the OS level), but
 /// once `active_connections` exceeds the limit, newly accepted connections are flagged
-/// as over the soft limit. `handle_connection` currently just logs and closes those —
-/// once the device protocol is defined, that's where a "try again shortly" / busy
-/// response should be written before closing.
+/// as over the soft limit. `handle_connection` sends a `ConnResponse::TryAgainLater`
+/// before closing those, so a device is told to back off instead of just seeing its
+/// connection die. This is the *only* admission gate in the system — deliberately: if
+/// the server is ever genuinely overloaded, connections should be turned away here,
+/// as early and cheaply as possible, not kept alive only to be rejected later once
+/// they've announced (see `card_pool`, which never rejects).
 pub async fn run(listen_port: u16, connection_limit: u16) -> io::Result<()> {
     let active_connections = Arc::new(AtomicUsize::new(0));
     let updater = tokio::spawn(server_status_updater(Arc::clone(&active_connections)));
     let listener = TcpListener::bind(("0.0.0.0", listen_port)).await?;
-    println!(
+    log::info!(
         "[TCP] phase=listen status=bound addr=0.0.0.0:{} connection_limit={}",
         listen_port,
         connection_limit
@@ -92,7 +97,7 @@ pub async fn run(listen_port: u16, connection_limit: u16) -> io::Result<()> {
         };
 
         if let Err(e) = stream.set_nodelay(true) {
-            println!(
+            log::warn!(
                 "[TCP] phase=accept status=nodelay_failed peer={} err={:?}",
                 peer_addr,
                 e
@@ -101,7 +106,7 @@ pub async fn run(listen_port: u16, connection_limit: u16) -> io::Result<()> {
 
         let count = active_connections.fetch_add(1, Ordering::Relaxed) + 1;
         let over_soft_limit = count > connection_limit as usize;
-        println!(
+        log::info!(
             "[TCP] phase=connect status=accepted peer={} active_connections={} over_soft_limit={}",
             peer_addr,
             count,
@@ -113,7 +118,7 @@ pub async fn run(listen_port: u16, connection_limit: u16) -> io::Result<()> {
             handle_connection(stream, peer_addr, over_soft_limit).await;
 
             let remaining = active_connections.fetch_sub(1, Ordering::Relaxed) - 1;
-            println!(
+            log::info!(
                 "[TCP] phase=disconnect status=closed peer={} active_connections={}",
                 peer_addr,
                 remaining
@@ -127,7 +132,7 @@ async fn send_abort_message(stream: &mut WriteHalf<'_>, reason: AbortReason) {
     let abort_message = AbortMessage { reason };
     let abort_bytes: Vec<u8> = Message::Abort(abort_message).into();
     if let Err(e) = stream.write_all(&abort_bytes).await {
-        println!(
+        log::warn!(
             "[TCP] peer={} action=send_abort err={:?}",
             stream.peer_addr().unwrap(),
             e
@@ -138,7 +143,7 @@ async fn send_abort_message(stream: &mut WriteHalf<'_>, reason: AbortReason) {
 /// Outcome of whichever card-related background wait is currently pending — see
 /// `handle_connection`'s `pending` variable.
 enum CardEvent {
-    /// The device's first `try_reserve` wait resolved with a card.
+    /// The device's wait for a first card resolved.
     Acquired(crate::card_pool::CardGuard),
     /// A priority replacement for a revoked card arrived.
     Replaced(crate::smart_card::ManagedCard),
@@ -169,20 +174,28 @@ async fn poll_pending(pending: &mut Option<PendingCardEvent>) -> CardEvent {
 ///
 /// `Ready`/`Abort(CardRemoved)` are server-initiated: the device announces itself
 /// once (`ConnAnnounce`) and then just waits — indefinitely — for the server to send
-/// `Ready` when a card is actually available. It never asks for one itself. So this
-/// handler does the admission decision (queue-full or not) synchronously right when
-/// `ConnAnnounce` arrives, then separately waits for an actual card concurrently with
-/// continuing to read whatever else the device sends meanwhile (Ping, Abort, ...).
+/// `Ready` when a card is actually available. It never asks for one itself.
+/// `ConnAnnounce` never rejects (the only admission gate is `connection_limit` at
+/// accept time, above) — a device that reaches this handler always eventually gets a
+/// card, however long the wait, while continuing to read whatever else it sends
+/// meanwhile (Ping, Abort, ...).
 async fn handle_connection(mut stream: TcpStream, peer_addr: SocketAddr, over_soft_limit: bool) {
     if over_soft_limit {
-        println!(
+        log::warn!(
             "[TCP] phase=connect status=over_soft_limit peer={} action=reject",
             peer_addr
         );
-        // TODO: once the device protocol is defined, write a "try again shortly" /
-        // busy response here before closing instead of dropping silently, e.g.:
-        //   let _ = stream.write_all(BUSY_RESPONSE).await;
-        let _ = stream; // dropping closes the socket
+        // The device hasn't sent anything yet at this point (this is a raw
+        // connection-count guard, checked at accept time), but ConnResponse is a
+        // self-contained status message, not strictly a reply, so sending it
+        // unprompted here is fine and gives the device something to back off on
+        // instead of just watching its connection die with no explanation.
+        let reply = Message::ConnResponse(crate::device_protocol::ConnResponseMessage {
+            status: crate::device_protocol::ConnResponseStatus::TryAgainLater,
+            retry_after_seconds: Some(CONNECTION_LIMIT_RETRY_SECONDS),
+        });
+        let reply_bytes: Vec<u8> = reply.into();
+        let _ = stream.write_all(&reply_bytes).await;
         return;
     }
 
@@ -190,6 +203,14 @@ async fn handle_connection(mut stream: TcpStream, peer_addr: SocketAddr, over_so
     let mut message_reader = crate::device_protocol::message::MessageReader::new(read_half);
 
     let mut announced = false;
+    // Retained (not just logged inline) so the `AuthOutcome` handler can pass
+    // it on to the telemetry log once the device reports how the session went.
+    let mut imei: Option<String> = None;
+    // Retained for future version-specific handling — not used for anything
+    // yet beyond logging, and deliberately kept out of telemetry.rs (a
+    // firmware version can narrow down a specific client, defeating that
+    // data's anonymization).
+    let mut device_firmware_version: Option<String> = None;
     // Set once ConnAnnounce is admitted (ahead of actually holding a card) and stays
     // set until the first card is acquired. Distinct from `card` because there's a
     // real waiting period between admission and having a card in hand.
@@ -200,6 +221,20 @@ async fn handle_connection(mut stream: TcpStream, peer_addr: SocketAddr, over_so
     // take its place.
     let mut card: Option<crate::card_pool::CardGuard> = None;
     let mut pending: Option<PendingCardEvent> = None;
+    // Whether we've already inspected the current card session's first TachoToCard
+    // frame to detect which protocol the VU actually wants (21-byte APDU = T=0,
+    // 22-byte = T=1, per the FMS-standard remote company card spec) and reconnected
+    // the physical card to match if PCSC's own auto-negotiation guessed differently.
+    // Reset on every fresh/replacement card, since each one gets its own Ready and
+    // the VU redoes this detection against its own first frame each time.
+    let mut protocol_confirmed = false;
+    // VU download handoff state (see vu_download.rs). None of this touches the
+    // physical card — RequestUpload/TransferData/RequestTransferExit happen
+    // entirely on the device's own CAN/UDS link with the VU, so this just
+    // accumulates whatever the device hands over. Reset on every DownloadStart.
+    let mut download_buffer: Vec<u8> = Vec::new();
+    let mut download_meta: Option<(u8, u8)> = None; // (generation, data_types bitmask)
+    const MAX_DOWNLOAD_SIZE: usize = 16 * 1024 * 1024;
 
     loop {
         // (Re)arm `pending` if nothing is currently in flight for the connection's
@@ -207,14 +242,14 @@ async fn handle_connection(mut stream: TcpStream, peer_addr: SocketAddr, over_so
         // admitted, card acquired, card replaced, card revoked) since `pending` is
         // only ever reset to `None` at those points — NOT every loop tick. Polling
         // the exact same future across iterations (rather than constructing a fresh
-        // one each time) matters here: `wait_after_reserving`'s semaphore wait would
-        // otherwise silently lose the device's place in line on every single poll.
+        // one each time) matters here: `acquire`'s semaphore wait would otherwise
+        // silently lose the device's place in line on every single poll.
         let has_card = card.as_ref().map(|g| g.has_card()).unwrap_or(false);
 
         if pending.is_none() {
             pending = if awaiting_first_card {
                 Some(Box::pin(async {
-                    CardEvent::Acquired(crate::card_pool::CARD_POOL.wait_after_reserving().await)
+                    CardEvent::Acquired(crate::card_pool::CARD_POOL.acquire().await)
                 }))
             } else if let Some(guard) = &card {
                 if has_card {
@@ -246,16 +281,16 @@ async fn handle_connection(mut stream: TcpStream, peer_addr: SocketAddr, over_so
         tokio::select! {
             result = read_fut => match result {
             Ok(Some(Ok(message))) => {
-                println!("[TCP] peer={} received message", peer_addr);
+                log::debug!("[TCP] peer={} received message", peer_addr);
                 match message {
                     Message::Ping(_) => {
                         let reply = Message::Pong(crate::device_protocol::PongMessage {});
                         let reply_bytes: Vec<u8> = reply.into();
-                        println!("[TCP] peer={} message=Ping action=reply Pong, {:?}", peer_addr, reply_bytes);
+                        log::debug!("[TCP] peer={} message=Ping action=reply Pong, {:?}", peer_addr, reply_bytes);
                         write_half.write_all(&reply_bytes).await.unwrap();
                     },
                     Message::Pong(_) => {
-                        println!("[TCP] peer={} message=Pong", peer_addr);
+                        log::debug!("[TCP] peer={} message=Pong", peer_addr);
                     },
                     Message::ConnAnnounce(conn_announce_message) => {
                         if announced {
@@ -266,54 +301,88 @@ async fn handle_connection(mut stream: TcpStream, peer_addr: SocketAddr, over_so
                             });
                             let reply_bytes: Vec<u8> = reply.into();
                             let _ = write_half.write_all(&reply_bytes).await;
-                            println!("[TCP] peer={} IMEI={} message=ConnAnnounce action=reply status=Accepted note=duplicate", peer_addr, conn_announce_message.imei);
+                            log::info!("[TCP] peer={} IMEI={} firmware_version={} message=ConnAnnounce action=reply status=Accepted note=duplicate", peer_addr, conn_announce_message.imei, conn_announce_message.firmware_version);
                         } else {
-                            match crate::card_pool::CARD_POOL.try_reserve() {
-                                Ok(()) => {
-                                    announced = true;
-                                    awaiting_first_card = true;
-                                    pending = None; // arm as "Acquired" wait next loop
-                                    let reply = Message::ConnResponse(crate::device_protocol::ConnResponseMessage {
-                                        status: crate::device_protocol::ConnResponseStatus::Accepted,
-                                        retry_after_seconds: None,
-                                    });
-                                    let reply_bytes: Vec<u8> = reply.into();
-                                    write_half.write_all(&reply_bytes).await.unwrap();
-                                    println!("[TCP] peer={} IMEI={} message=ConnAnnounce action=reply status=Accepted", peer_addr, conn_announce_message.imei);
-                                }
-                                Err(crate::card_pool::QueueFull) => {
-                                    let reply = Message::ConnResponse(crate::device_protocol::ConnResponseMessage {
-                                        status: crate::device_protocol::ConnResponseStatus::TryAgainLater,
-                                        retry_after_seconds: Some(AUTH_QUEUE_FULL_RETRY_SECONDS),
-                                    });
-                                    let reply_bytes: Vec<u8> = reply.into();
-                                    let _ = write_half.write_all(&reply_bytes).await;
-                                    println!("[TCP] peer={} IMEI={} message=ConnAnnounce action=reject reason=queue_full", peer_addr, conn_announce_message.imei);
-                                    return; // Close the connection; device is expected to reconnect later.
-                                }
-                            }
+                            // No admission check here — the only gate in the system is
+                            // `connection_limit` at accept time (see `over_soft_limit`
+                            // above), checked before this connection was ever handed to
+                            // this task. A device that got this far always gets a card
+                            // eventually, however long the wait.
+                            announced = true;
+                            awaiting_first_card = true;
+                            imei = Some(conn_announce_message.imei.clone());
+                            device_firmware_version = Some(conn_announce_message.firmware_version.clone());
+                            pending = None; // arm as "Acquired" wait next loop
+                            let reply = Message::ConnResponse(crate::device_protocol::ConnResponseMessage {
+                                status: crate::device_protocol::ConnResponseStatus::Accepted,
+                                retry_after_seconds: None,
+                            });
+                            let reply_bytes: Vec<u8> = reply.into();
+                            write_half.write_all(&reply_bytes).await.unwrap();
+                            log::info!("[TCP] peer={} IMEI={} firmware_version={} message=ConnAnnounce action=reply status=Accepted", peer_addr, conn_announce_message.imei, conn_announce_message.firmware_version);
                         }
                     },
                     Message::ConnResponse(conn_response_message) => {
                         self::send_abort_message(&mut write_half, AbortReason::ProtocolViolation).await;
-                        println!("[TCP] peer={} message=ConnResponse action=unexpected status={:?}", peer_addr, conn_response_message.status);
+                        log::warn!("[TCP] peer={} message=ConnResponse action=unexpected status={:?}", peer_addr, conn_response_message.status);
                     },
                     Message::Ready(_) => {
                         // Ready is server -> device only; a device sending it is a protocol error.
                         self::send_abort_message(&mut write_half, AbortReason::ProtocolViolation).await;
-                        println!("[TCP] peer={} message=Ready action=abort reason=unexpected_direction", peer_addr);
+                        log::warn!("[TCP] peer={} message=Ready action=abort reason=unexpected_direction", peer_addr);
                     },
                     Message::TachoToCard(tacho_to_card_message) => {
                         let has_card = card.as_ref().map(|g| g.has_card()).unwrap_or(false);
                         if !has_card {
                             // Device must have received Ready before relaying APDUs.
                             self::send_abort_message(&mut write_half, AbortReason::ProtocolViolation).await;
-                            println!("[TCP] peer={} message=TachoToCard action=abort reason=no_card_assigned", peer_addr);
+                            log::warn!("[TCP] peer={} message=TachoToCard action=abort reason=no_card_assigned", peer_addr);
                         } else {
                             let guard = card.as_ref().unwrap();
+
+                            // Gen1-only fallback: on the older 3DES scheme, the VU's
+                            // Internal Authenticate APDU length reveals its protocol choice
+                            // (21 bytes = T=0, 22 = T=1) independently of the ATR. Confirmed
+                            // on real hardware (see TACHOGRAPH_RDL_HANDOFF.md) that this
+                            // does NOT apply to Gen2 ECC-based auth — GENERAL AUTHENTICATE
+                            // never varies in length by protocol — so `wanted` will just
+                            // stay `None` forever on that card generation and this block is
+                            // a no-op; `ManagedCard::new`'s ATR-declared-default connect is
+                            // the real defense there. Left in for the Gen1 case, where this
+                            // is a genuinely faster, guess-free option. Keep sniffing every
+                            // frame's length (not just frame #1 — housekeeping commands like
+                            // SELECT commonly come first) until one actually matches.
+                            if !protocol_confirmed {
+                                let len = tacho_to_card_message.data.len();
+                                let wanted = match len {
+                                    21 => Some(pcsc::Protocols::T0),
+                                    22 => Some(pcsc::Protocols::T1),
+                                    _ => None,
+                                };
+                                log::debug!(
+                                    "[TCP] peer={} action=protocol_check apdu_len={} current_protocol={:?} inferred_protocol={:?}",
+                                    peer_addr, len, guard.protocol(), wanted
+                                );
+                                if let Some(wanted) = wanted {
+                                    protocol_confirmed = true;
+                                    if guard.protocol() != wanted {
+                                        log::info!(
+                                            "[TCP] peer={} action=protocol_switch from={:?} to={:?}",
+                                            peer_addr, guard.protocol(), wanted
+                                        );
+                                        match guard.reconnect_to_protocol(wanted).await {
+                                            Ok(()) => log::info!("[TCP] peer={} action=protocol_switch status=ok now={:?}", peer_addr, guard.protocol()),
+                                            Err(e) => log::error!("[TCP] peer={} action=protocol_switch status=failed err={}", peer_addr, e),
+                                        }
+                                    }
+                                }
+                            }
+
                             let apdu_hex = hex::encode(&tacho_to_card_message.data);
+                            log::debug!("[TCP] peer={} action=tacho_to_card apdu_hex={}", peer_addr, apdu_hex);
                             match guard.apdu_transmit(&apdu_hex).await {
                                 Ok(response_hex) => {
+                                    log::debug!("[TCP] peer={} action=card_to_tacho apdu_hex={}", peer_addr, response_hex);
                                     // Passive sniffer: extract useful plaintext EF data as it
                                     // flows through (see apdu_sniffer.rs). We stay transparent —
                                     // the device drives its own authentication against the card
@@ -357,21 +426,154 @@ async fn handle_connection(mut stream: TcpStream, peer_addr: SocketAddr, over_so
                         self::send_abort_message(&mut write_half, AbortReason::ProtocolViolation).await;
                     },
                     Message::Abort(abort_message) => {
-                        println!("[TCP] peer={} message=Abort action=close reason={}", peer_addr, abort_message.reason.to_string());
+                        log::info!("[TCP] peer={} message=Abort action=close reason={}", peer_addr, abort_message.reason.to_string());
                         break;
+                    },
+                    Message::AuthOutcome(auth_outcome_message) => {
+                        let has_card = card.as_ref().map(|g| g.has_card()).unwrap_or(false);
+                        if !has_card {
+                            self::send_abort_message(&mut write_half, AbortReason::ProtocolViolation).await;
+                            log::warn!("[TCP] peer={} message=AuthOutcome action=abort reason=no_card_assigned", peer_addr);
+                        } else {
+                            let guard = card.as_ref().unwrap();
+                            log::info!("[TCP] peer={} action=auth_outcome success={}", peer_addr, auth_outcome_message.success);
+
+                            // Cache-only, same transparency invariant as the sniffer hook
+                            // above: never touch the card ourselves to find this out.
+                            if let Some(iccid) = guard.iccid.get() {
+                                let card_number = crate::config::get_from_cache(crate::config::CacheSection::Cards, iccid);
+                                crate::config::record_auth_result_async(&card_number, auth_outcome_message.success).await;
+
+                                let imei_value = imei.clone().unwrap_or_default();
+                                crate::telemetry::record_session_outcome(
+                                    iccid,
+                                    &imei_value,
+                                    guard.atr(),
+                                    guard.protocol(),
+                                    auth_outcome_message.success,
+                                );
+                            }
+
+                            // The download phase (if any) needs zero card interaction —
+                            // RequestUpload/TransferData/RequestTransferExit happen
+                            // entirely on the device's own CAN/UDS link with the VU — so
+                            // release the card now rather than holding it for the whole
+                            // download. `awaiting_first_card` stays false, so the loop's
+                            // `pending`-arming logic naturally arms nothing further (no
+                            // card-wait), and `has_card` reads false from here on.
+                            card = None;
+                        }
+                    },
+                    Message::DownloadStart(download_start_message) => {
+                        if !announced {
+                            self::send_abort_message(&mut write_half, AbortReason::ProtocolViolation).await;
+                            log::warn!("[TCP] peer={} message=DownloadStart action=abort reason=not_announced", peer_addr);
+                        } else {
+                            download_buffer.clear();
+                            download_meta = Some((download_start_message.generation, download_start_message.data_types));
+                            log::info!(
+                                "[TCP] peer={} action=download_start generation={} data_types={:#04x}",
+                                peer_addr, download_start_message.generation, download_start_message.data_types
+                            );
+                        }
+                    },
+                    Message::DownloadChunk(download_chunk_message) => {
+                        if !announced || download_meta.is_none() {
+                            self::send_abort_message(&mut write_half, AbortReason::ProtocolViolation).await;
+                            log::warn!("[TCP] peer={} message=DownloadChunk action=abort reason=no_download_started", peer_addr);
+                        } else if download_buffer.len() + download_chunk_message.data.len() > MAX_DOWNLOAD_SIZE {
+                            self::send_abort_message(&mut write_half, AbortReason::DownloadTooLarge).await;
+                            log::warn!("[TCP] peer={} message=DownloadChunk action=abort reason=download_too_large", peer_addr);
+                        } else {
+                            log::debug!("[TCP] peer={} action=download_chunk len={} total={}", peer_addr, download_chunk_message.data.len(), download_buffer.len() + download_chunk_message.data.len());
+                            download_buffer.extend_from_slice(&download_chunk_message.data);
+                        }
+                    },
+                    Message::DownloadComplete(download_complete_message) => {
+                        if !announced || download_meta.is_none() {
+                            self::send_abort_message(&mut write_half, AbortReason::ProtocolViolation).await;
+                            log::warn!("[TCP] peer={} message=DownloadComplete action=abort reason=no_download_started", peer_addr);
+                        } else {
+                            let (generation, _data_types) = download_meta.unwrap();
+                            let actual_crc32 = crate::vu_download::compute_crc32(&download_buffer);
+                            let matches = actual_crc32 == download_complete_message.crc32;
+                            log::info!(
+                                "[TCP] peer={} action=download_complete bytes={} expected_crc32={:08x} actual_crc32={:08x} matches={}",
+                                peer_addr, download_buffer.len(), download_complete_message.crc32, actual_crc32, matches
+                            );
+
+                            // Structural sanity check: every declared block must be
+                            // exactly its declared size, with nothing left over and
+                            // nothing overrunning — independent of the CRC (which only
+                            // says "the bytes match what the device thinks it sent," not
+                            // "the bytes make internal sense") and independent of VRN
+                            // extraction (which only walks as far as the 4th block and
+                            // would happily succeed even if something later is corrupt).
+                            // Only meaningful for generation 2 — Gen1's fields are
+                            // fixed-offset, not self-describing, so there's nothing in
+                            // the byte stream itself to check sizes against.
+                            let structure_issue = if generation == 2 {
+                                crate::vu_download::validate_gen2_structure(&download_buffer).err()
+                            } else {
+                                None
+                            };
+                            if let Some(offset) = structure_issue {
+                                log::warn!("[TCP] peer={} action=download_malformed offset={}", peer_addr, offset);
+                            }
+
+                            // Save regardless of whether the CRC matched or the structure
+                            // validated — for testing/debugging visibility into what
+                            // actually arrived, any issue is tagged rather than silently
+                            // discarded. Only a fully clean result (CRC match AND, where
+                            // checkable, valid structure) gets the plain (untagged)
+                            // filename that downstream tooling should treat as verified.
+                            let vrn = crate::vu_download::extract_vrn(generation, &download_buffer);
+                            let imei_value = imei.clone().unwrap_or_default();
+                            let verified = matches && structure_issue.is_none();
+                            let mut tag_parts: Vec<String> = Vec::new();
+                            if !matches {
+                                tag_parts.push("crc_mismatch".to_string());
+                            }
+                            if let Some(offset) = structure_issue {
+                                tag_parts.push(format!("malformed_at_{}", offset));
+                            }
+                            let tag = if tag_parts.is_empty() { None } else { Some(tag_parts.join("_")) };
+                            let success = match crate::vu_download::save_download(vrn.as_deref(), &imei_value, &download_buffer, tag.as_deref()) {
+                                Ok(path) => {
+                                    log::info!("[TCP] peer={} action=download_saved path={:?} vrn={:?} verified={}", peer_addr, path, vrn, verified);
+                                    verified
+                                }
+                                Err(e) => {
+                                    log::error!("[TCP] peer={} action=download_save_failed err={}", peer_addr, e);
+                                    false
+                                }
+                            };
+
+                            let reply = Message::DownloadAck(crate::device_protocol::DownloadAckMessage { success });
+                            let reply_bytes: Vec<u8> = reply.into();
+                            let _ = write_half.write_all(&reply_bytes).await;
+
+                            download_buffer.clear();
+                            download_meta = None;
+                        }
+                    },
+                    Message::DownloadAck(_download_ack_message) => {
+                        // Server -> device only; a device sending it is a protocol error.
+                        self::send_abort_message(&mut write_half, AbortReason::ProtocolViolation).await;
+                        log::warn!("[TCP] peer={} message=DownloadAck action=abort reason=unexpected_direction", peer_addr);
                     },
                 }
             }
             Ok(Some(Err(e))) => {
-                println!("[TCP] peer={} read error: {:?}", peer_addr, e.message);
+                log::warn!("[TCP] peer={} read error: {:?}", peer_addr, e.message);
                 break;
             }
             Ok(None) => {
-                println!("[TCP] peer={} closed the connection", peer_addr);
+                log::info!("[TCP] peer={} closed the connection", peer_addr);
                 break;
             }
             Err(_) => {
-                println!(
+                log::warn!(
                     "[TCP] peer={} read timeout after {:?} (announced={} has_card={})",
                     peer_addr, current_read_timeout(announced, has_card), announced, has_card
                 );
@@ -382,20 +584,24 @@ async fn handle_connection(mut stream: TcpStream, peer_addr: SocketAddr, over_so
                 pending = None; // consumed; re-armed for the new state at the top of the next iteration
                 match event {
                     CardEvent::Acquired(guard) => {
+                        let atr = guard.atr().to_vec();
                         card = Some(guard);
                         awaiting_first_card = false;
-                        let reply_bytes: Vec<u8> = Message::Ready(crate::device_protocol::ReadyMessage {}).into();
+                        protocol_confirmed = false;
+                        let reply_bytes: Vec<u8> = Message::Ready(crate::device_protocol::ReadyMessage { atr }).into();
                         if write_half.write_all(&reply_bytes).await.is_ok() {
-                            println!("[TCP] peer={} action=card_assigned status=ready_sent", peer_addr);
+                            log::info!("[TCP] peer={} action=card_assigned status=ready_sent payload_hex={}", peer_addr, hex::encode(&reply_bytes));
                         }
                     }
                     CardEvent::Replaced(new_card) => {
                         if let Some(guard) = card.as_mut() {
                             guard.install_replacement(new_card);
                         }
-                        let reply_bytes: Vec<u8> = Message::Ready(crate::device_protocol::ReadyMessage {}).into();
+                        protocol_confirmed = false;
+                        let atr = card.as_ref().map(|g| g.atr().to_vec()).unwrap_or_default();
+                        let reply_bytes: Vec<u8> = Message::Ready(crate::device_protocol::ReadyMessage { atr }).into();
                         if write_half.write_all(&reply_bytes).await.is_ok() {
-                            println!("[TCP] peer={} action=card_reassigned status=ready_sent", peer_addr);
+                            log::info!("[TCP] peer={} action=card_reassigned status=ready_sent payload_hex={}", peer_addr, hex::encode(&reply_bytes));
                         }
                     }
                     CardEvent::Revoked => {
@@ -407,10 +613,37 @@ async fn handle_connection(mut stream: TcpStream, peer_addr: SocketAddr, over_so
                             guard.discard_dead_card();
                         }
                         self::send_abort_message(&mut write_half, AbortReason::CardRemoved).await;
-                        println!("[TCP] peer={} action=card_removed status=notified", peer_addr);
+                        log::warn!("[TCP] peer={} action=card_removed status=notified", peer_addr);
                     }
                 }
             }
+        }
+    }
+
+    // A download that was in progress but never reached DownloadComplete (e.g. the
+    // device disconnected mid-transfer, as seen in testing) would otherwise just
+    // vanish with the rest of this function's local state. Best-effort save it
+    // anyway, clearly tagged as incomplete/unverified (no CRC was ever provided to
+    // check it against) — for debugging visibility into what actually arrived
+    // rather than losing it silently.
+    if !download_buffer.is_empty() {
+        let generation = download_meta.map(|(generation, _)| generation).unwrap_or(0);
+        let vrn = crate::vu_download::extract_vrn(generation, &download_buffer);
+        let imei_value = imei.clone().unwrap_or_default();
+        // Structural offset (if any) is genuinely useful here even though the
+        // transfer was already known-incomplete — it shows exactly how far the
+        // well-formed data went before truncation, rather than just "somewhere".
+        let tag = if generation == 2 {
+            match crate::vu_download::validate_gen2_structure(&download_buffer) {
+                Ok(_) => "incomplete".to_string(),
+                Err(offset) => format!("incomplete_malformed_at_{}", offset),
+            }
+        } else {
+            "incomplete".to_string()
+        };
+        match crate::vu_download::save_download(vrn.as_deref(), &imei_value, &download_buffer, Some(&tag)) {
+            Ok(path) => log::warn!("[TCP] peer={} action=download_saved_incomplete path={:?} bytes={}", peer_addr, path, download_buffer.len()),
+            Err(e) => log::error!("[TCP] peer={} action=download_save_failed err={}", peer_addr, e),
         }
     }
 }

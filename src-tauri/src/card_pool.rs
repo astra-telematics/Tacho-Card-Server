@@ -1,9 +1,13 @@
 //! Bounded pool of physical smart cards, shared across authenticating devices.
 //!
 //! Goal: exactly as many devices as there are cards available can authenticate at
-//! once (N devices <-> N cards). Additional devices wait in a FIFO queue capped at
-//! `max_queue` (M) devices; anyone trying to join beyond that is refused immediately
-//! rather than growing the queue without bound.
+//! once (N devices <-> N cards). Additional devices wait in a FIFO queue — there is
+//! no cap here on how many can wait; the only admission control in the system is the
+//! raw TCP `connection_limit` check at accept time, before a connection ever reaches
+//! this pool (see `socket_server::run`). The reasoning: if the server is ever
+//! genuinely overloaded (e.g. under a connection flood), those connections should be
+//! rejected as early and cheaply as possible — at accept, before any protocol
+//! parsing — not kept alive only to be rejected later at a second, redundant gate.
 //!
 //! If a checked-out card is pulled mid-session, the affected device does NOT get
 //! sent back to the queue — it already holds a session slot, it just needs a working
@@ -13,10 +17,7 @@
 //!
 //! `Ready`/`Abort(CardRemoved)` in the device protocol are server-initiated: a device
 //! connects, announces itself, and then just waits (indefinitely) for `Ready` — it
-//! never asks for a card itself. So admission (queue-full or not) is decided
-//! synchronously via `try_reserve` right when the device announces, and the actual
-//! wait for a permit happens separately via `wait_after_reserving`, concurrently with
-//! reading whatever else the device sends meanwhile.
+//! never asks for a card itself.
 //!
 //! Implementation:
 //! - A `tokio::sync::Semaphore` tracks how many cards are free right now — its own
@@ -52,17 +53,10 @@ struct CheckedOutEntry {
 pub struct CardPool {
     semaphore: Arc<Semaphore>,
     cards: Mutex<VecDeque<ManagedCard>>,
-    max_queue: usize,
     waiting: AtomicUsize,
     checked_out: Mutex<Vec<CheckedOutEntry>>,
     priority_waiters: Mutex<VecDeque<oneshot::Sender<ManagedCard>>>,
 }
-
-/// Returned when a device tries to join the wait queue while it's already full
-/// (`max_queue` devices ahead of it are waiting). Callers should tell the device to
-/// retry later (e.g. `ConnResponse::TryAgainLater`) instead of blocking it.
-#[derive(Debug)]
-pub struct QueueFull;
 
 /// RAII handle to a checked-out card. Returns the card to the pool automatically
 /// when dropped — including on early return or the holding task being aborted — so
@@ -187,11 +181,10 @@ impl Drop for CardGuard {
 }
 
 impl CardPool {
-    pub fn new(max_queue: usize) -> Arc<Self> {
+    pub fn new() -> Arc<Self> {
         Arc::new(Self {
             semaphore: Arc::new(Semaphore::new(0)),
             cards: Mutex::new(VecDeque::new()),
-            max_queue,
             waiting: AtomicUsize::new(0),
             checked_out: Mutex::new(Vec::new()),
             priority_waiters: Mutex::new(VecDeque::new()),
@@ -312,57 +305,39 @@ impl CardPool {
         self.cards.lock().unwrap().len()
     }
 
-    /// Current number of devices waiting in line for their first card.
+    /// Current number of devices waiting in line for their first card. Observability
+    /// only — there's no cap here (see module docs); admission is controlled solely
+    /// by `connection_limit` at TCP accept time, before a connection ever reaches
+    /// this pool.
     pub fn waiting_count(&self) -> usize {
         self.waiting.load(Ordering::SeqCst)
     }
 
-    /// Synchronous admission check for a first card: reserves a place in line (a
-    /// queue slot) if there's room, without waiting for a card to actually become
-    /// available. Returns `Err(QueueFull)` immediately if `max_queue` devices are
-    /// already ahead of this one. Meant to be called right when a device announces
-    /// itself, so the accept/reject decision can be made — and a `ConnResponse`
-    /// sent — before committing to any actual waiting (see `wait_after_reserving`).
-    pub fn try_reserve(&self) -> Result<(), QueueFull> {
-        loop {
-            let current = self.waiting.load(Ordering::SeqCst);
-            if current >= self.max_queue {
-                return Err(QueueFull);
-            }
-            if self
-                .waiting
-                .compare_exchange(current, current + 1, Ordering::SeqCst, Ordering::SeqCst)
-                .is_ok()
-            {
-                return Ok(());
-            }
-        }
-    }
-
     /// Waits (FIFO, fair — inherited from the semaphore's own waiter list) for a card
-    /// to be free, after a successful `try_reserve`. Returns a guard that releases
-    /// the card back to the pool when dropped (on disconnect, abort, or task
-    /// cancellation). If a card happens to be free already, this resolves immediately.
-    pub async fn wait_after_reserving(self: &Arc<Self>) -> CardGuard {
+    /// to be free. Returns a guard that releases the card back to the pool when
+    /// dropped (on disconnect, abort, or task cancellation). If a card is already
+    /// free, this resolves immediately. Never rejects — a device that's gotten this
+    /// far already passed the one admission gate that exists (`connection_limit`, at
+    /// accept time), so it always eventually gets a card rather than being turned
+    /// away a second time somewhere deeper in the stack.
+    pub async fn acquire(self: &Arc<Self>) -> CardGuard {
+        if let Ok(permit) = Arc::clone(&self.semaphore).try_acquire_owned() {
+            return self.checkout(permit).await;
+        }
+
+        self.waiting.fetch_add(1, Ordering::SeqCst);
         let permit = Arc::clone(&self.semaphore).acquire_owned().await;
         self.waiting.fetch_sub(1, Ordering::SeqCst);
 
         // The semaphore is never closed (nothing ever calls `close()`), so this can't fail.
-        self.checkout(permit.expect("card pool semaphore was unexpectedly closed"))
+        self.checkout(permit.expect("card pool semaphore was unexpectedly closed")).await
     }
 
-    /// Convenience combining `try_reserve` + `wait_after_reserving` for callers that
-    /// don't need to act on the two steps separately (e.g. tests).
-    pub async fn acquire(self: &Arc<Self>) -> Result<CardGuard, QueueFull> {
-        self.try_reserve()?;
-        Ok(self.wait_after_reserving().await)
-    }
-
-    /// Waits for the next card to become available, bypassing the M-capped queue
-    /// entirely and taking priority over devices still waiting for their first card
-    /// — for a session that already holds a slot (see `CardGuard::discard_dead_card`)
-    /// and just needs a working card to go with it, not a new admission. Returns the
-    /// raw card; install it with `CardGuard::install_replacement`.
+    /// Waits for the next card to become available, taking priority over devices
+    /// still waiting for their first card — for a session that already holds a slot
+    /// (see `CardGuard::discard_dead_card`) and just needs a working card to go with
+    /// it, not a new admission. Returns the raw card; install it with
+    /// `CardGuard::install_replacement`.
     pub async fn wait_for_replacement_card(self: &Arc<Self>) -> ManagedCard {
         let (tx, rx) = oneshot::channel();
         self.priority_waiters.lock().unwrap().push_back(tx);
@@ -370,13 +345,20 @@ impl CardPool {
             .expect("card pool dropped without ever fulfilling a priority wait")
     }
 
-    fn checkout(self: &Arc<Self>, permit: OwnedSemaphorePermit) -> CardGuard {
+    async fn checkout(self: &Arc<Self>, permit: OwnedSemaphorePermit) -> CardGuard {
         let card = self
             .cards
             .lock()
             .unwrap()
             .pop_front()
             .expect("permit acquired but pool was empty — invariant violated");
+        // A card sitting idle here may have been left mid-session by whichever
+        // device held it last — e.g. a DF selected away from MF — and this
+        // pool can hand the same physical card to many different devices over
+        // its lifetime in the reader. Never hand out state a previous session
+        // left behind: force a reset (`reconnect()` already does
+        // `Disposition::ResetCard`) before this new session ever sees it.
+        card.reconnect().await;
         let (revoked, notify) = self.register_checked_out(&card);
         CardGuard {
             card: Some(card),
@@ -388,20 +370,11 @@ impl CardPool {
     }
 }
 
-const DEFAULT_MAX_AUTH_QUEUE: usize = 50;
-
 lazy_static! {
     /// Global card pool shared by the reader-monitoring loop (which adds/removes
     /// cards as they're inserted/pulled) and the TCP server (which checks a card out
-    /// per authenticating device). Queue depth (M) is read from config.yaml's
-    /// `server.max_auth_queue` on first use; edit that file and restart to change it —
-    /// there's no settings-UI field for it yet.
-    pub static ref CARD_POOL: Arc<CardPool> = {
-        let max_queue = get_from_cache(CacheSection::Server, "max_auth_queue")
-            .parse::<usize>()
-            .unwrap_or(DEFAULT_MAX_AUTH_QUEUE);
-        CardPool::new(max_queue)
-    };
+    /// per authenticating device).
+    pub static ref CARD_POOL: Arc<CardPool> = CardPool::new();
 }
 
 #[cfg(test)]
@@ -409,23 +382,21 @@ mod tests {
     use super::*;
 
     // ManagedCard can't be constructed without real hardware (`ManagedCard::new`
-    // calls into pcsc), so these tests exercise the pool's admission/queueing logic
-    // directly against the semaphore + waiting counter rather than through
-    // `acquire`/`add_card`'s full round trip.
+    // calls into pcsc), so this test exercises the pool's waiting-counter bookkeeping
+    // directly against the semaphore rather than through `acquire`/`add_card`'s full
+    // round trip.
 
     #[tokio::test]
-    async fn queue_full_rejects_immediately_beyond_max_queue() {
-        let pool = CardPool::new(1);
-        // No cards at all, so every acquire() blocks and consumes a queue slot.
+    async fn acquire_blocks_until_a_card_is_added_then_resolves() {
+        let pool = CardPool::new();
         let pool_bg = Arc::clone(&pool);
         let waiter = tokio::spawn(async move { pool_bg.acquire().await });
-        // Give the spawned task a chance to register itself as waiting.
+
+        // No card yet — the waiter should be sitting in line, not resolved.
         while pool.waiting_count() == 0 {
             tokio::task::yield_now().await;
         }
-
-        let rejected = pool.acquire().await;
-        assert!(rejected.is_err(), "second waiter should be rejected once queue is full");
+        assert!(!waiter.is_finished(), "acquire() must wait when no card is available");
 
         waiter.abort();
     }

@@ -4,11 +4,7 @@
       <q-toolbar>
         <q-toolbar-title class="q-ml-md">
           Tacho Card Server
-          <q-icon
-            name="mdi-record-circle-outline"
-            class="q-ml-md"
-            :color="serverStatus >= 0 ? 'green' : undefined"
-          />
+          <q-icon name="mdi-record-circle-outline" class="q-ml-md" :color="serverStatus >= 0 ? 'green' : undefined" />
           <span class="q-ml-xs">{{ serverStatus }}</span>
         </q-toolbar-title>
 
@@ -45,7 +41,7 @@ const serverStatus = ref(-1)
 const unlistenFns: UnlistenFn[] = []
 
 const ACCESS_NOTIFICATION_TEXT =
-  "The application cannot access the directory '~/Documents/tba' and cannot continue to operate. Perhaps such a directory has already been created by another version of the program, therefore it has local access restrictions. A possible solution may be: rename the current directory, for example, to tba1 and restart the application. It will create a new directory with the necessary access rights."
+  "The application cannot access the directory '~/Documents/tcs' and cannot continue to operate. Perhaps such a directory has already been created by another version of the program, therefore it has local access restrictions. A possible solution may be: rename the current directory, for example, to tcs1 and restart the application. It will create a new directory with the necessary access rights."
 
 onMounted(async () => {
   try {

@@ -1,4 +1,4 @@
-name: Build TBA (Windows amd64 + Ubuntu 22.04 amd64)
+name: Build TCS (Windows amd64 + Ubuntu 22.04 amd64)
 
 on:
   push:
@@ -41,7 +41,7 @@ jobs:
       - name: Upload MSI artifact
         uses: actions/upload-artifact@v4
         with:
-          name: tba-windows-amd64-msi
+          name: tcs-windows-amd64-msi
           path: src-tauri/target/release/bundle/msi/*.msi
           if-no-files-found: error
           retention-days: 14
@@ -86,7 +86,7 @@ jobs:
       - name: Upload AppImage artifact
         uses: actions/upload-artifact@v4
         with:
-          name: tba-ubuntu-2204-amd64-appimage
+          name: tcs-ubuntu-2204-amd64-appimage
           path: src-tauri/target/release/bundle/appimage/*.AppImage
           if-no-files-found: error
           retention-days: 14

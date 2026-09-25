@@ -38,6 +38,20 @@
             @update:model-value="changeTheme"
           />
         </div>
+        <q-toggle
+          v-model="allowAnonymousData"
+          label="Allow anonymous data collection"
+        />
+        <div>
+          <q-btn
+            flat
+            dense
+            no-caps
+            color="primary"
+            label="Open collected data"
+            @click="openTelemetryLog"
+          />
+        </div>
       </q-card-section>
       <q-card-actions align="right" class="text-primary">
         <q-btn flat label="Cancel" v-close-popup />
@@ -63,6 +77,7 @@ defineEmits<{
 
 const listenPortValue = ref(7878)
 const connectionLimitValue = ref(1000)
+const allowAnonymousData = ref(true)
 
 const $q = useQuasar()
 const selectedTheme = ref('')
@@ -91,6 +106,7 @@ const saveServerConfig = async () => {
       listenPort: listenPortValue.value,
       connectionLimit: connectionLimitValue.value,
       theme: selectedTheme.value,
+      allowAnonymousData: allowAnonymousData.value,
     })
 
     console.log('Response from update_server:', response)
@@ -123,6 +139,7 @@ listen('global-config-server', (event) => {
     listen_port: number
     connection_limit: number
     dark_theme: string
+    allow_anonymous_data: string
   }
   console.log(
     'listen_port:',
@@ -131,6 +148,8 @@ listen('global-config-server', (event) => {
     payload.connection_limit,
     'dark_theme:',
     payload.dark_theme,
+    'allow_anonymous_data:',
+    payload.allow_anonymous_data,
   )
 
   listenPortValue.value = payload.listen_port
@@ -138,7 +157,24 @@ listen('global-config-server', (event) => {
 
   changeTheme(payload.dark_theme)
   selectedTheme.value = payload.dark_theme
+
+  // Backend cache values are all plain strings (see config.rs::get_from_cache).
+  allowAnonymousData.value = payload.allow_anonymous_data === 'true'
 }).catch((error) => {
   console.error('Error listening to global-config-server:', error)
 })
+
+const openTelemetryLog = async () => {
+  try {
+    await invoke('open_telemetry_log')
+  } catch (error) {
+    console.log('Error opening telemetry log:', error)
+    Notify.create({
+      message: 'Failed to open the collected data file.',
+      color: 'red',
+      position: 'bottom',
+      timeout: 3000,
+    })
+  }
+}
 </script>

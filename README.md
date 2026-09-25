@@ -74,7 +74,7 @@ If everything went well, you will see something like:
 🔄 Restoring original configuration
 ✅ Build completed successfully!
 📊 Application architecture information:
-Architectures in the fat file: ./src-tauri/target/universal-apple-darwin/release/bundle/macos/tba.app/Contents/MacOS/tacho-bridge-application are: x86_64 arm64
+Architectures in the fat file: ./src-tauri/target/universal-apple-darwin/release/bundle/macos/tcs.app/Contents/MacOS/tacho-card-server are: x86_64 arm64
 
 🏁 Script execution completed
 ```
@@ -175,8 +175,8 @@ If the card has never been authenticated through TCS, these fields stay `null` i
 
 Both files live in the user's Documents directory:
 
-- **Config:** `~/Documents/tba/config.yaml` — server host, app identifier, per-card data (iccid, card number, expire, company info, last_auth, …)
-- **Log:** `~/Documents/tba/log.txt` — rolling file log written by `fern`; contains APDU traces (at DEBUG), connection events (`[CONN] phase=… status=…`), and sniffer field extractions
+- **Config:** `~/Documents/tcs/config.yaml` — server host, app identifier, per-card data (iccid, card number, expire, company info, last_auth, …)
+- **Log:** `~/Documents/tcs/log.txt` — rolling file log written by `fern`; contains APDU traces (at DEBUG), connection events (`[CONN] phase=… status=…`), and sniffer field extractions
 
 On first run both are created automatically; if the OS denies write access, the UI surfaces a notification.
 

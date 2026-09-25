@@ -126,17 +126,17 @@ if [ $BUILD_RESULT -eq 0 ]; then
     echo "✅ Build completed successfully!"
     
     # Check the architecture of the built app
-    APP_PATH="./src-tauri/target/universal-apple-darwin/release/bundle/macos/tba.app"
-    BINARY_PATH="$APP_PATH/Contents/MacOS/tacho-bridge-application"
+    APP_PATH="./src-tauri/target/universal-apple-darwin/release/bundle/macos/tcs.app"
+    BINARY_PATH="$APP_PATH/Contents/MacOS/tacho-card-server"
     
     if [ -f "$BINARY_PATH" ]; then
         echo "📊 Application architecture information:"
         lipo -info "$BINARY_PATH"
     else
         echo "⚠️ Cannot verify architecture - binary not found at expected location"
-        find ./src-tauri/target -name "tba.app" -type d | while read -r app; do
+        find ./src-tauri/target -name "tcs.app" -type d | while read -r app; do
             echo "🔍 Found app bundle at: $app"
-            lipo -info "$app/Contents/MacOS/tacho-bridge-application" 2>/dev/null || echo "  Cannot read architecture info"
+            lipo -info "$app/Contents/MacOS/tacho-card-server" 2>/dev/null || echo "  Cannot read architecture info"
         done
     fi
 else

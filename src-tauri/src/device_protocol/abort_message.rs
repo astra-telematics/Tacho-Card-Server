@@ -5,6 +5,8 @@ pub enum AbortReason {
     Unknown,
     ProtocolViolation,
     CardRemoved,
+    CardProtocolMismatch,
+    DownloadTooLarge,
 }
 
 pub struct AbortMessage {
@@ -17,6 +19,8 @@ impl ToString for AbortReason {
             AbortReason::Unknown => "Unknown".to_string(),
             AbortReason::ProtocolViolation => "Protocol Violation".to_string(),
             AbortReason::CardRemoved => "Card Removed".to_string(),
+            AbortReason::CardProtocolMismatch => "Card Protocol Mismatch".to_string(),
+            AbortReason::DownloadTooLarge => "Download Too Large".to_string(),
         }
     }
 }
@@ -49,6 +53,8 @@ impl TryFrom<u8> for AbortReason {
             0x00 => Ok(AbortReason::Unknown),
             0x01 => Ok(AbortReason::ProtocolViolation),
             0x02 => Ok(AbortReason::CardRemoved),
+            0x03 => Ok(AbortReason::CardProtocolMismatch),
+            0x04 => Ok(AbortReason::DownloadTooLarge),
             _ => Err(ProtocolError { message: "Invalid abort reason".to_string() }),
         }
     }
@@ -60,6 +66,8 @@ impl Into<u8> for AbortReason {
             AbortReason::Unknown => 0x00,
             AbortReason::ProtocolViolation => 0x01,
             AbortReason::CardRemoved => 0x02,
+            AbortReason::CardProtocolMismatch => 0x03,
+            AbortReason::DownloadTooLarge => 0x04,
         }
     }
 }

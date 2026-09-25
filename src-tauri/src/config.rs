@@ -27,6 +27,7 @@ pub struct ConfigurationFile {
     description: String,                    // A brief description of the application.
     appearance: Option<AppearanceConfig>,   // Optional UI configuration settings.
     server: Option<ServerConfig>,           // Optional server configuration settings.
+    logging: Option<LoggingConfig>,         // Optional log rotation/retention settings.
     cards: HashMap<String, CardConfig>,     // Hashmap of the cards with the CardConfig structure
 }
 
@@ -35,15 +36,19 @@ pub struct ConfigurationFile {
 pub struct ServerConfig {
     pub listen_port: u16,
     pub connection_limit: u16,
-    /// Max number of devices allowed to queue for a card once all cards are checked
-    /// out (see `card_pool`). `#[serde(default)]` so config.yaml files written before
-    /// this field existed still load instead of failing to parse.
-    #[serde(default = "default_max_auth_queue")]
-    pub max_auth_queue: u16,
 }
 
-fn default_max_auth_queue() -> u16 {
-    50
+pub const DEFAULT_LOG_RETENTION_DAYS: u32 = 7;
+
+/// Log file rotation/retention settings. See `logger.rs`. Generated with the
+/// default retention once on first boot (or on upgrade from a config that
+/// predates this field) in `init_config()`.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct LoggingConfig {
+    /// How many days of rotated (compressed) log files to keep before they're
+    /// deleted. A new log file is started on every process launch and,
+    /// additionally, once per calendar day while running.
+    pub retention_days: u32,
 }
 
 // Dark Theme enum, part of AppearanceConfig that contains data about the theme.
@@ -97,7 +102,7 @@ pub fn get_config_path() -> io::Result<PathBuf> {
     }
 
     config_path.push("Documents");
-    config_path.push("tba");
+    config_path.push("tcs");
 
     log::debug!("Config directory path resolved to: {:?}", config_path);
 
@@ -298,22 +303,13 @@ pub fn update_server_config(
     listen_port: u16,
     connection_limit: u16,
     theme: &str,
+    allow_anonymous_data: bool,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut config = load_config(config_path)?;
-
-    // max_auth_queue isn't editable from this command yet (no settings-UI field for
-    // it) — preserve whatever was already on disk instead of resetting it to the
-    // default every time listen_port/connection_limit are saved from the UI.
-    let max_auth_queue = config
-        .server
-        .as_ref()
-        .map(|s| s.max_auth_queue)
-        .unwrap_or_else(default_max_auth_queue);
 
     config.server = Some(ServerConfig {
         listen_port,
         connection_limit,
-        max_auth_queue,
     });
     config.appearance = Some(AppearanceConfig {
         dark_theme: match theme {
@@ -322,6 +318,20 @@ pub fn update_server_config(
             "Light" => DarkTheme::Light,
             _ => DarkTheme::Auto,
         },
+    });
+    // Preserve the existing salt/upload_url/cursor — only the toggle itself
+    // changes from this path. `init_config()` guarantees this is `Some` by
+    // the time the app can even reach a save from the settings dialog, but
+    // fall back safely (fresh salt) rather than panic if that's ever not true.
+    let existing_telemetry = config.telemetry.clone().unwrap_or_else(|| TelemetryConfig {
+        allow_anonymous_data,
+        salt: generate_telemetry_salt(),
+        upload_url: None,
+        uploaded_through_timestamp: 0,
+    });
+    config.telemetry = Some(TelemetryConfig {
+        allow_anonymous_data,
+        ..existing_telemetry
     });
 
     save_config(config_path, &config)?;
@@ -392,7 +402,7 @@ pub async fn remove_card_from_config(
 /// Public function to update the server address in the configuration.
 /// This function is a Tauri command that updates the configuration file with a new server address.
 #[tauri::command]
-pub fn update_server(listen_port: String, connection_limit: String, theme: &str) -> bool {
+pub fn update_server(listen_port: String, connection_limit: String, theme: &str, allow_anonymous_data: bool) -> bool {
     let config_path = match get_config_path() {
         Ok(path) => path,
         Err(e) => {
@@ -400,11 +410,11 @@ pub fn update_server(listen_port: String, connection_limit: String, theme: &str)
             return false;
         }
     };
-    log::info!("Updating server configuration: listen_port={}, connection_limit={}, theme={}", listen_port, connection_limit, theme);
+    log::info!("Updating server configuration: listen_port={}, connection_limit={}, theme={}, allow_anonymous_data={}", listen_port, connection_limit, theme, allow_anonymous_data);
 
-    match update_server_config(&config_path, listen_port.parse().unwrap_or(7878), connection_limit.parse().unwrap_or(1000), theme) {
+    match update_server_config(&config_path, listen_port.parse().unwrap_or(7878), connection_limit.parse().unwrap_or(1000), theme, allow_anonymous_data) {
         Ok(_) => {
-            log::info!("The server configuration is updated: listen_port={}, connection_limit={}, theme={}", listen_port, connection_limit, theme);
+            log::info!("The server configuration is updated: listen_port={}, connection_limit={}, theme={}, allow_anonymous_data={}", listen_port, connection_limit, theme, allow_anonymous_data);
             true
         }
         Err(e) => {
@@ -426,6 +436,7 @@ pub struct CacheConfigData {
     pub cards: HashMap<String, CardConfig>,
     pub server: Option<ServerConfig>,
     pub appearance: Option<AppearanceConfig>,
+    pub logging: Option<LoggingConfig>,
 }
 
 lazy_static! {
@@ -439,7 +450,8 @@ lazy_static! {
 pub enum CacheSection {
     Cards,
     Server,
-    Appearance
+    Appearance,
+    Logging,
 }
 
 /// Returns a clone of the CardConfig for the given card number from the runtime cache,
@@ -524,7 +536,6 @@ pub fn get_from_cache(section: CacheSection, key: &str) -> String {
                 match key {
                     "listen_port" => server.listen_port.to_string(),
                     "connection_limit" => server.connection_limit.to_string(),
-                    "max_auth_queue" => server.max_auth_queue.to_string(),
                     _ => {
                         log::debug!("Unknown key for server section: {}", key);
                         "".to_string()
@@ -552,23 +563,22 @@ pub fn get_from_cache(section: CacheSection, key: &str) -> String {
                 "".to_string()
             }
         }
-    }
-}
 
-/// Splits a host string into host and port components.
-///
-/// This function takes a string containing a host and port separated by a colon (e.g., "example.com:8080"),
-/// and splits it into two separate strings: the host and the port. If the input string does not contain a colon,
-/// it returns an error.
-pub fn split_host_to_parts(host: &str) -> Result<(String, u16), String> {
-    let parts: Vec<&str> = host.split(':').collect();
-    if parts.len() == 2 {
-        let port = parts[1]
-            .parse::<u16>()
-            .map_err(|_| "Invalid port number".to_string())?;
-        Ok((parts[0].to_string(), port))
-    } else {
-        Err("Host doesn't correspond to the format 'host:port'".to_string())
+        CacheSection::Logging => {
+            log::debug!("Accessing Logging config");
+            if let Some(logging) = &cache.logging {
+                match key {
+                    "retention_days" => logging.retention_days.to_string(),
+                    _ => {
+                        log::debug!("Unknown key for logging section: {}", key);
+                        "".to_string()
+                    }
+                }
+            } else {
+                log::debug!("No logging config found");
+                "".to_string()
+            }
+        }
     }
 }
 
@@ -585,6 +595,8 @@ pub fn load_config_to_cache(
         cards: config.cards.clone(),
         server: config.server.clone(),
         appearance: config.appearance.clone(),
+        telemetry: config.telemetry.clone(),
+        logging: config.logging.clone(),
     };
 
     // trace_cache(&*cache);
@@ -592,49 +604,11 @@ pub fn load_config_to_cache(
     Ok(())
 }
 
-// pub fn trace_cache(cache: &CacheConfigData) {
-//     log::debug!("HashMap: Company Card Number => Card Configuration ----------");
-//     for (card_number, card_config) in cache.cards.iter() {
-//         log::debug!(
-//             "CN: {:<16} | ICCID: {:<16} | Expire: {}",
-//             card_number,
-//             card_config.iccid,
-//             card_config.expire.unwrap_or(0)
-//         );
-//     }
-//     log::debug!("{}", "-".repeat(70));
-
-//     if let Some(ident) = &cache.ident {
-//         log::debug!("ident: {}", ident);
-//     }
-
-//     if let Some(server) = &cache.server {
-//         log::debug!("Server Host: {}", server.host);
-//     } else {
-//         log::warn!("No server configuration found.");
-//     }
-
-//     if let Some(appearance) = &cache.appearance {
-//         log::debug!("Appearance: {:?}", appearance);
-//     } else {
-//         log::warn!("No appearance configuration found.");
-//     }
-// }
-
-/// Generates a unique ident value based on the current time in microseconds.
-/// The ident value is in the format "TBA" followed by 13 digits.
-fn generate_ident() -> String {
-    let start = SystemTime::now();
-    let since_the_epoch = start.duration_since(UNIX_EPOCH).expect("Time went backwards");
-    let micros = since_the_epoch.as_micros();
-    format!("TBA{:013}", micros % 1_000_000_000_000u128)
-}
-
 /// Initializes the configuration file.
 /// This function creates a default configuration file if it does not exist, and loads it into the cache.
 pub fn init_config() -> io::Result<()> {
     let config_path = get_config_path()?;
-    let config: ConfigurationFile;
+    let mut config: ConfigurationFile;
 
     if config_path.exists() {
         let mut contents = String::new();
@@ -653,6 +627,14 @@ pub fn init_config() -> io::Result<()> {
     } else {
         log::debug!("Config file not found. Generating default config.");
         config = generate_default_config();
+    }
+
+    // Same backfill approach as telemetry above — covers a brand-new config
+    // and an upgrade from one that predates log rotation.
+    if config.logging.is_none() {
+        config.logging = Some(LoggingConfig {
+            retention_days: DEFAULT_LOG_RETENTION_DAYS,
+        });
     }
 
     save_config(&config_path, &config)
@@ -687,6 +669,7 @@ fn generate_default_config() -> ConfigurationFile {
             dark_theme: DarkTheme::Auto,
         }),
         server: None,
+        logging: None,
         cards: HashMap::new(),
     }
 }
@@ -707,7 +690,7 @@ mod tests {
             .unwrap_or(0);
         let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
         let mut dir = std::env::temp_dir();
-        dir.push(format!("tba-test-{}-{}-{}-{}", tag, pid, nanos, seq));
+        dir.push(format!("tcs-test-{}-{}-{}-{}", tag, pid, nanos, seq));
         fs::create_dir_all(&dir).expect("create tmp dir");
         dir
     }
@@ -728,7 +711,7 @@ mod tests {
             },
         );
         ConfigurationFile {
-            name: "TBA".to_string(),
+            name: "TCS".to_string(),
             version: "0.0.0-test".to_string(),
             description: "test".to_string(),
             appearance: Some(AppearanceConfig {
@@ -737,8 +720,14 @@ mod tests {
             server: Some(ServerConfig {
                 listen_port: 7878,
                 connection_limit: 1000,
-                max_auth_queue: 50,
             }),
+            telemetry: Some(TelemetryConfig {
+                allow_anonymous_data: true,
+                salt: "test-salt".to_string(),
+                upload_url: None,
+                uploaded_through_timestamp: 0,
+            }),
+            logging: Some(LoggingConfig { retention_days: 7 }),
             cards,
         }
     }
@@ -841,7 +830,7 @@ mod tests {
     #[test]
     fn generate_ident_format() {
         let id = generate_ident();
-        assert!(id.starts_with("TBA"));
+        assert!(id.starts_with("TCS"));
         assert_eq!(id.len(), 3 + 13);
         assert!(id[3..].chars().all(|c| c.is_ascii_digit()));
     }

@@ -1,10 +1,10 @@
 // Passive APDU sniffer.
 //
-// TBA is a transparent proxy between flespi (VU role) and the smart card.
+// TCS is a transparent proxy between an Astra device and the smart card.
 // After Gen1 mutual authentication flespi wraps every APDU in Secure Messaging
 // (CLA=0C), but for tachograph cards the SM wrapper uses DO'81 (plain value) +
 // DO'8E (MAC) — no DO'87 (encrypted value). That means the file content flows
-// through TBA in cleartext; only integrity is protected.
+// through TCS in cleartext; only integrity is protected.
 //
 // This module observes (CAPDU, RAPDU) pairs and, when a READ BINARY response
 // arrives for a previously-SELECTed EF we recognise (0520 EF_Identification,

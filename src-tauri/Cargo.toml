@@ -1,10 +1,10 @@
 [package]
-name = "tacho-bridge-application"
-version = "0.7.3"
+name = "tacho-card-server"
+version = "0.0.1"
 description = "Tachograph authentication application"
-authors = ["Shatilo Evgeny"]
+authors = ["Jessica Doyle"]
 license = ""
-repository = "https://git.gurtam.net/shev/flespi_tca"
+repository = "https://github.com/astra-telematics/Tacho-Card-Server"
 edition = "2021"
 rust-version = "1.84.0"
 
@@ -28,7 +28,6 @@ tauri-plugin-log = "2.0.0-rc"
 pcsc = "2.9.0"
 hex = "0.4.3"
 rumqttc = "0.25.1"
-fern = "0.7.1"
 chrono = "0.4.39"
 serde_yaml = "0.9.34"
 lazy_static = "1.5.0"
@@ -39,6 +38,11 @@ once_cell = "1.21.3"
 tokio-serial = "5.4.5"
 serialport = "4.8.1"
 luhn = "1.0.1"
+sha2 = "0.10"
+rand = "0.8"
+tauri-plugin-opener = "2"
+crc32fast = "1"
+flexi_logger = { version = "0.31", features = ["compress"] }
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.61", features = ["Win32_System_Console"] }

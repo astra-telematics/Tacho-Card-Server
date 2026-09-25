@@ -6,7 +6,9 @@ use std::time::Duration;
 use tokio::{io::AsyncReadExt, time::timeout};
 
 use crate::device_protocol::{
-    AbortMessage, CardToTachoMessage, ConnAnnounceMessage, ConnResponseMessage, PingMessage, PongMessage, ReadyMessage, TachoToCardMessage, ready_message};
+    AbortMessage, AuthOutcomeMessage, CardToTachoMessage, ConnAnnounceMessage, ConnResponseMessage,
+    DownloadAckMessage, DownloadChunkMessage, DownloadCompleteMessage, DownloadStartMessage,
+    PingMessage, PongMessage, ReadyMessage, TachoToCardMessage, ready_message};
 use crate::device_protocol::{ProtocolError, Result};
 
 pub enum Message {
@@ -18,6 +20,11 @@ pub enum Message {
     TachoToCard(TachoToCardMessage),
     CardToTacho(CardToTachoMessage),
     Abort(AbortMessage),
+    AuthOutcome(AuthOutcomeMessage),
+    DownloadStart(DownloadStartMessage),
+    DownloadChunk(DownloadChunkMessage),
+    DownloadComplete(DownloadCompleteMessage),
+    DownloadAck(DownloadAckMessage),
 }
 
 
@@ -55,7 +62,7 @@ impl MessageReader<'_> {
                     Err(_) => return None, // Read error
                 }
             }
-            println!("[TCP] peer={} buffer_len={} buffer={:?}", self.stream.as_ref().peer_addr().unwrap(), self.buffer.len(), self.buffer);
+            log::debug!("[TCP] peer={} buffer_len={} buffer={:?}", self.stream.as_ref().peer_addr().unwrap(), self.buffer.len(), self.buffer);
 
             // We have header; read payload length and ensure full message present
             let payload_length = u16::from_be_bytes([self.buffer[3], self.buffer[4]]) as usize;
@@ -143,6 +150,36 @@ impl Into<Vec<u8>> for Message {
                 bytes.extend_from_slice(&(payload.len() as u16).to_be_bytes()); // Payload Length
                 bytes.extend_from_slice(&payload);                  // Payload
             },
+            Message::AuthOutcome(auth_outcome_message) => {
+                let payload: Vec<u8> = auth_outcome_message.into();
+                bytes.extend_from_slice(&0x0008u16.to_be_bytes());  // Message Type
+                bytes.extend_from_slice(&(payload.len() as u16).to_be_bytes()); // Payload Length
+                bytes.extend_from_slice(&payload);                  // Payload
+            },
+            Message::DownloadStart(download_start_message) => {
+                let payload: Vec<u8> = download_start_message.into();
+                bytes.extend_from_slice(&0x0009u16.to_be_bytes());  // Message Type
+                bytes.extend_from_slice(&(payload.len() as u16).to_be_bytes()); // Payload Length
+                bytes.extend_from_slice(&payload);                  // Payload
+            },
+            Message::DownloadChunk(download_chunk_message) => {
+                let payload: Vec<u8> = download_chunk_message.into();
+                bytes.extend_from_slice(&0x000Au16.to_be_bytes());  // Message Type
+                bytes.extend_from_slice(&(payload.len() as u16).to_be_bytes()); // Payload Length
+                bytes.extend_from_slice(&payload);                  // Payload
+            },
+            Message::DownloadComplete(download_complete_message) => {
+                let payload: Vec<u8> = download_complete_message.into();
+                bytes.extend_from_slice(&0x000Bu16.to_be_bytes());  // Message Type
+                bytes.extend_from_slice(&(payload.len() as u16).to_be_bytes()); // Payload Length
+                bytes.extend_from_slice(&payload);                  // Payload
+            },
+            Message::DownloadAck(download_ack_message) => {
+                let payload: Vec<u8> = download_ack_message.into();
+                bytes.extend_from_slice(&0x000Cu16.to_be_bytes());  // Message Type
+                bytes.extend_from_slice(&(payload.len() as u16).to_be_bytes()); // Payload Length
+                bytes.extend_from_slice(&payload);                  // Payload
+            },
         }
         bytes
     }
@@ -214,6 +251,41 @@ impl TryFrom<Vec<u8>> for Message {
             0x0007 => {
                 match AbortMessage::try_from(payload.to_vec()) {
                     Ok(abort_message) => Ok(Message::Abort(abort_message)),
+                    Err(e) => Err(e),
+                }
+            },
+
+            0x0008 => {
+                match AuthOutcomeMessage::try_from(payload.to_vec()) {
+                    Ok(auth_outcome_message) => Ok(Message::AuthOutcome(auth_outcome_message)),
+                    Err(e) => Err(e),
+                }
+            },
+
+            0x0009 => {
+                match DownloadStartMessage::try_from(payload.to_vec()) {
+                    Ok(download_start_message) => Ok(Message::DownloadStart(download_start_message)),
+                    Err(e) => Err(e),
+                }
+            },
+
+            0x000A => {
+                match DownloadChunkMessage::try_from(payload.to_vec()) {
+                    Ok(download_chunk_message) => Ok(Message::DownloadChunk(download_chunk_message)),
+                    Err(e) => Err(e),
+                }
+            },
+
+            0x000B => {
+                match DownloadCompleteMessage::try_from(payload.to_vec()) {
+                    Ok(download_complete_message) => Ok(Message::DownloadComplete(download_complete_message)),
+                    Err(e) => Err(e),
+                }
+            },
+
+            0x000C => {
+                match DownloadAckMessage::try_from(payload.to_vec()) {
+                    Ok(download_ack_message) => Ok(Message::DownloadAck(download_ack_message)),
                     Err(e) => Err(e),
                 }
             },
