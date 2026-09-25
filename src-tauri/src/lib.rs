@@ -9,7 +9,6 @@ mod global_app_handle;  // Global access to app state and emitters.
 mod socket_server;      // TCP listen server (replacement for the outbound MQTT client).
 mod device_protocol;    // Device protocol message definitions and parsing.
 mod card_pool;          // Bounded pool of physical cards shared across authenticating devices.
-mod telemetry;          // Anonymous, opt-out protocol-selection telemetry.
 mod vu_download;        // VU data download: CRC verification, VRN extraction, storage.
 // mod com_port;          // COM port handling.
 
@@ -108,29 +107,6 @@ pub fn run() {
                             log::error!("[TCP] phase=listen status=failed err={:?}", e);
                         }
                     });
-
-                    async_runtime::spawn(async {
-                        // Periodic anonymous telemetry upload (see telemetry.rs). No-ops
-                        // until both `allow_anonymous_data` is on and an upload_url is
-                        // configured — the local log accumulates either way.
-                        telemetry::run_periodic_upload().await;
-                    });
-
-                    // Spawn a background task to monitor the COM port for the Smart Card Rack device. This will run concurrently with the main application.
-                    // async_runtime::spawn(async {
-                    //     // Find the COM port for the Smart Card Rack device using its VID and PID. If found, start monitoring it.
-                    //     if let Ok(Some(port)) = com_port::find_card_reader_by_vid_pid(0x0403, 0x6015).await {
-                    //         log::info!("Smart Card Rack found at: {}", port);
-                            
-                    //         // Start continuous monitoring in the background for the COM port. This function will run indefinitely, checking for card insertions and removals.
-                    //         match com_port::monitor_card_reader(port).await {
-                    //             Ok(_) => log::info!("COM port monitor finished"),
-                    //             Err(e) => log::error!("COM port monitor error: {}", e),
-                    //         }
-                    //     } else {
-                    //         log::warn!("Smart Card Rack device not found (VID:0x0403, PID:0x6015)");
-                    //     }
-                    // });
                 });
 
                 // Handle the application close event to log this.
@@ -148,7 +124,6 @@ pub fn run() {
             config::update_server,         // update server config from the frontend
             config::remove_card,            // remove card from config
             smart_card::manual_sync_cards, // manual sync cards from the frontend
-            telemetry::open_telemetry_log, // open the local anonymous telemetry log
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -196,10 +171,6 @@ fn run_headless() {
         {
             log::error!("[TCP] phase=listen status=failed err={:?}", e);
         }
-    });
-
-    async_runtime::spawn(async {
-        telemetry::run_periodic_upload().await;
     });
 
     log::info!("-== Application is running in headless mode ==-");

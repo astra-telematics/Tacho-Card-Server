@@ -443,15 +443,6 @@ async fn handle_connection(mut stream: TcpStream, peer_addr: SocketAddr, over_so
                             if let Some(iccid) = guard.iccid.get() {
                                 let card_number = crate::config::get_from_cache(crate::config::CacheSection::Cards, iccid);
                                 crate::config::record_auth_result_async(&card_number, auth_outcome_message.success).await;
-
-                                let imei_value = imei.clone().unwrap_or_default();
-                                crate::telemetry::record_session_outcome(
-                                    iccid,
-                                    &imei_value,
-                                    guard.atr(),
-                                    guard.protocol(),
-                                    auth_outcome_message.success,
-                                );
                             }
 
                             // The download phase (if any) needs zero card interaction —

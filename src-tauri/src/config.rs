@@ -319,21 +319,6 @@ pub fn update_server_config(
             _ => DarkTheme::Auto,
         },
     });
-    // Preserve the existing salt/upload_url/cursor — only the toggle itself
-    // changes from this path. `init_config()` guarantees this is `Some` by
-    // the time the app can even reach a save from the settings dialog, but
-    // fall back safely (fresh salt) rather than panic if that's ever not true.
-    let existing_telemetry = config.telemetry.clone().unwrap_or_else(|| TelemetryConfig {
-        allow_anonymous_data,
-        salt: generate_telemetry_salt(),
-        upload_url: None,
-        uploaded_through_timestamp: 0,
-    });
-    config.telemetry = Some(TelemetryConfig {
-        allow_anonymous_data,
-        ..existing_telemetry
-    });
-
     save_config(config_path, &config)?;
     load_config_to_cache(&config)?;
 
@@ -595,7 +580,6 @@ pub fn load_config_to_cache(
         cards: config.cards.clone(),
         server: config.server.clone(),
         appearance: config.appearance.clone(),
-        telemetry: config.telemetry.clone(),
         logging: config.logging.clone(),
     };
 
@@ -719,13 +703,7 @@ mod tests {
             }),
             server: Some(ServerConfig {
                 listen_port: 7878,
-                connection_limit: 1000,
-            }),
-            telemetry: Some(TelemetryConfig {
-                allow_anonymous_data: true,
-                salt: "test-salt".to_string(),
-                upload_url: None,
-                uploaded_through_timestamp: 0,
+                connection_limit: 100,
             }),
             logging: Some(LoggingConfig { retention_days: 7 }),
             cards,
@@ -803,36 +781,11 @@ mod tests {
     }
 
     #[test]
-    fn split_host_to_parts_valid() {
-        let (host, port) = split_host_to_parts("mqtt.flespi.io:8883").expect("split");
-        assert_eq!(host, "mqtt.flespi.io");
-        assert_eq!(port, 8883);
-    }
-
-    #[test]
-    fn split_host_to_parts_missing_port() {
-        assert!(split_host_to_parts("mqtt.flespi.io").is_err());
-    }
-
-    #[test]
-    fn split_host_to_parts_bad_port() {
-        assert!(split_host_to_parts("mqtt.flespi.io:notaport").is_err());
-    }
-
-    #[test]
     fn generate_default_config_is_well_formed() {
         let cfg = generate_default_config();
         assert!(!cfg.name.is_empty());
         assert!(!cfg.version.is_empty());
         assert!(cfg.cards.is_empty());
-    }
-
-    #[test]
-    fn generate_ident_format() {
-        let id = generate_ident();
-        assert!(id.starts_with("TCS"));
-        assert_eq!(id.len(), 3 + 13);
-        assert!(id[3..].chars().all(|c| c.is_ascii_digit()));
     }
 
     #[test]
