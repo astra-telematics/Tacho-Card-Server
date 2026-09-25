@@ -74,6 +74,11 @@
             @update:model-value="changeTheme"
           />
         </div>
+        <q-toggle
+          v-model="minimizeToTrayValue"
+          label="Minimise to tray when closed"
+          class="q-mt-sm"
+        />
       </q-card-section>
       <q-card-actions align="right" class="text-primary">
         <q-btn flat label="Cancel" v-close-popup />
@@ -102,6 +107,7 @@ const listenPortValue = ref(7878)
 const connectionLimitValue = ref(100)
 const logRetentionDaysValue = ref(7)
 const downloadPathValue = ref('')
+const minimizeToTrayValue = ref(true)
 
 const $q = useQuasar()
 const selectedTheme = ref('')
@@ -132,6 +138,7 @@ const saveServerConfig = async () => {
       downloadPath: downloadPathValue.value,
       logRetentionDays: logRetentionDaysValue.value.toString(),
       theme: selectedTheme.value,
+      minimizeToTray: minimizeToTrayValue.value,
     })
 
     console.log('Response from update_server:', response)
@@ -166,6 +173,7 @@ listen('global-config-server', (event) => {
     download_path: string
     retention_days: number
     dark_theme: string
+    minimize_to_tray: string
   }
   console.log(
     'listen_port:',
@@ -180,6 +188,8 @@ listen('global-config-server', (event) => {
   connectionLimitValue.value = payload.connection_limit
   downloadPathValue.value = payload.download_path
   logRetentionDaysValue.value = payload.retention_days
+  // Backend cache values are plain strings; empty (no appearance section yet) means on.
+  minimizeToTrayValue.value = payload.minimize_to_tray !== 'false'
 
   changeTheme(payload.dark_theme)
   selectedTheme.value = payload.dark_theme

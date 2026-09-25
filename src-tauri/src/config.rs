@@ -6,7 +6,7 @@ use std::fs;
 use std::fs::File;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 // ───── External Crates ─────
@@ -90,93 +90,117 @@ pub struct CardConfig {
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct AppearanceConfig {
     pub dark_theme: DarkTheme,
+    /// Closing the window hides it to the tray instead of exiting. Defaulted so
+    /// configs written before this field existed still parse.
+    #[serde(default = "default_minimize_to_tray")]
+    pub minimize_to_tray: bool,
 }
 
-/// Retrieves the configuration file path.
-/// This function constructs the path to the configuration file, creating the necessary directories if they do not exist.
+fn default_minimize_to_tray() -> bool {
+    true
+}
+
+/// Config file path given with `--config` on the command line, if any. Set once at
+/// startup, before anything reads the config.
+static CONFIG_PATH_OVERRIDE: OnceLock<PathBuf> = OnceLock::new();
+
+const DEFAULT_CONFIG_FILE_NAME: &str = "config.yaml";
+
+/// Use `path` (an absolute config file path) instead of `~/Documents/tcs/config.yaml`.
+/// Its directory becomes the data directory, so logs and the default downloads folder
+/// move with it. Must be called before `init_config()`; later calls are ignored.
+pub fn set_config_path_override(path: PathBuf) {
+    let _ = CONFIG_PATH_OVERRIDE.set(path);
+}
+
+/// Suffix for the app identifier when `--config` is in use, so single-instance
+/// detection is per config file: relaunching with the same config focuses the running
+/// window, while a different config starts its own instance. `None` for the default
+/// config, which keeps the plain identifier.
+pub fn instance_id_suffix() -> Option<String> {
+    use std::hash::{Hash, Hasher};
+
+    use std::path::Component;
+
+    let path = CONFIG_PATH_OVERRIDE.get()?;
+    // Lexical normalisation (the path is already absolute): drop `.`, resolve `..`, and
+    // unify separators, so `D:\tcs\config.yaml` and `d:/tcs/./config.yaml` match. Not
+    // `fs::canonicalize`, which fails until the file exists and adds a `\\?\` prefix
+    // on Windows, so two launches could disagree.
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            other => normalized.push(other),
+        }
+    }
+    let key = normalized.to_string_lossy();
+    #[cfg(target_os = "windows")]
+    let key = key.to_lowercase();
+
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    key.hash(&mut hasher);
+    Some(format!(".cfg{:016x}", hasher.finish()))
+}
+
+/// The directory holding the config file (`~/Documents/tcs` unless overridden with
+/// `--config`). Logs and the default downloads folder live under it. Created if missing.
+pub fn get_data_dir() -> io::Result<PathBuf> {
+    let dir = match CONFIG_PATH_OVERRIDE.get() {
+        Some(path) => path
+            .parent()
+            .map(Path::to_path_buf)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "config path has no parent directory"))?,
+        None => {
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            let home_dir = env::var("HOME");
+
+            #[cfg(target_os = "windows")]
+            let home_dir = env::var("USERPROFILE");
+
+            let home = home_dir.map_err(|e| {
+                log::error!("Failed to get home directory environment variable: {}", e);
+                io::Error::new(io::ErrorKind::Other, "Failed to get home directory environment variable")
+            })?;
+            let mut dir = PathBuf::from(home);
+            dir.push("Documents");
+            dir.push("tcs");
+            dir
+        }
+    };
+
+    if let Err(e) = fs::create_dir_all(&dir) {
+        log::error!("Failed to create data directory {:?}: {}", dir, e);
+        return Err(e);
+    }
+
+    Ok(dir)
+}
+
+/// Retrieves the configuration file path: the `--config` path if one was given,
+/// otherwise `~/Documents/tcs/config.yaml`. Creates the containing directory if needed.
 pub fn get_config_path() -> io::Result<PathBuf> {
-    let mut config_path = PathBuf::new();
-
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    let home_dir = env::var("HOME");
-
-    #[cfg(target_os = "windows")]
-    let home_dir = env::var("USERPROFILE");
-
-    match &home_dir {
-        Ok(home) => {
-            log::debug!("Home directory found: {}", home);
-            config_path.push(home);
-        }
-        Err(e) => {
-            log::error!("Failed to get home directory environment variable: {}", e);
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
-                "Failed to get home directory environment variable",
-            ));
-        }
-    }
-
-    config_path.push("Documents");
-    config_path.push("tcs");
-
-    log::debug!("Config directory path resolved to: {:?}", config_path);
-
-    if let Err(e) = fs::create_dir_all(&config_path) {
-        log::error!("Failed to create config directory {:?}: {}", config_path, e);
-        return Err(e);
-    }
-
-    config_path.push("config.yaml");
-
-    log::debug!("Final config file path: {:?}", config_path);
-
-    Ok(config_path)
+    let dir = get_data_dir()?;
+    let file_name = CONFIG_PATH_OVERRIDE
+        .get()
+        .and_then(|path| path.file_name())
+        .unwrap_or(DEFAULT_CONFIG_FILE_NAME.as_ref());
+    Ok(dir.join(file_name))
 }
 
+/// `<data dir>/downloads`, created if missing.
 pub fn get_default_download_path() -> io::Result<String> {
-    let mut config_path = PathBuf::new();
+    let dir = get_data_dir()?.join("downloads");
 
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    let home_dir = env::var("HOME");
-
-    #[cfg(target_os = "windows")]
-    let home_dir = env::var("USERPROFILE");
-
-    match &home_dir {
-        Ok(home) => {
-            log::debug!("Home directory found: {}", home);
-            config_path.push(home);
-        }
-        Err(e) => {
-            log::error!("Failed to get home directory environment variable: {}", e);
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
-                "Failed to get home directory environment variable",
-            ));
-        }
-    }
-
-    config_path.push("Documents");
-    config_path.push("tcs");
-
-    log::debug!("Config directory path resolved to: {:?}", config_path);
-
-    if let Err(e) = fs::create_dir_all(&config_path) {
-        log::error!("Failed to create config directory {:?}: {}", config_path, e);
+    if let Err(e) = fs::create_dir_all(&dir) {
+        log::error!("Failed to create download directory {:?}: {}", dir, e);
         return Err(e);
     }
 
-    config_path.push("downloads");
-
-    if let Err(e) = fs::create_dir_all(&config_path) {
-        log::error!("Failed to create download directory {:?}: {}", config_path, e);
-        return Err(e);
-    }
-
-    log::debug!("Final download directory path: {:?}", config_path);
-
-    Ok(config_path.to_str().unwrap_or("").to_string())
+    Ok(dir.to_str().unwrap_or("").to_string())
 }
 
 /// Load the configuration from the file.
@@ -365,7 +389,8 @@ pub fn update_server_config(
     connection_limit: u16,
     download_path: String,
     log_retention_days: u32,
-    theme: &str
+    theme: &str,
+    minimize_to_tray: bool,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut config = load_config(config_path)?;
 
@@ -384,6 +409,7 @@ pub fn update_server_config(
             "Light" => DarkTheme::Light,
             _ => DarkTheme::Auto,
         },
+        minimize_to_tray,
     });
     save_config(config_path, &config)?;
     load_config_to_cache(&config)?;
@@ -456,7 +482,7 @@ pub async fn remove_card_from_config(
 /// Public function to update the server address in the configuration.
 /// This function is a Tauri command that updates the configuration file with a new server address.
 #[tauri::command]
-pub fn update_server(listen_port: String, connection_limit: String, download_path: String, log_retention_days: String, theme: &str) -> bool {
+pub fn update_server(listen_port: String, connection_limit: String, download_path: String, log_retention_days: String, theme: &str, minimize_to_tray: bool) -> bool {
     let config_path = match get_config_path() {
         Ok(path) => path,
         Err(e) => {
@@ -464,16 +490,17 @@ pub fn update_server(listen_port: String, connection_limit: String, download_pat
             return false;
         }
     };
-    log::info!("Updating server configuration: listen_port={}, connection_limit={}, download_path={}, log_retention_days={}, theme={}", listen_port, connection_limit, download_path, log_retention_days, theme);
+    log::info!("Updating server configuration: listen_port={}, connection_limit={}, download_path={}, log_retention_days={}, theme={}, minimize_to_tray={}", listen_port, connection_limit, download_path, log_retention_days, theme, minimize_to_tray);
 
     match update_server_config(&config_path, 
         listen_port.parse().unwrap_or(DEFAULT_SERVER_LISTEN_PORT), 
         connection_limit.parse().unwrap_or(DEFAULT_SERVER_CONNECTION_LIMIT), 
         if download_path.trim().is_empty() { default_download_path() } else { download_path.trim().to_string() },
         log_retention_days.parse().unwrap_or(DEFAULT_LOG_RETENTION_DAYS), 
-        theme) {
+        theme,
+        minimize_to_tray) {
         Ok(_) => {
-            log::info!("The server configuration is updated: listen_port={}, connection_limit={}, download_path={}, log_retention_days={}, theme={}", listen_port, connection_limit, download_path, log_retention_days, theme);
+            log::info!("The server configuration is updated: listen_port={}, connection_limit={}, download_path={}, log_retention_days={}, theme={}, minimize_to_tray={}", listen_port, connection_limit, download_path, log_retention_days, theme, minimize_to_tray);
             true
         }
         Err(e) => {
@@ -558,7 +585,6 @@ pub fn get_from_cache(section: CacheSection, key: &str) -> String {
     let cache = CACHE.lock().unwrap();
 
     log::debug!("Accessing cache section: {:?}, key: {}", section, key);
-    log::debug!("Current cache state: {:?}", *cache); // Покажет всё, если у `CacheConfigData` реализован Debug
 
     match section {
         CacheSection::Cards => {
@@ -611,6 +637,7 @@ pub fn get_from_cache(section: CacheSection, key: &str) -> String {
                 log::debug!("Appearance config: {:?}", appearance);
                 match key {
                     "dark_theme" => format!("{:?}", appearance.dark_theme),
+                    "minimize_to_tray" => appearance.minimize_to_tray.to_string(),
                     _ => {
                         log::debug!("Unknown key for appearance section: {}", key);
                         "".to_string()
@@ -730,6 +757,7 @@ fn generate_default_config() -> ConfigurationFile {
         description: "Application for the tachograph cards authentication".to_string(),
         appearance: Some(AppearanceConfig {
             dark_theme: DarkTheme::Auto,
+            minimize_to_tray: true,
         }),
         server: Some(ServerConfig { listen_port: 7878, connection_limit: 100, download_path: default_download_path() }),
         logging: Some(LoggingConfig { retention_days: DEFAULT_LOG_RETENTION_DAYS }),
@@ -779,6 +807,7 @@ mod tests {
             description: "test".to_string(),
             appearance: Some(AppearanceConfig {
                 dark_theme: DarkTheme::Auto,
+                minimize_to_tray: true,
             }),
             server: Some(ServerConfig {
                 listen_port: 7878,
@@ -907,6 +936,7 @@ pub fn emit_global_config_server(app: &tauri::AppHandle) -> Result<(), Box<dyn E
     let download_path = get_from_cache(CacheSection::Server, "download_path");
     let logging_retention_days = get_from_cache(CacheSection::Logging, "retention_days");
     let appearance = get_from_cache(CacheSection::Appearance, "dark_theme");
+    let minimize_to_tray = get_from_cache(CacheSection::Appearance, "minimize_to_tray");
 
     let mut config_app_payload = HashMap::new();
     config_app_payload.insert("listen_port", listen_port);
@@ -914,6 +944,7 @@ pub fn emit_global_config_server(app: &tauri::AppHandle) -> Result<(), Box<dyn E
     config_app_payload.insert("download_path", download_path);
     config_app_payload.insert("retention_days", logging_retention_days);
     config_app_payload.insert("dark_theme", appearance);
+    config_app_payload.insert("minimize_to_tray", minimize_to_tray);
 
     // Emit this data as a global event to update fornt-end fields
     if let Err(e) = app.emit("global-config-server", config_app_payload) {

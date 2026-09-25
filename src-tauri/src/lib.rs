@@ -13,16 +13,34 @@ mod vu_download;        // VU data download: CRC verification, VRN extraction, s
 // mod com_port;          // COM port handling.
 
 // ───── External Crates ─────
-use tauri::{async_runtime, Listener, Manager, WindowEvent};
+use tauri::menu::{Menu, MenuItem};
+use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
+use tauri::{async_runtime, AppHandle, Listener, Manager, WindowEvent};
+use tauri_plugin_notification::NotificationExt;
 
 use crate::config::{CacheSection, get_from_cache}; // Tauri application framework and async runtime.
 
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Set on the first "frontend-loaded" event; see the handler in `run()`.
 static BACKEND_STARTED: AtomicBool = AtomicBool::new(false);
 
+/// Set the first time the window is hidden to the tray; see `notify_hidden_to_tray`.
+static TRAY_HINT_SHOWN: AtomicBool = AtomicBool::new(false);
+
 pub fn run() {
+    // `--config <path>` must be applied before anything reads the config or starts logging.
+    match config_path_from_args(std::env::args().skip(1)) {
+        Ok(Some(path)) => config::set_config_path_override(path),
+        Ok(None) => {}
+        Err(e) => {
+            attach_console();
+            eprintln!("{}", e);
+            std::process::exit(2);
+        }
+    }
+
     // Headless mode: run the card-monitoring / MQTT backend with no window or tray,
     // for use as a background service (e.g. on a server or via a system service manager).
     if std::env::args().any(|arg| arg == "--headless") {
@@ -30,10 +48,24 @@ pub fn run() {
         return;
     }
 
+    let mut context = tauri::generate_context!();
+    // Single-instance detection keys on the app identifier; make it per config file so
+    // `--config` instances with different configs can run side by side.
+    if let Some(suffix) = config::instance_id_suffix() {
+        context.config_mut().identifier.push_str(&suffix);
+    }
+
     // start builder to run tauri applicationrustup target add aarch64-pc-windows-msvc
     tauri::Builder::default()
+        // Must be the first plugin: a second launch (with the same config) exits here
+        // and brings the already-running instance's window to the front instead.
+        .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
+            log::info!("Second launch detected; showing the running instance.");
+            show_main_window(app);
+        }))
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_notification::init())
         .setup(move |app| {
             // Obtain a lightweight reference to the app for convenient interaction
             let app_handle = app.app_handle();
@@ -126,13 +158,28 @@ pub fn run() {
                     });
                 });
 
-                // Handle the application close event to log this.
+                // With `appearance.minimize_to_tray` on (the default), closing the window
+                // hides it to the tray and the backend keeps running; the tray's "Quit"
+                // is then the way to exit. With it off, closing exits as normal.
+                let close_window = window.clone();
                 window.on_window_event(move |event| {
-                    if let WindowEvent::CloseRequested { .. } = event {
-                        log::info!("-== Application is closed by user ==-\n");
+                    if let WindowEvent::CloseRequested { api, .. } = event {
+                        // Empty = no appearance section yet, which means the default (on).
+                        if get_from_cache(CacheSection::Appearance, "minimize_to_tray") == "false" {
+                            log::info!("-== Application is closed by user ==-\n");
+                            return;
+                        }
+                        api.prevent_close();
+                        if let Err(e) = close_window.hide() {
+                            log::error!("Failed to hide window to tray: {:?}", e);
+                        }
+                        log::info!("Window hidden to tray.");
+                        notify_hidden_to_tray(close_window.app_handle());
                     }
                 });
             }
+
+            build_tray(app)?;
 
             Ok(())
         })
@@ -143,8 +190,70 @@ pub fn run() {
             smart_card::manual_sync_cards, // manual sync cards from the frontend
             logger::open_logs_folder,      // open the log directory in the OS file manager
         ])
-        .run(tauri::generate_context!())
+        .run(context)
         .expect("error while running tauri application");
+}
+
+/// Shows, unminimises and focuses the main window (from the tray, or when a second
+/// launch hands over to this instance).
+fn show_main_window(app: &AppHandle) {
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.unminimize();
+        let _ = window.show();
+        let _ = window.set_focus();
+    }
+}
+
+/// Tells the user, once per run, that closing the window left the app running in the
+/// tray — otherwise it looks like it exited while it's still holding the port and cards.
+fn notify_hidden_to_tray(app: &AppHandle) {
+    if TRAY_HINT_SHOWN.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    if let Err(e) = app
+        .notification()
+        .builder()
+        .title("Tacho Card Server is still running")
+        .body("It's been minimised to the system tray. Use Quit from the tray icon to exit.")
+        .show()
+    {
+        log::warn!("Failed to show tray notification: {:?}", e);
+    }
+}
+
+/// Tray icon: left click shows the window; the menu has Show and Quit.
+fn build_tray(app: &tauri::App) -> tauri::Result<()> {
+    let show = MenuItem::with_id(app, "show", "Show", true, None::<&str>)?;
+    let quit = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
+    let menu = Menu::with_items(app, &[&show, &quit])?;
+
+    let mut tray = TrayIconBuilder::with_id("main")
+        .tooltip("Tacho Card Server")
+        .menu(&menu)
+        .show_menu_on_left_click(false)
+        .on_menu_event(|app, event| match event.id.as_ref() {
+            "show" => show_main_window(app),
+            "quit" => {
+                log::info!("-== Application is closed by user ==-\n");
+                app.exit(0);
+            }
+            _ => {}
+        })
+        .on_tray_icon_event(|tray, event| {
+            if let TrayIconEvent::Click {
+                button: MouseButton::Left,
+                button_state: MouseButtonState::Up,
+                ..
+            } = event
+            {
+                show_main_window(tray.app_handle());
+            }
+        });
+    if let Some(icon) = app.default_window_icon() {
+        tray = tray.icon(icon.clone());
+    }
+    tray.build(app)?;
+    Ok(())
 }
 
 /// Runs the backend (card monitoring + MQTT connection) without creating a
@@ -192,6 +301,37 @@ fn run_headless() {
     });
 
     log::info!("-== Application is closed by user (headless) ==-\n");
+}
+
+/// Reads `--config <path>` / `--config=<path>` from the command line. The path may be a
+/// config file (created with defaults if it doesn't exist) or an existing directory, in
+/// which case `config.yaml` inside it is used. Relative paths are resolved against the
+/// current working directory.
+fn config_path_from_args(args: impl Iterator<Item = String>) -> Result<Option<PathBuf>, String> {
+    let mut args = args;
+    let mut raw: Option<String> = None;
+    while let Some(arg) = args.next() {
+        if arg == "--config" {
+            raw = Some(args.next().ok_or("--config requires a path, e.g. --config D:\\tcs\\config.yaml")?);
+        } else if let Some(value) = arg.strip_prefix("--config=") {
+            raw = Some(value.to_string());
+        }
+    }
+    let Some(raw) = raw else { return Ok(None) };
+    if raw.trim().is_empty() {
+        return Err("--config requires a path, e.g. --config D:\\tcs\\config.yaml".to_string());
+    }
+
+    let mut path = PathBuf::from(raw.trim());
+    if path.is_relative() {
+        let cwd = std::env::current_dir()
+            .map_err(|e| format!("Failed to resolve relative --config path: {}", e))?;
+        path = cwd.join(path);
+    }
+    if path.is_dir() {
+        path.push("config.yaml");
+    }
+    Ok(Some(path))
 }
 
 /// Attaches the process to the console of whatever launched it (e.g. cmd/PowerShell),

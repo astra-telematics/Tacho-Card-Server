@@ -44,6 +44,8 @@ tauri-plugin-opener = "2"
 crc32fast = "1"
 flexi_logger = { version = "0.31", features = ["compress"] }
 tauri-plugin-dialog = "2"
+tauri-plugin-single-instance = "2"
+tauri-plugin-notification = "2"
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.61", features = ["Win32_System_Console"] }

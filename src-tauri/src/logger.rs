@@ -20,31 +20,15 @@ struct Release {
 /// logging is needed (in practice, forever — nothing ever clears this).
 static LOGGER_HANDLE: OnceCell<LoggerHandle> = OnceCell::new();
 
+/// `<data dir>/logs` — see `config::get_data_dir()` (follows `--config`).
 fn log_directory() -> PathBuf {
-    let mut log_path = PathBuf::new();
-
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
-    let home_var = "HOME";
-    #[cfg(target_os = "windows")]
-    let home_var = "USERPROFILE";
-
-    match env::var(home_var) {
-        Ok(home) => {
-            log_path.push(home);
-            log_path.push("Documents");
-            log_path.push("tcs");
-        }
+    match crate::config::get_data_dir() {
+        Ok(dir) => dir.join("logs"),
         Err(e) => {
-            eprintln!(
-                "Failed to read {} env var ({}). Logging to current directory.",
-                home_var, e
-            );
-            log_path.push(".");
-            log_path.push("tcs-logs");
+            eprintln!("Failed to resolve data directory ({}). Logging to current directory.", e);
+            PathBuf::from(".").join("tcs-logs").join("logs")
         }
     }
-    log_path.push("logs");
-    log_path
 }
 
 /// Opens the log directory in the OS file manager.
@@ -122,6 +106,10 @@ pub fn setup_logging() {
 
     log::info!("-== Application is launched ==-");
     log::info!("Log directory: {:?}, retention: {} day(s)", log_dir, retention_days);
+    match crate::config::get_config_path() {
+        Ok(path) => log::info!("Config file: {:?}", path),
+        Err(e) => log::error!("Failed to resolve config file path: {}", e),
+    }
 
     // Check for the latest version asynchronously
     async_runtime::spawn(async {
