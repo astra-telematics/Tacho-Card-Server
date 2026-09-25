@@ -19,6 +19,13 @@ use tauri::Emitter;
 use crate::global_app_handle::emit_card_config_event;
 // use crate::smart_card::manual_sync_cards;
 
+
+// ----- Constants -----
+pub const DEFAULT_LOG_RETENTION_DAYS: u32 = 7;
+pub const DEFAULT_SERVER_LISTEN_PORT: u16 = 7878;
+pub const DEFAULT_SERVER_CONNECTION_LIMIT: u16 = 100;
+
+
 /// Represents the configuration settings for the application.
 #[derive(Serialize, Deserialize, Debug)]
 pub struct ConfigurationFile {
@@ -36,9 +43,18 @@ pub struct ConfigurationFile {
 pub struct ServerConfig {
     pub listen_port: u16,
     pub connection_limit: u16,
+    // Defaulted so configs written before this field existed still parse, rather than
+    // failing and being reset to defaults by init_config() (which would drop all cards).
+    #[serde(default = "default_download_path")]
+    pub download_path: String,
 }
 
-pub const DEFAULT_LOG_RETENTION_DAYS: u32 = 7;
+/// `get_default_download_path()`, falling back to a relative "downloads" directory if
+/// the home directory can't be resolved.
+pub fn default_download_path() -> String {
+    get_default_download_path().unwrap_or_else(|_| "downloads".to_string())
+}
+
 
 /// Log file rotation/retention settings. See `logger.rs`. Generated with the
 /// default retention once on first boot (or on upgrade from a config that
@@ -116,6 +132,51 @@ pub fn get_config_path() -> io::Result<PathBuf> {
     log::debug!("Final config file path: {:?}", config_path);
 
     Ok(config_path)
+}
+
+pub fn get_default_download_path() -> io::Result<String> {
+    let mut config_path = PathBuf::new();
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    let home_dir = env::var("HOME");
+
+    #[cfg(target_os = "windows")]
+    let home_dir = env::var("USERPROFILE");
+
+    match &home_dir {
+        Ok(home) => {
+            log::debug!("Home directory found: {}", home);
+            config_path.push(home);
+        }
+        Err(e) => {
+            log::error!("Failed to get home directory environment variable: {}", e);
+            return Err(io::Error::new(
+                io::ErrorKind::Other,
+                "Failed to get home directory environment variable",
+            ));
+        }
+    }
+
+    config_path.push("Documents");
+    config_path.push("tcs");
+
+    log::debug!("Config directory path resolved to: {:?}", config_path);
+
+    if let Err(e) = fs::create_dir_all(&config_path) {
+        log::error!("Failed to create config directory {:?}: {}", config_path, e);
+        return Err(e);
+    }
+
+    config_path.push("downloads");
+
+    if let Err(e) = fs::create_dir_all(&config_path) {
+        log::error!("Failed to create download directory {:?}: {}", config_path, e);
+        return Err(e);
+    }
+
+    log::debug!("Final download directory path: {:?}", config_path);
+
+    Ok(config_path.to_str().unwrap_or("").to_string())
 }
 
 /// Load the configuration from the file.
@@ -302,14 +363,19 @@ pub fn update_server_config(
     config_path: &Path,
     listen_port: u16,
     connection_limit: u16,
-    theme: &str,
-    allow_anonymous_data: bool,
+    download_path: String,
+    log_retention_days: u32,
+    theme: &str
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut config = load_config(config_path)?;
 
     config.server = Some(ServerConfig {
         listen_port,
         connection_limit,
+        download_path,
+    });
+    config.logging = Some(LoggingConfig {
+        retention_days: log_retention_days,
     });
     config.appearance = Some(AppearanceConfig {
         dark_theme: match theme {
@@ -321,6 +387,9 @@ pub fn update_server_config(
     });
     save_config(config_path, &config)?;
     load_config_to_cache(&config)?;
+
+    // Rebind / re-limit the running TCP server; no-op if neither value changed.
+    crate::socket_server::apply_settings(listen_port, connection_limit);
 
     Ok(())
 }
@@ -387,7 +456,7 @@ pub async fn remove_card_from_config(
 /// Public function to update the server address in the configuration.
 /// This function is a Tauri command that updates the configuration file with a new server address.
 #[tauri::command]
-pub fn update_server(listen_port: String, connection_limit: String, theme: &str, allow_anonymous_data: bool) -> bool {
+pub fn update_server(listen_port: String, connection_limit: String, download_path: String, log_retention_days: String, theme: &str) -> bool {
     let config_path = match get_config_path() {
         Ok(path) => path,
         Err(e) => {
@@ -395,11 +464,16 @@ pub fn update_server(listen_port: String, connection_limit: String, theme: &str,
             return false;
         }
     };
-    log::info!("Updating server configuration: listen_port={}, connection_limit={}, theme={}, allow_anonymous_data={}", listen_port, connection_limit, theme, allow_anonymous_data);
+    log::info!("Updating server configuration: listen_port={}, connection_limit={}, download_path={}, log_retention_days={}, theme={}", listen_port, connection_limit, download_path, log_retention_days, theme);
 
-    match update_server_config(&config_path, listen_port.parse().unwrap_or(7878), connection_limit.parse().unwrap_or(1000), theme, allow_anonymous_data) {
+    match update_server_config(&config_path, 
+        listen_port.parse().unwrap_or(DEFAULT_SERVER_LISTEN_PORT), 
+        connection_limit.parse().unwrap_or(DEFAULT_SERVER_CONNECTION_LIMIT), 
+        if download_path.trim().is_empty() { default_download_path() } else { download_path.trim().to_string() },
+        log_retention_days.parse().unwrap_or(DEFAULT_LOG_RETENTION_DAYS), 
+        theme) {
         Ok(_) => {
-            log::info!("The server configuration is updated: listen_port={}, connection_limit={}, theme={}, allow_anonymous_data={}", listen_port, connection_limit, theme, allow_anonymous_data);
+            log::info!("The server configuration is updated: listen_port={}, connection_limit={}, download_path={}, log_retention_days={}, theme={}", listen_port, connection_limit, download_path, log_retention_days, theme);
             true
         }
         Err(e) => {
@@ -410,8 +484,6 @@ pub fn update_server(listen_port: String, connection_limit: String, theme: &str,
 }
 
 /*
-  HashMap. ATR = Card number
-
   initializing a global cache (HashMap<String, String>) using Mutex.
   Mapping card keys and matching them with the real company card number,
   which can only be entered manually
@@ -521,6 +593,7 @@ pub fn get_from_cache(section: CacheSection, key: &str) -> String {
                 match key {
                     "listen_port" => server.listen_port.to_string(),
                     "connection_limit" => server.connection_limit.to_string(),
+                    "download_path" => server.download_path.clone(),
                     _ => {
                         log::debug!("Unknown key for server section: {}", key);
                         "".to_string()
@@ -613,11 +686,17 @@ pub fn init_config() -> io::Result<()> {
         config = generate_default_config();
     }
 
-    // Same backfill approach as telemetry above — covers a brand-new config
-    // and an upgrade from one that predates log rotation.
     if config.logging.is_none() {
         config.logging = Some(LoggingConfig {
             retention_days: DEFAULT_LOG_RETENTION_DAYS,
+        });
+    }
+
+    if config.server.is_none() {
+        config.server = Some(ServerConfig {
+            listen_port: 7878,
+            connection_limit: 100,
+            download_path: default_download_path(),
         });
     }
 
@@ -646,14 +725,14 @@ pub fn init_config() -> io::Result<()> {
 // Default structure config
 fn generate_default_config() -> ConfigurationFile {
     ConfigurationFile {
-        name: "Tacho Bridge Application".to_string(),
+        name: "Tacho Card Server".to_string(),
         version: env!("CARGO_PKG_VERSION").to_string(),
         description: "Application for the tachograph cards authentication".to_string(),
         appearance: Some(AppearanceConfig {
             dark_theme: DarkTheme::Auto,
         }),
-        server: None,
-        logging: None,
+        server: Some(ServerConfig { listen_port: 7878, connection_limit: 100, download_path: default_download_path() }),
+        logging: Some(LoggingConfig { retention_days: DEFAULT_LOG_RETENTION_DAYS }),
         cards: HashMap::new(),
     }
 }
@@ -704,6 +783,7 @@ mod tests {
             server: Some(ServerConfig {
                 listen_port: 7878,
                 connection_limit: 100,
+                download_path: default_download_path(),
             }),
             logging: Some(LoggingConfig { retention_days: 7 }),
             cards,
@@ -726,11 +806,11 @@ mod tests {
         assert_eq!(card.last_auth, Some((1_700_000_500, true)));
         assert_eq!(
             loaded.server.as_ref().map(|s| s.listen_port),
-            Some(7878)
+            Some(DEFAULT_SERVER_LISTEN_PORT)
         );
         assert_eq!(
             loaded.server.as_ref().map(|s| s.connection_limit),
-            Some(1000)
+            Some(DEFAULT_SERVER_CONNECTION_LIMIT)
         );
 
         let _ = fs::remove_dir_all(&dir);
@@ -808,6 +888,15 @@ mod tests {
     }
 }
 
+/// Re-sends every cached card config to the frontend, e.g. after a webview reload
+/// wiped its state. `init_config()` does the same from the file on first load.
+pub fn emit_card_configs() {
+    let cards = CACHE.lock().unwrap().cards.clone();
+    for (card_number, card_config) in cards {
+        emit_card_config_event("global-card-config-updated", card_number, Some(card_config));
+    }
+}
+
 pub fn emit_global_config_server(app: &tauri::AppHandle) -> Result<(), Box<dyn Error>> {
     // small note: the structure requires the clone trait because the configuration is passed by reference,
     // so the value cannot be fully transferred to ownership.
@@ -815,11 +904,15 @@ pub fn emit_global_config_server(app: &tauri::AppHandle) -> Result<(), Box<dyn E
     // Gettting Host value from the "operation cahce" with the ServerConfig structure
     let listen_port = get_from_cache(CacheSection::Server, "listen_port");
     let connection_limit = get_from_cache(CacheSection::Server, "connection_limit");
+    let download_path = get_from_cache(CacheSection::Server, "download_path");
+    let logging_retention_days = get_from_cache(CacheSection::Logging, "retention_days");
     let appearance = get_from_cache(CacheSection::Appearance, "dark_theme");
 
     let mut config_app_payload = HashMap::new();
     config_app_payload.insert("listen_port", listen_port);
     config_app_payload.insert("connection_limit", connection_limit);
+    config_app_payload.insert("download_path", download_path);
+    config_app_payload.insert("retention_days", logging_retention_days);
     config_app_payload.insert("dark_theme", appearance);
 
     // Emit this data as a global event to update fornt-end fields

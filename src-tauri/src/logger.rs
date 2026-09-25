@@ -47,6 +47,20 @@ fn log_directory() -> PathBuf {
     log_path
 }
 
+/// Opens the log directory in the OS file manager.
+#[tauri::command]
+pub fn open_logs_folder() -> Result<(), String> {
+    let log_dir = log_directory();
+    std::fs::create_dir_all(&log_dir).map_err(|e| {
+        log::error!("Failed to create log directory {:?}: {}", log_dir, e);
+        format!("Failed to create log directory: {}", e)
+    })?;
+    tauri_plugin_opener::open_path(&log_dir, None::<&str>).map_err(|e| {
+        log::error!("Failed to open log directory {:?}: {}", log_dir, e);
+        format!("Failed to open log directory: {}", e)
+    })
+}
+
 /// Sets up logging: a fresh log file every time the process starts, an
 /// additional rollover once per calendar day if it keeps running that long,
 /// older rotated files compressed, and anything past the retention window
@@ -59,6 +73,12 @@ fn log_directory() -> PathBuf {
 /// `config::DEFAULT_LOG_RETENTION_DAYS` if that cache isn't populated yet, so
 /// a config load failure here is degraded, not fatal).
 pub fn setup_logging() {
+    // Only one global logger can ever be installed; a second `start()` fails with
+    // "logger already initialized", which must not be reported as an access error.
+    if LOGGER_HANDLE.get().is_some() {
+        return;
+    }
+
     let log_dir = log_directory();
     if let Err(e) = std::fs::create_dir_all(&log_dir) {
         eprintln!("Failed to create log directory {:?}: {}", log_dir, e);

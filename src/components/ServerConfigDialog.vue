@@ -6,10 +6,7 @@
   >
     <q-card style="min-width: 350px">
       <q-card-section>
-        <div class="text-h6">Server configuration</div>
-      </q-card-section>
-
-      <q-card-section class="q-pt-none">
+        <div class="text-h6">Server</div>
         <q-input
           label="Listen Port"
           dense
@@ -22,6 +19,45 @@
           v-model="connectionLimitValue"
           @keyup.enter="$emit('update:modelValue', false)"
         />
+        <q-input
+          label="Download Path"
+          dense
+          v-model="downloadPathValue"
+          @keyup.enter="$emit('update:modelValue', false)"
+        >
+          <template #append>
+            <q-btn
+              flat
+              round
+              dense
+              icon="mdi-folder-open"
+              @click="browseDownloadPath"
+            >
+              <q-tooltip>Browse…</q-tooltip>
+            </q-btn>
+          </template>
+        </q-input>
+      </q-card-section>
+
+      <q-card-section class="q-pt-none">
+        <div class="text-h6">Logging</div>
+        <q-input
+          label="Log Retention Days"
+          dense
+          v-model="logRetentionDaysValue"
+          @keyup.enter="$emit('update:modelValue', false)"
+        />
+        <q-btn
+          flat
+          label="Open Logs Folder"
+          color="primary"
+          class="q-mt-md"
+          @click="openLogsFolder"
+        />
+      </q-card-section>
+
+      <q-card-section class="q-pt-none">
+        <div class="text-h6">Appearance</div>
         <div class="q-mt-md row items-center">
           <div class="text-caption text-grey q-mr-md">Theme</div>
           <q-btn-toggle
@@ -38,20 +74,6 @@
             @update:model-value="changeTheme"
           />
         </div>
-        <q-toggle
-          v-model="allowAnonymousData"
-          label="Allow anonymous data collection"
-        />
-        <div>
-          <q-btn
-            flat
-            dense
-            no-caps
-            color="primary"
-            label="Open collected data"
-            @click="openTelemetryLog"
-          />
-        </div>
       </q-card-section>
       <q-card-actions align="right" class="text-primary">
         <q-btn flat label="Cancel" v-close-popup />
@@ -66,6 +88,7 @@ import { useQuasar, Notify } from 'quasar'
 import { ref } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
+import { open } from '@tauri-apps/plugin-dialog'
 
 defineProps<{
   modelValue: boolean
@@ -76,8 +99,9 @@ defineEmits<{
 }>()
 
 const listenPortValue = ref(7878)
-const connectionLimitValue = ref(1000)
-const allowAnonymousData = ref(true)
+const connectionLimitValue = ref(100)
+const logRetentionDaysValue = ref(7)
+const downloadPathValue = ref('')
 
 const $q = useQuasar()
 const selectedTheme = ref('')
@@ -103,10 +127,11 @@ const saveServerConfig = async () => {
 
   try {
     const response = await invoke('update_server', {
-      listenPort: listenPortValue.value,
-      connectionLimit: connectionLimitValue.value,
+      listenPort: listenPortValue.value.toString(),
+      connectionLimit: connectionLimitValue.value.toString(),
+      downloadPath: downloadPathValue.value,
+      logRetentionDays: logRetentionDaysValue.value.toString(),
       theme: selectedTheme.value,
-      allowAnonymousData: allowAnonymousData.value,
     })
 
     console.log('Response from update_server:', response)
@@ -138,8 +163,9 @@ listen('global-config-server', (event) => {
   const payload = event.payload as {
     listen_port: number
     connection_limit: number
+    download_path: string
+    retention_days: number
     dark_theme: string
-    allow_anonymous_data: string
   }
   console.log(
     'listen_port:',
@@ -148,29 +174,49 @@ listen('global-config-server', (event) => {
     payload.connection_limit,
     'dark_theme:',
     payload.dark_theme,
-    'allow_anonymous_data:',
-    payload.allow_anonymous_data,
   )
 
   listenPortValue.value = payload.listen_port
   connectionLimitValue.value = payload.connection_limit
+  downloadPathValue.value = payload.download_path
+  logRetentionDaysValue.value = payload.retention_days
 
   changeTheme(payload.dark_theme)
   selectedTheme.value = payload.dark_theme
-
-  // Backend cache values are all plain strings (see config.rs::get_from_cache).
-  allowAnonymousData.value = payload.allow_anonymous_data === 'true'
 }).catch((error) => {
   console.error('Error listening to global-config-server:', error)
 })
 
-const openTelemetryLog = async () => {
+const browseDownloadPath = async () => {
   try {
-    await invoke('open_telemetry_log')
+    const selected = await open({
+      directory: true,
+      multiple: false,
+      title: 'Select download folder',
+      ...(downloadPathValue.value ? { defaultPath: downloadPathValue.value } : {}),
+    })
+    // null when the picker is cancelled — keep the current path.
+    if (typeof selected === 'string') {
+      downloadPathValue.value = selected
+    }
   } catch (error) {
-    console.log('Error opening telemetry log:', error)
+    console.log('Error opening folder picker:', error)
     Notify.create({
-      message: 'Failed to open the collected data file.',
+      message: 'Failed to open the folder picker.',
+      color: 'red',
+      position: 'bottom',
+      timeout: 3000,
+    })
+  }
+}
+
+const openLogsFolder = async () => {
+  try {
+    await invoke('open_logs_folder')
+  } catch (error) {
+    console.log('Error opening logs folder:', error)
+    Notify.create({
+      message: 'Failed to open the logs folder.',
       color: 'red',
       position: 'bottom',
       timeout: 3000,

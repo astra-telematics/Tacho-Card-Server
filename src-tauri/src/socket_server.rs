@@ -15,7 +15,10 @@ use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
 use tokio::net::tcp::WriteHalf;
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::watch;
+use lazy_static::lazy_static;
 
+use crate::config::{DEFAULT_SERVER_CONNECTION_LIMIT, DEFAULT_SERVER_LISTEN_PORT};
 use crate::device_protocol::{AbortMessage, AbortReason};
 use crate::device_protocol::Message;
 use crate::global_app_handle::server_emit_event;
@@ -62,9 +65,76 @@ pub async fn server_status_updater(active_connections: Arc<AtomicUsize>) {
     }
 }
 
-/// Binds `bind_addr` (e.g. "0.0.0.0:7878") and accepts connections until the listener
-/// itself errors out. Each connection is handed to its own task immediately, so a slow
-/// or idle client can never block others from being accepted.
+/// Listener settings that can be changed at runtime from the UI (see
+/// `config::update_server_config`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ServerSettings {
+    pub listen_port: u16,
+    pub connection_limit: u16,
+}
+
+lazy_static! {
+    /// Live listener settings. `run` watches this: a new `connection_limit` applies to
+    /// the next accepted connection, and a new `listen_port` rebinds the listener.
+    static ref SETTINGS: watch::Sender<ServerSettings> = watch::Sender::new(ServerSettings {
+        listen_port: DEFAULT_SERVER_LISTEN_PORT,
+        connection_limit: DEFAULT_SERVER_CONNECTION_LIMIT,
+    });
+}
+
+/// Pushes new listener settings to the running server (if any). Safe to call before
+/// `run` has started — `run` picks up whatever is current when it subscribes.
+pub fn apply_settings(listen_port: u16, connection_limit: u16) {
+    let new = ServerSettings { listen_port, connection_limit };
+    SETTINGS.send_if_modified(|current| {
+        if *current == new {
+            return false;
+        }
+        *current = new;
+        true
+    });
+}
+
+async fn bind(listen_port: u16, connection_limit: u16) -> Option<TcpListener> {
+    match TcpListener::bind(("0.0.0.0", listen_port)).await {
+        Ok(listener) => {
+            log::info!(
+                "[TCP] phase=listen status=bound addr=0.0.0.0:{} connection_limit={}",
+                listen_port,
+                connection_limit
+            );
+            Some(listener)
+        }
+        Err(e) => {
+            log::error!(
+                "[TCP] phase=listen status=bind_failed addr=0.0.0.0:{} err={:?}",
+                listen_port,
+                e
+            );
+            None
+        }
+    }
+}
+
+/// Accepts on `listener`, or waits forever if there isn't one (bind failed), so the
+/// `select!` in `run` just waits for the next settings change instead.
+async fn accept(listener: &Option<TcpListener>) -> io::Result<(TcpStream, SocketAddr)> {
+    match listener {
+        Some(listener) => listener.accept().await,
+        None => std::future::pending().await,
+    }
+}
+
+/// Binds 0.0.0.0:`listen_port` and accepts connections forever. Each connection is
+/// handed to its own task immediately, so a slow or idle client can never block others
+/// from being accepted.
+///
+/// Settings changes pushed via `apply_settings` are applied without a restart: a new
+/// `connection_limit` takes effect for the next accepted connection, and a new
+/// `listen_port` binds a fresh listener and drops the old one. Connections that are
+/// already established are unaffected by either — they keep running on their own
+/// tasks. If binding the new port fails, the server keeps listening on the old one; if
+/// there is no listener at all (initial bind failed), it waits for a settings change.
 ///
 /// `connection_limit` is not a hard cap: connections are always accepted (so the
 /// TCP handshake never fails and the client isn't left hanging at the OS level), but
@@ -75,18 +145,49 @@ pub async fn server_status_updater(active_connections: Arc<AtomicUsize>) {
 /// the server is ever genuinely overloaded, connections should be turned away here,
 /// as early and cheaply as possible, not kept alive only to be rejected later once
 /// they've announced (see `card_pool`, which never rejects).
-pub async fn run(listen_port: u16, connection_limit: u16) -> io::Result<()> {
+pub async fn run(listen_port: u16, connection_limit: u16) {
+    apply_settings(listen_port, connection_limit);
+    let mut settings_rx = SETTINGS.subscribe();
+    let mut current = *settings_rx.borrow_and_update();
+
     let active_connections = Arc::new(AtomicUsize::new(0));
     let updater = tokio::spawn(server_status_updater(Arc::clone(&active_connections)));
-    let listener = TcpListener::bind(("0.0.0.0", listen_port)).await?;
-    log::info!(
-        "[TCP] phase=listen status=bound addr=0.0.0.0:{} connection_limit={}",
-        listen_port,
-        connection_limit
-    );
+    let mut listener = bind(current.listen_port, current.connection_limit).await;
 
     loop {
-        let (stream, peer_addr) = match listener.accept().await {
+        let accepted = tokio::select! {
+            changed = settings_rx.changed() => {
+                if changed.is_err() {
+                    break; // Sender is a static, so this never happens in practice.
+                }
+                let new = *settings_rx.borrow_and_update();
+                if new.connection_limit != current.connection_limit {
+                    log::info!(
+                        "[TCP] phase=config status=connection_limit_changed old={} new={}",
+                        current.connection_limit,
+                        new.connection_limit
+                    );
+                    current.connection_limit = new.connection_limit;
+                }
+                if new.listen_port != current.listen_port || listener.is_none() {
+                    log::info!(
+                        "[TCP] phase=config status=listen_port_changed old={} new={}",
+                        current.listen_port,
+                        new.listen_port
+                    );
+                    // Bind the new port before dropping the old listener, so a failed
+                    // bind leaves the server reachable where it was.
+                    if let Some(new_listener) = bind(new.listen_port, current.connection_limit).await {
+                        listener = Some(new_listener);
+                        current.listen_port = new.listen_port;
+                    }
+                }
+                continue;
+            }
+            accepted = accept(&listener) => accepted,
+        };
+
+        let (stream, peer_addr) = match accepted {
             Ok(pair) => pair,
             Err(e) => {
                 // A single failed accept (e.g. a transient resource error) shouldn't take
@@ -105,7 +206,7 @@ pub async fn run(listen_port: u16, connection_limit: u16) -> io::Result<()> {
         }
 
         let count = active_connections.fetch_add(1, Ordering::Relaxed) + 1;
-        let over_soft_limit = count > connection_limit as usize;
+        let over_soft_limit = count > current.connection_limit as usize;
         log::info!(
             "[TCP] phase=connect status=accepted peer={} active_connections={} over_soft_limit={}",
             peer_addr,

@@ -4,7 +4,11 @@
       <q-toolbar>
         <q-toolbar-title class="q-ml-md">
           Tacho Card Server
-          <q-icon name="mdi-record-circle-outline" class="q-ml-md" :color="serverStatus >= 0 ? 'green' : undefined" />
+          <q-icon
+            name="mdi-record-circle-outline"
+            class="q-ml-md"
+            :color="serverStatus >= 0 ? 'green' : undefined"
+          />
           <span class="q-ml-xs">{{ serverStatus }}</span>
         </q-toolbar-title>
 
@@ -47,7 +51,7 @@ onMounted(async () => {
   try {
     const unlisten = await listen('server-status', (event) => {
       serverStatus.value = event.payload as number
-      console.log('server-status:', serverStatus.value)
+      // console.log('server-status:', serverStatus.value)
     })
     unlistenFns.push(unlisten)
   } catch (error) {

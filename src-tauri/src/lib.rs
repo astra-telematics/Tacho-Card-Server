@@ -17,6 +17,11 @@ use tauri::{async_runtime, Listener, Manager, WindowEvent};
 
 use crate::config::{CacheSection, get_from_cache}; // Tauri application framework and async runtime.
 
+use std::sync::atomic::{AtomicBool, Ordering};
+
+/// Set on the first "frontend-loaded" event; see the handler in `run()`.
+static BACKEND_STARTED: AtomicBool = AtomicBool::new(false);
+
 pub fn run() {
     // Headless mode: run the card-monitoring / MQTT backend with no window or tray,
     // for use as a background service (e.g. on a server or via a system service manager).
@@ -28,6 +33,7 @@ pub fn run() {
     // start builder to run tauri applicationrustup target add aarch64-pc-windows-msvc
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_dialog::init())
         .setup(move |app| {
             // Obtain a lightweight reference to the app for convenient interaction
             let app_handle = app.app_handle();
@@ -39,7 +45,7 @@ pub fn run() {
                 // getting Application version foriom the Cargo.toml file
                 let version = env!("CARGO_PKG_VERSION");
                 // Form new Title with the version
-                let title = format!("v{}", version);
+                let title = format!("Tacho Card Server: v{}", version);
                 // Set new title to the window
                 window
                     .set_title(&title)
@@ -56,6 +62,23 @@ pub fn run() {
                     }
                     #[cfg(target_os = "windows")] {
                         std::thread::sleep(std::time::Duration::from_millis(300));
+                    }
+
+                    // "frontend-loaded" fires on every webview load, including reloads
+                    // (Ctrl+R, Vite full reloads in dev). Backend startup must only run
+                    // once per process; later loads just re-send state to the fresh page.
+                    if BACKEND_STARTED.swap(true, Ordering::SeqCst) {
+                        log::debug!("Frontend reloaded; re-sending state.");
+                        config::emit_card_configs();
+                        if let Err(e) = config::emit_global_config_server(&front_app_handle) {
+                            log::error!("Failed to emit global config server: {:?}", e);
+                        }
+                        async_runtime::spawn(async {
+                            if let Err(e) = smart_card::manual_sync_cards(String::new(), false).await {
+                                log::error!("Failed to resync readers after reload: {}", e);
+                            }
+                        });
+                        return;
                     }
 
                     // Initialize configuration first — logging reads log_retention_days
@@ -94,18 +117,12 @@ pub fn run() {
 
                     async_runtime::spawn(async {
                         // Start the TCP listen server (replacement for the outbound MQTT client).
-                        // bind_addr / soft_connection_limit are configurable via the
-                        // `tcp_server` section of config.yaml.
-                        let listen_port: u16 = get_from_cache(CacheSection::Server, "listen_port").parse().unwrap_or(7878);
-                        let connection_limit: u16 = get_from_cache(CacheSection::Server, "connection_limit").parse().unwrap_or(1000);
-                        if let Err(e) = socket_server::run(
-                            listen_port,
-                            connection_limit,
-                        )
-                        .await
-                        {
-                            log::error!("[TCP] phase=listen status=failed err={:?}", e);
-                        }
+                        // listen_port / connection_limit come from the `server` section of
+                        // config.yaml; changes saved from the UI are applied live
+                        // (see socket_server::apply_settings).
+                        let listen_port: u16 = get_from_cache(CacheSection::Server, "listen_port").parse().unwrap_or(config::DEFAULT_SERVER_LISTEN_PORT);
+                        let connection_limit: u16 = get_from_cache(CacheSection::Server, "connection_limit").parse().unwrap_or(config::DEFAULT_SERVER_CONNECTION_LIMIT);
+                        socket_server::run(listen_port, connection_limit).await;
                     });
                 });
 
@@ -124,6 +141,7 @@ pub fn run() {
             config::update_server,         // update server config from the frontend
             config::remove_card,            // remove card from config
             smart_card::manual_sync_cards, // manual sync cards from the frontend
+            logger::open_logs_folder,      // open the log directory in the OS file manager
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -159,18 +177,10 @@ fn run_headless() {
 
     async_runtime::spawn(async {
         // Start the TCP listen server (replacement for the outbound MQTT client).
-        // bind_addr / soft_connection_limit are configurable via the
-        // `tcp_server` section of config.yaml.
+        // listen_port / connection_limit come from the `server` section of config.yaml.
         let listen_port: u16 = get_from_cache(CacheSection::Server, "listen_port").parse().expect("Invalid listen_port in cache");
         let max_connections: u16 = get_from_cache(CacheSection::Server, "connection_limit").parse().expect("Invalid connection_limit in cache");
-        if let Err(e) = socket_server::run(
-            listen_port,
-            max_connections,
-        )
-        .await
-        {
-            log::error!("[TCP] phase=listen status=failed err={:?}", e);
-        }
+        socket_server::run(listen_port, max_connections).await;
     });
 
     log::info!("-== Application is running in headless mode ==-");

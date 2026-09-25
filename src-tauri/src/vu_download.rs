@@ -11,6 +11,8 @@
 
 use std::path::PathBuf;
 
+use crate::config::{get_from_cache, CacheSection};
+
 /// `hex(SHA256(...))` this is not — just a plain CRC32 over the reassembled
 /// file, matching whatever the device computed, so a corrupted/incomplete
 /// transfer can be detected and the device told to redownload rather than
@@ -213,14 +215,21 @@ pub fn extract_vrn(generation: u8, data: &[u8]) -> Option<String> {
     }
 }
 
+/// The configured `server.download_path`, or the default (`~/Documents/tcs/downloads`)
+/// if none is set. Read from the cache on every save, so a change from the UI applies
+/// to the next download.
 fn downloads_dir() -> std::io::Result<PathBuf> {
-    let config_path = crate::config::get_config_path()?;
-    let dir = config_path.with_file_name("downloads");
+    let configured = get_from_cache(CacheSection::Server, "download_path");
+    let dir = if configured.trim().is_empty() {
+        PathBuf::from(crate::config::default_download_path())
+    } else {
+        PathBuf::from(configured.trim())
+    };
     std::fs::create_dir_all(&dir)?;
     Ok(dir)
 }
 
-/// Writes to `~/Documents/tcs/downloads/<filename>.ddd`. Filename is
+/// Writes to `<server.download_path>/<filename>.ddd`. Filename is
 /// `<sanitized VRN>_<IMEI>_<YYYYMMDD_HHMMSS>[_<tag>].ddd`, falling back to
 /// `UNKNOWN_VRN_<IMEI>_<timestamp>[_<tag>].ddd` when VRN wasn't extractable —
 /// a parse failure on our side must never mean data gets thrown away. `tag`
