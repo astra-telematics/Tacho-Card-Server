@@ -23,8 +23,8 @@ use crate::global_app_handle::emit_card_config_event;
 // ----- Constants -----
 pub const DEFAULT_LOG_RETENTION_DAYS: u32 = 7;
 pub const DEFAULT_SERVER_LISTEN_PORT: u16 = 7878;
-pub const DEFAULT_SERVER_CONNECTION_LIMIT: u16 = 100;
-/// 1 = once a day. 0 disables the limit. See `download_db.rs`.
+pub const DEFAULT_SERVER_CONNECTION_LIMIT: u16 = 10;
+/// 1 = once a day. 0 disables the limit. See `database.rs`.
 pub const DEFAULT_DOWNLOAD_INTERVAL_DAYS: u32 = 7;
 /// Upper bound for `download_interval_days`. Regulations require a VU download at least
 /// every 90 days; 60 leaves a month of headroom for devices that miss their slot.

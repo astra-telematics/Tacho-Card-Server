@@ -1,32 +1,30 @@
-//! SQLite record of completed VU downloads, stored as `tcs.db` in the data directory
-//! (next to config.yaml, so it follows `--config`).
+//! SQLite database (`tcs.db` in the data directory, next to config.yaml, so it follows
+//! `--config`). Holds:
 //!
-//! Used to enforce a minimum interval between downloads from the same device
-//! (`server.download_interval_days` in config.yaml; 1 = once a day, 7 = once a week,
-//! 0 = no limit). A device (IMEI) whose last verified download was less than that many
-//! days ago is told at `ConnAnnounce` to come back shortly after midnight on the day it
-//! becomes eligible (see `socket_server::handle_connection`). Days are the server's
-//! local calendar dates. Unverified downloads (CRC mismatch, malformed, incomplete) are
-//! recorded for visibility but don't count, so the device can retry straight away.
+//! - **Downloads**: every VU download received, used to enforce a minimum interval
+//!   between downloads from the same device (`server.download_interval_days` in
+//!   config.yaml; 1 = once a day, 7 = once a week, 0 = no limit). A device (IMEI) whose
+//!   last verified download was less than that many days ago may not download again
+//!   until the start of the day it becomes eligible; `admission.rs` picks the exact
+//!   time to send it back. Days are the server's local calendar dates. Unverified
+//!   downloads (CRC mismatch, malformed, incomplete) are recorded for visibility but
+//!   don't count, so the device can retry straight away.
+//! - **Card sessions**: how long each device held a card, so `admission.rs`'s average
+//!   survives restarts.
 //!
-//! Every failure here is logged and treated as "no download recorded" — a database
-//! problem must never stop a device from downloading.
+//! Every failure here is logged and treated as "nothing recorded" — a database problem
+//! must never stop a device from downloading.
 
 use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
 
-use chrono::{DateTime, Days, Duration, Local, NaiveDate, TimeZone};
-use rand::Rng;
+use chrono::{DateTime, Days, Local, NaiveDate, TimeZone};
 use rusqlite::{params, Connection};
 
 const DB_FILE_NAME: &str = "tcs.db";
 
 /// Bumped (with a matching step in `migrate`) whenever the schema changes.
-const SCHEMA_VERSION: i32 = 1;
-
-/// Spread devices that become eligible on the same day over this window after
-/// midnight, so they don't all reconnect at 00:00:00 at once.
-const MIDNIGHT_JITTER_SECONDS: i64 = 15 * 60;
+const SCHEMA_VERSION: i32 = 2;
 
 /// Opened on first use. `None` if opening failed (logged once); every call then
 /// behaves as if nothing is recorded.
@@ -80,7 +78,19 @@ fn migrate(conn: &mut Connection) -> rusqlite::Result<()> {
             );
             CREATE INDEX IF NOT EXISTS idx_downloads_imei_date ON downloads (imei, local_date);",
         )?;
-        tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+        tx.pragma_update(None, "user_version", 1)?;
+        tx.commit()?;
+    }
+    if version < 2 {
+        let tx = conn.transaction()?;
+        tx.execute_batch(
+            "CREATE TABLE IF NOT EXISTS card_sessions (
+                id          INTEGER PRIMARY KEY,
+                ended_at    INTEGER NOT NULL, -- unix seconds (UTC)
+                duration_ms INTEGER NOT NULL  -- card assigned -> card released
+            );",
+        )?;
+        tx.pragma_update(None, "user_version", 2)?;
         tx.commit()?;
     }
     Ok(())
@@ -168,10 +178,10 @@ pub async fn record_download(record: DownloadRecord) {
 }
 
 /// If `imei` isn't allowed to download yet — its last verified download was less than
-/// `interval_days` days ago (server-local dates) — how long until it may. `None` means
-/// go ahead: no limit configured (`interval_days == 0`), no verified download on
-/// record, or the interval has passed.
-pub async fn time_until_next_download(imei: &str, interval_days: u32) -> Option<std::time::Duration> {
+/// `interval_days` days ago (server-local dates) — the local midnight at the start of
+/// the day it may. `None` means go ahead now: no limit configured
+/// (`interval_days == 0`), no verified download on record, or the interval has passed.
+pub async fn next_download_allowed_at(imei: &str, interval_days: u32) -> Option<DateTime<Local>> {
     // Belt and braces: config load and save already clamp, but never exceed the cap.
     let interval_days = interval_days.min(crate::config::MAX_DOWNLOAD_INTERVAL_DAYS);
     if interval_days == 0 {
@@ -188,23 +198,48 @@ pub async fn time_until_next_download(imei: &str, interval_days: u32) -> Option<
     if now.date_naive() >= next {
         return None;
     }
-    let jitter = Duration::seconds(rand::thread_rng().gen_range(0..=MIDNIGHT_JITTER_SECONDS));
-    Some(time_until_start_of(next, now, jitter))
+    Some(start_of_day(next))
 }
 
-/// Time from `now` until local midnight at the start of `date`, plus `jitter`. At
-/// least one second, so a device is never told to retry immediately.
-fn time_until_start_of(date: NaiveDate, now: DateTime<Local>, jitter: Duration) -> std::time::Duration {
-    let start = date
-        .and_hms_opt(0, 0, 0)
-        // `earliest()` handles a DST change at midnight; if midnight doesn't exist
-        // locally at all, fall back to counting whole days.
-        .and_then(|naive| Local.from_local_datetime(&naive).earliest())
-        .unwrap_or_else(|| now + Duration::days((date - now.date_naive()).num_days()));
-    (start - now + jitter)
-        .to_std()
-        .unwrap_or_default()
-        .max(std::time::Duration::from_secs(1))
+/// Local midnight at the start of `date`. `earliest()` handles a DST change at
+/// midnight; if midnight doesn't exist locally at all, 01:00 is used instead.
+fn start_of_day(date: NaiveDate) -> DateTime<Local> {
+    [0, 1]
+        .iter()
+        .find_map(|&hour| {
+            date.and_hms_opt(hour, 0, 0)
+                .and_then(|naive| Local.from_local_datetime(&naive).earliest())
+        })
+        .unwrap_or_else(Local::now)
+}
+
+fn insert_card_session(conn: &Connection, duration: std::time::Duration, ended_at: DateTime<Local>) -> rusqlite::Result<()> {
+    conn.execute(
+        "INSERT INTO card_sessions (ended_at, duration_ms) VALUES (?1, ?2)",
+        params![ended_at.timestamp(), duration.as_millis() as i64],
+    )?;
+    Ok(())
+}
+
+/// The most recent `limit` card session durations, oldest first.
+fn recent_card_sessions(conn: &Connection, limit: usize) -> rusqlite::Result<Vec<std::time::Duration>> {
+    let mut stmt = conn.prepare(
+        "SELECT duration_ms FROM (SELECT id, duration_ms FROM card_sessions ORDER BY id DESC LIMIT ?1)
+         ORDER BY id ASC",
+    )?;
+    let rows = stmt.query_map(params![limit as i64], |row| row.get::<_, i64>(0))?;
+    rows.map(|ms| ms.map(|ms| std::time::Duration::from_millis(ms.max(0) as u64)))
+        .collect()
+}
+
+/// Records how long a device held a card. Blocking; call off the async runtime.
+pub fn record_card_session_blocking(duration: std::time::Duration) {
+    with_db((), |conn| insert_card_session(conn, duration, Local::now()));
+}
+
+/// The most recent `limit` card session durations, oldest first. Blocking.
+pub fn recent_card_sessions_blocking(limit: usize) -> Vec<std::time::Duration> {
+    with_db(Vec::new(), |conn| recent_card_sessions(conn, limit))
 }
 
 #[cfg(test)]
@@ -256,15 +291,20 @@ mod tests {
     }
 
     #[test]
-    fn time_until_start_of_counts_to_local_midnight() {
-        let now = local(2026, 9, 25, 22, 0);
-        let tomorrow = NaiveDate::from_ymd_opt(2026, 9, 26).unwrap();
-        let next_week = NaiveDate::from_ymd_opt(2026, 10, 2).unwrap();
-        assert_eq!(time_until_start_of(tomorrow, now, Duration::zero()).as_secs(), 2 * 3600);
-        assert_eq!(time_until_start_of(tomorrow, now, Duration::seconds(60)).as_secs(), 2 * 3600 + 60);
-        // 7 days minus 22 h, give or take an hour if a DST change falls in between.
-        let week = time_until_start_of(next_week, now, Duration::zero()).as_secs() as i64;
-        assert!((week - (6 * 86400 + 2 * 3600)).abs() <= 3600, "{week}");
+    fn start_of_day_is_local_midnight() {
+        let date = NaiveDate::from_ymd_opt(2026, 9, 26).unwrap();
+        assert_eq!(start_of_day(date), local(2026, 9, 26, 0, 0));
+    }
+
+    #[test]
+    fn recent_card_sessions_returns_the_latest_oldest_first() {
+        let conn = test_db();
+        let now = Local::now();
+        for secs in [10, 20, 30, 40] {
+            insert_card_session(&conn, std::time::Duration::from_secs(secs), now).unwrap();
+        }
+        let recent: Vec<u64> = recent_card_sessions(&conn, 3).unwrap().iter().map(|d| d.as_secs()).collect();
+        assert_eq!(recent, vec![20, 30, 40]);
     }
 
     #[test]

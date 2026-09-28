@@ -69,6 +69,12 @@ pub struct CardGuard {
     permit: Option<OwnedSemaphorePermit>,
     revoked: Arc<AtomicBool>,
     notify: Arc<Notify>,
+    /// When the card was assigned; the session's length is reported to `admission`
+    /// on drop, as the "time to authenticate" that drives queue wait estimates.
+    checked_out_at: std::time::Instant,
+    /// Set if the card was pulled mid-session. Such a session's length includes
+    /// waiting for a replacement card, so it isn't representative and isn't reported.
+    had_replacement: bool,
 }
 
 impl std::ops::Deref for CardGuard {
@@ -130,6 +136,7 @@ impl CardGuard {
             self.pool.unregister_checked_out(old_card.reader_name());
             // old_card drops here without being recycled — it's confirmed dead.
         }
+        self.had_replacement = true;
         // Fresh, inert placeholders: nothing will ever flip or notify these until a
         // real replacement card is installed.
         self.revoked = Arc::new(AtomicBool::new(false));
@@ -152,6 +159,9 @@ impl CardGuard {
 
 impl Drop for CardGuard {
     fn drop(&mut self) {
+        if !self.had_replacement {
+            crate::admission::record_card_session(self.checked_out_at.elapsed());
+        }
         match self.card.take() {
             Some(card) => {
                 self.pool.unregister_checked_out(card.reader_name());
@@ -305,6 +315,11 @@ impl CardPool {
         self.cards.lock().unwrap().len()
     }
 
+    /// Total number of working cards: idle plus checked out to a session.
+    pub fn card_count(&self) -> usize {
+        self.idle_count() + self.checked_out.lock().unwrap().len()
+    }
+
     /// Current number of devices waiting in line for their first card. Observability
     /// only — there's no cap here (see module docs); admission is controlled solely
     /// by `connection_limit` at TCP accept time, before a connection ever reaches
@@ -366,6 +381,8 @@ impl CardPool {
             permit: Some(permit),
             revoked,
             notify,
+            checked_out_at: std::time::Instant::now(),
+            had_replacement: false,
         }
     }
 }

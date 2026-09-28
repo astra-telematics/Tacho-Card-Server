@@ -18,23 +18,31 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::watch;
 use lazy_static::lazy_static;
 
-use crate::config::{get_from_cache, CacheSection, DEFAULT_DOWNLOAD_INTERVAL_DAYS, DEFAULT_SERVER_CONNECTION_LIMIT, DEFAULT_SERVER_LISTEN_PORT};
+use crate::config::{
+    get_from_cache, CacheSection, DEFAULT_DOWNLOAD_INTERVAL_DAYS, DEFAULT_SERVER_CONNECTION_LIMIT,
+    DEFAULT_SERVER_LISTEN_PORT,
+};
 use crate::device_protocol::{AbortMessage, AbortReason};
 use crate::device_protocol::Message;
 use crate::global_app_handle::server_emit_event;
 
-/// Suggested wait before a device retries after being turned away because the raw
-/// TCP connection count (`connection_limit`) was already over its soft limit — the
-/// one and only admission gate in the system, checked at accept time before the
-/// device has said anything at all.
-const CONNECTION_LIMIT_RETRY_SECONDS: u32 = 5;
+/// Shortest wait a device is told to retry after when turned away because the raw TCP
+/// connection count (`connection_limit`) was over its soft limit — checked at accept
+/// time, before the device has said anything at all. The actual delay is
+/// `admission`'s estimate of when a card will be free; this floor stops a device
+/// hammering the socket when that estimate is near zero. About one authentication's
+/// worth (~30 s in testing): sooner than that, nothing will have changed.
+const MIN_CONNECTION_LIMIT_RETRY: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// How long a freshly-accepted connection has to send `ConnAnnounce` before it's
 /// dropped.
 const CONN_ANNOUNCE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
-/// How long an announced-and-accepted device may go without a card (queued, or
-/// waiting for a replacement after one was pulled) before it's dropped.
-const AWAITING_CARD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+/// How long an announced device without a card may go silent before it's dropped:
+/// while queued (or waiting for a replacement card), and after authenticating while it
+/// hands over a download. A silence limit, not a total: every message — `Ping`, each
+/// `DownloadChunk` — restarts it, so a device can queue or download for as long as it
+/// takes provided it keeps talking.
+const IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 /// How long a device holding a card has, after `Ready` (or after any message), to
 /// send its next message before it's dropped — keeps a device that goes silent
 /// mid-authentication from sitting on a card forever.
@@ -51,7 +59,7 @@ fn current_read_timeout(announced: bool, has_card: bool) -> std::time::Duration 
     } else if has_card {
         AUTHENTICATING_TIMEOUT
     } else {
-        AWAITING_CARD_TIMEOUT
+        IDLE_TIMEOUT
     }
 }
 
@@ -149,6 +157,12 @@ pub async fn run(listen_port: u16, connection_limit: u16) {
     apply_settings(listen_port, connection_limit);
     let mut settings_rx = SETTINGS.subscribe();
     let mut current = *settings_rx.borrow_and_update();
+
+    // Seed the average card session length from previous runs before any device is
+    // admitted against it.
+    if let Err(e) = tokio::task::spawn_blocking(crate::admission::load_history).await {
+        log::error!("[ADMISSION] status=history_load_failed err={:?}", e);
+    }
 
     let active_connections = Arc::new(AtomicUsize::new(0));
     let updater = tokio::spawn(server_status_updater(Arc::clone(&active_connections)));
@@ -282,9 +296,18 @@ async fn poll_pending(pending: &mut Option<PendingCardEvent>) -> CardEvent {
 /// meanwhile (Ping, Abort, ...).
 async fn handle_connection(mut stream: TcpStream, peer_addr: SocketAddr, over_soft_limit: bool) {
     if over_soft_limit {
+        let retry_after = crate::admission::over_connection_limit_retry_delay(MIN_CONNECTION_LIMIT_RETRY);
+        let retry_after_seconds = u32::try_from(retry_after.as_secs()).unwrap_or(u32::MAX);
+        let busyness = crate::admission::busyness();
         log::warn!(
-            "[TCP] phase=connect status=over_soft_limit peer={} action=reject",
-            peer_addr
+            "[TCP] phase=connect status=over_soft_limit peer={} action=reject retry_after_seconds={} card_available_in_seconds={:?} cards={} waiting={} average_session_ms={} expected_returns={}",
+            peer_addr,
+            retry_after_seconds,
+            busyness.card_available_in.map(|wait| wait.as_secs()),
+            busyness.queue.cards,
+            busyness.queue.waiting,
+            busyness.queue.average_session.as_millis(),
+            busyness.expected_returns
         );
         // The device hasn't sent anything yet at this point (this is a raw
         // connection-count guard, checked at accept time), but ConnResponse is a
@@ -293,7 +316,7 @@ async fn handle_connection(mut stream: TcpStream, peer_addr: SocketAddr, over_so
         // instead of just watching its connection die with no explanation.
         let reply = Message::ConnResponse(crate::device_protocol::ConnResponseMessage {
             status: crate::device_protocol::ConnResponseStatus::TryAgainLater,
-            retry_after_seconds: Some(CONNECTION_LIMIT_RETRY_SECONDS),
+            retry_after_seconds: Some(retry_after_seconds),
         });
         let reply_bytes: Vec<u8> = reply.into();
         let _ = stream.write_all(&reply_bytes).await;
@@ -374,10 +397,8 @@ async fn handle_connection(mut stream: TcpStream, peer_addr: SocketAddr, over_so
         // timeout" work for free: a new window starts as soon as the previous read
         // (or card event) completes, using this loop pass's phase, not the phase the
         // connection was in when it first opened.
-        let read_fut = tokio::time::timeout(
-            current_read_timeout(announced, has_card),
-            message_reader.read_message(),
-        );
+        let read_timeout = current_read_timeout(announced, has_card);
+        let read_fut = tokio::time::timeout(read_timeout, message_reader.read_message());
 
         tokio::select! {
             result = read_fut => match result {
@@ -403,28 +424,32 @@ async fn handle_connection(mut stream: TcpStream, peer_addr: SocketAddr, over_so
                             let reply_bytes: Vec<u8> = reply.into();
                             let _ = write_half.write_all(&reply_bytes).await;
                             log::info!("[TCP] peer={} IMEI={} firmware_version={} message=ConnAnnounce action=reply status=Accepted note=duplicate", peer_addr, conn_announce_message.imei, conn_announce_message.firmware_version);
-                        } else if let Some(wait) = crate::download_db::time_until_next_download(
-                            &conn_announce_message.imei,
-                            get_from_cache(CacheSection::Server, "download_interval_days")
-                                .parse()
-                                .unwrap_or(DEFAULT_DOWNLOAD_INTERVAL_DAYS),
-                        ).await {
-                            // Downloaded too recently (`download_interval_days`) — turn it
-                            // away before it queues for a card. See download_db.rs.
-                            let retry_after_seconds = u32::try_from(wait.as_secs()).unwrap_or(u32::MAX);
-                            let reply = Message::ConnResponse(crate::device_protocol::ConnResponseMessage {
-                                status: crate::device_protocol::ConnResponseStatus::TryAgainLater,
-                                retry_after_seconds: Some(retry_after_seconds),
-                            });
-                            let reply_bytes: Vec<u8> = reply.into();
-                            let _ = write_half.write_all(&reply_bytes).await;
-                            log::info!("[TCP] peer={} IMEI={} firmware_version={} message=ConnAnnounce action=reply status=TryAgainLater reason=download_interval_not_elapsed retry_after_seconds={}", peer_addr, conn_announce_message.imei, conn_announce_message.firmware_version, retry_after_seconds);
-                            break;
                         } else {
                             // Beyond `connection_limit` at accept time (see `over_soft_limit`
-                            // above), the only check is the download interval just
-                            // above. A device that got this far always gets a card
-                            // eventually, however long the wait.
+                            // above), the only check is the download interval: a device
+                            // that downloaded too recently is told when to come back. Anyone
+                            // else queues for a card, however long the wait.
+                            let download_allowed_at = crate::database::next_download_allowed_at(
+                                &conn_announce_message.imei,
+                                get_from_cache(CacheSection::Server, "download_interval_days")
+                                    .parse()
+                                    .unwrap_or(DEFAULT_DOWNLOAD_INTERVAL_DAYS),
+                            ).await;
+                            if let Some(retry_after) = crate::admission::download_interval_retry_delay(download_allowed_at) {
+                                let retry_after_seconds = u32::try_from(retry_after.as_secs()).unwrap_or(u32::MAX);
+                                let reply = Message::ConnResponse(crate::device_protocol::ConnResponseMessage {
+                                    status: crate::device_protocol::ConnResponseStatus::TryAgainLater,
+                                    retry_after_seconds: Some(retry_after_seconds),
+                                });
+                                let reply_bytes: Vec<u8> = reply.into();
+                                let _ = write_half.write_all(&reply_bytes).await;
+                                log::info!(
+                                    "[TCP] peer={} IMEI={} firmware_version={} message=ConnAnnounce action=reply status=TryAgainLater reason=download_interval_not_elapsed retry_after_seconds={}",
+                                    peer_addr, conn_announce_message.imei, conn_announce_message.firmware_version, retry_after_seconds
+                                );
+                                break;
+                            }
+
                             announced = true;
                             awaiting_first_card = true;
                             imei = Some(conn_announce_message.imei.clone());
@@ -436,7 +461,12 @@ async fn handle_connection(mut stream: TcpStream, peer_addr: SocketAddr, over_so
                             });
                             let reply_bytes: Vec<u8> = reply.into();
                             write_half.write_all(&reply_bytes).await.unwrap();
-                            log::info!("[TCP] peer={} IMEI={} firmware_version={} message=ConnAnnounce action=reply status=Accepted", peer_addr, conn_announce_message.imei, conn_announce_message.firmware_version);
+                            let snapshot = crate::admission::snapshot();
+                            log::info!(
+                                "[TCP] peer={} IMEI={} firmware_version={} message=ConnAnnounce action=reply status=Accepted estimated_wait_seconds={:?} cards={} waiting={} average_session_ms={}",
+                                peer_addr, conn_announce_message.imei, conn_announce_message.firmware_version,
+                                snapshot.estimated_wait().map(|wait| wait.as_secs()), snapshot.cards, snapshot.waiting, snapshot.average_session.as_millis()
+                            );
                         }
                     },
                     Message::ConnResponse(conn_response_message) => {
@@ -659,7 +689,7 @@ async fn handle_connection(mut stream: TcpStream, peer_addr: SocketAddr, over_so
                             // Only a download that's both verified and actually on disk
                             // counts towards the once-a-day limit.
                             let success = verified && saved_path.is_some();
-                            crate::download_db::record_download(crate::download_db::DownloadRecord {
+                            crate::database::record_download(crate::database::DownloadRecord {
                                 imei: imei_value,
                                 vrn: vrn.clone(),
                                 verified: success,
@@ -695,7 +725,7 @@ async fn handle_connection(mut stream: TcpStream, peer_addr: SocketAddr, over_so
             Err(_) => {
                 log::warn!(
                     "[TCP] peer={} read timeout after {:?} (announced={} has_card={})",
-                    peer_addr, current_read_timeout(announced, has_card), announced, has_card
+                    peer_addr, read_timeout, announced, has_card
                 );
                 break;
             }
@@ -773,7 +803,7 @@ async fn handle_connection(mut stream: TcpStream, peer_addr: SocketAddr, over_so
         };
         // Recorded for visibility only — never verified, so it doesn't count
         // towards the once-a-day limit.
-        crate::download_db::record_download(crate::download_db::DownloadRecord {
+        crate::database::record_download(crate::database::DownloadRecord {
             imei: imei_value,
             vrn,
             verified: false,
