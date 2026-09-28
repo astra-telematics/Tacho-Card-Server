@@ -18,7 +18,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::watch;
 use lazy_static::lazy_static;
 
-use crate::config::{DEFAULT_SERVER_CONNECTION_LIMIT, DEFAULT_SERVER_LISTEN_PORT};
+use crate::config::{get_from_cache, CacheSection, DEFAULT_DOWNLOAD_INTERVAL_DAYS, DEFAULT_SERVER_CONNECTION_LIMIT, DEFAULT_SERVER_LISTEN_PORT};
 use crate::device_protocol::{AbortMessage, AbortReason};
 use crate::device_protocol::Message;
 use crate::global_app_handle::server_emit_event;
@@ -27,7 +27,7 @@ use crate::global_app_handle::server_emit_event;
 /// TCP connection count (`connection_limit`) was already over its soft limit — the
 /// one and only admission gate in the system, checked at accept time before the
 /// device has said anything at all.
-const CONNECTION_LIMIT_RETRY_SECONDS: u16 = 5;
+const CONNECTION_LIMIT_RETRY_SECONDS: u32 = 5;
 
 /// How long a freshly-accepted connection has to send `ConnAnnounce` before it's
 /// dropped.
@@ -403,11 +403,27 @@ async fn handle_connection(mut stream: TcpStream, peer_addr: SocketAddr, over_so
                             let reply_bytes: Vec<u8> = reply.into();
                             let _ = write_half.write_all(&reply_bytes).await;
                             log::info!("[TCP] peer={} IMEI={} firmware_version={} message=ConnAnnounce action=reply status=Accepted note=duplicate", peer_addr, conn_announce_message.imei, conn_announce_message.firmware_version);
+                        } else if let Some(wait) = crate::download_db::time_until_next_download(
+                            &conn_announce_message.imei,
+                            get_from_cache(CacheSection::Server, "download_interval_days")
+                                .parse()
+                                .unwrap_or(DEFAULT_DOWNLOAD_INTERVAL_DAYS),
+                        ).await {
+                            // Downloaded too recently (`download_interval_days`) — turn it
+                            // away before it queues for a card. See download_db.rs.
+                            let retry_after_seconds = u32::try_from(wait.as_secs()).unwrap_or(u32::MAX);
+                            let reply = Message::ConnResponse(crate::device_protocol::ConnResponseMessage {
+                                status: crate::device_protocol::ConnResponseStatus::TryAgainLater,
+                                retry_after_seconds: Some(retry_after_seconds),
+                            });
+                            let reply_bytes: Vec<u8> = reply.into();
+                            let _ = write_half.write_all(&reply_bytes).await;
+                            log::info!("[TCP] peer={} IMEI={} firmware_version={} message=ConnAnnounce action=reply status=TryAgainLater reason=download_interval_not_elapsed retry_after_seconds={}", peer_addr, conn_announce_message.imei, conn_announce_message.firmware_version, retry_after_seconds);
+                            break;
                         } else {
-                            // No admission check here — the only gate in the system is
-                            // `connection_limit` at accept time (see `over_soft_limit`
-                            // above), checked before this connection was ever handed to
-                            // this task. A device that got this far always gets a card
+                            // Beyond `connection_limit` at accept time (see `over_soft_limit`
+                            // above), the only check is the download interval just
+                            // above. A device that got this far always gets a card
                             // eventually, however long the wait.
                             announced = true;
                             awaiting_first_card = true;
@@ -586,7 +602,7 @@ async fn handle_connection(mut stream: TcpStream, peer_addr: SocketAddr, over_so
                             self::send_abort_message(&mut write_half, AbortReason::ProtocolViolation).await;
                             log::warn!("[TCP] peer={} message=DownloadComplete action=abort reason=no_download_started", peer_addr);
                         } else {
-                            let (generation, _data_types) = download_meta.unwrap();
+                            let (generation, data_types) = download_meta.unwrap();
                             let actual_crc32 = crate::vu_download::compute_crc32(&download_buffer);
                             let matches = actual_crc32 == download_complete_message.crc32;
                             log::info!(
@@ -630,16 +646,28 @@ async fn handle_connection(mut stream: TcpStream, peer_addr: SocketAddr, over_so
                                 tag_parts.push(format!("malformed_at_{}", offset));
                             }
                             let tag = if tag_parts.is_empty() { None } else { Some(tag_parts.join("_")) };
-                            let success = match crate::vu_download::save_download(vrn.as_deref(), &imei_value, &download_buffer, tag.as_deref()) {
+                            let saved_path = match crate::vu_download::save_download(vrn.as_deref(), &imei_value, &download_buffer, tag.as_deref()) {
                                 Ok(path) => {
                                     log::info!("[TCP] peer={} action=download_saved path={:?} vrn={:?} verified={}", peer_addr, path, vrn, verified);
-                                    verified
+                                    Some(path)
                                 }
                                 Err(e) => {
                                     log::error!("[TCP] peer={} action=download_save_failed err={}", peer_addr, e);
-                                    false
+                                    None
                                 }
                             };
+                            // Only a download that's both verified and actually on disk
+                            // counts towards the once-a-day limit.
+                            let success = verified && saved_path.is_some();
+                            crate::download_db::record_download(crate::download_db::DownloadRecord {
+                                imei: imei_value,
+                                vrn: vrn.clone(),
+                                verified: success,
+                                generation: Some(generation),
+                                data_types: Some(data_types),
+                                bytes: download_buffer.len(),
+                                file_path: saved_path,
+                            }).await;
 
                             let reply = Message::DownloadAck(crate::device_protocol::DownloadAckMessage { success });
                             let reply_bytes: Vec<u8> = reply.into();
@@ -733,9 +761,26 @@ async fn handle_connection(mut stream: TcpStream, peer_addr: SocketAddr, over_so
         } else {
             "incomplete".to_string()
         };
-        match crate::vu_download::save_download(vrn.as_deref(), &imei_value, &download_buffer, Some(&tag)) {
-            Ok(path) => log::warn!("[TCP] peer={} action=download_saved_incomplete path={:?} bytes={}", peer_addr, path, download_buffer.len()),
-            Err(e) => log::error!("[TCP] peer={} action=download_save_failed err={}", peer_addr, e),
-        }
+        let saved_path = match crate::vu_download::save_download(vrn.as_deref(), &imei_value, &download_buffer, Some(&tag)) {
+            Ok(path) => {
+                log::warn!("[TCP] peer={} action=download_saved_incomplete path={:?} bytes={}", peer_addr, path, download_buffer.len());
+                Some(path)
+            }
+            Err(e) => {
+                log::error!("[TCP] peer={} action=download_save_failed err={}", peer_addr, e);
+                None
+            }
+        };
+        // Recorded for visibility only — never verified, so it doesn't count
+        // towards the once-a-day limit.
+        crate::download_db::record_download(crate::download_db::DownloadRecord {
+            imei: imei_value,
+            vrn,
+            verified: false,
+            generation: download_meta.map(|(generation, _)| generation),
+            data_types: download_meta.map(|(_, data_types)| data_types),
+            bytes: download_buffer.len(),
+            file_path: saved_path,
+        }).await;
     }
 }

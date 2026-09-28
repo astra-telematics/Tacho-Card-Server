@@ -14,7 +14,7 @@
 
         <div class="q-pa-xs q-gutter-sm">
           <q-btn flat round icon="mdi-cog" @click="configOpen = true" />
-          <ServerConfigDialog v-model="configOpen" />
+          <ServerConfigDialog v-model="configOpen" style="width: 75vw" />
         </div>
       </q-toolbar>
     </q-header>

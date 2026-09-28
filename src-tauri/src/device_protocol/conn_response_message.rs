@@ -10,7 +10,7 @@ pub enum ConnResponseStatus {
 #[derive(Debug)]
 pub struct ConnResponseMessage {
     pub status: ConnResponseStatus,
-    pub retry_after_seconds: Option<u16>,
+    pub retry_after_seconds: Option<u32>, // Only present if status is TryAgainLater
 }
 
 impl TryFrom<u8> for ConnResponseStatus {
@@ -42,8 +42,8 @@ impl TryFrom<Vec<u8>> for ConnResponseMessage {
     fn try_from(bytes: Vec<u8>) -> Result<Self> {
         let status = ConnResponseStatus::try_from(bytes[0])?;
 
-        let retry_after_seconds = if status == ConnResponseStatus::TryAgainLater && bytes.len() >= 3 {
-            Some(u16::from_be_bytes([bytes[1], bytes[2]]))
+        let retry_after_seconds = if status == ConnResponseStatus::TryAgainLater && bytes.len() >= 5 {
+            Some(u32::from_be_bytes([bytes[1], bytes[2], bytes[3], bytes[4]]))
         } else {
             None
         };

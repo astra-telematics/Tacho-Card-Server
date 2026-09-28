@@ -24,6 +24,11 @@ use crate::global_app_handle::emit_card_config_event;
 pub const DEFAULT_LOG_RETENTION_DAYS: u32 = 7;
 pub const DEFAULT_SERVER_LISTEN_PORT: u16 = 7878;
 pub const DEFAULT_SERVER_CONNECTION_LIMIT: u16 = 100;
+/// 1 = once a day. 0 disables the limit. See `download_db.rs`.
+pub const DEFAULT_DOWNLOAD_INTERVAL_DAYS: u32 = 7;
+/// Upper bound for `download_interval_days`. Regulations require a VU download at least
+/// every 90 days; 60 leaves a month of headroom for devices that miss their slot.
+pub const MAX_DOWNLOAD_INTERVAL_DAYS: u32 = 60;
 
 
 /// Represents the configuration settings for the application.
@@ -47,6 +52,14 @@ pub struct ServerConfig {
     // failing and being reset to defaults by init_config() (which would drop all cards).
     #[serde(default = "default_download_path")]
     pub download_path: String,
+    /// Minimum whole days between verified downloads from the same device (rolling,
+    /// server-local dates): 1 = once a day, 7 = once a week, 0 = no limit.
+    #[serde(default = "default_download_interval_days")]
+    pub download_interval_days: u32,
+}
+
+fn default_download_interval_days() -> u32 {
+    DEFAULT_DOWNLOAD_INTERVAL_DAYS
 }
 
 /// `get_default_download_path()`, falling back to a relative "downloads" directory if
@@ -388,6 +401,7 @@ pub fn update_server_config(
     listen_port: u16,
     connection_limit: u16,
     download_path: String,
+    download_interval_days: u32,
     log_retention_days: u32,
     theme: &str,
     minimize_to_tray: bool,
@@ -398,6 +412,7 @@ pub fn update_server_config(
         listen_port,
         connection_limit,
         download_path,
+        download_interval_days,
     });
     config.logging = Some(LoggingConfig {
         retention_days: log_retention_days,
@@ -482,7 +497,7 @@ pub async fn remove_card_from_config(
 /// Public function to update the server address in the configuration.
 /// This function is a Tauri command that updates the configuration file with a new server address.
 #[tauri::command]
-pub fn update_server(listen_port: String, connection_limit: String, download_path: String, log_retention_days: String, theme: &str, minimize_to_tray: bool) -> bool {
+pub fn update_server(listen_port: String, connection_limit: String, download_path: String, download_interval_days: String, log_retention_days: String, theme: &str, minimize_to_tray: bool) -> bool {
     let config_path = match get_config_path() {
         Ok(path) => path,
         Err(e) => {
@@ -490,17 +505,18 @@ pub fn update_server(listen_port: String, connection_limit: String, download_pat
             return false;
         }
     };
-    log::info!("Updating server configuration: listen_port={}, connection_limit={}, download_path={}, log_retention_days={}, theme={}, minimize_to_tray={}", listen_port, connection_limit, download_path, log_retention_days, theme, minimize_to_tray);
+    log::info!("Updating server configuration: listen_port={}, connection_limit={}, download_path={}, download_interval_days={}, log_retention_days={}, theme={}, minimize_to_tray={}", listen_port, connection_limit, download_path, download_interval_days, log_retention_days, theme, minimize_to_tray);
 
     match update_server_config(&config_path, 
         listen_port.parse().unwrap_or(DEFAULT_SERVER_LISTEN_PORT), 
         connection_limit.parse().unwrap_or(DEFAULT_SERVER_CONNECTION_LIMIT), 
         if download_path.trim().is_empty() { default_download_path() } else { download_path.trim().to_string() },
+        download_interval_days.parse().unwrap_or(DEFAULT_DOWNLOAD_INTERVAL_DAYS).min(MAX_DOWNLOAD_INTERVAL_DAYS),
         log_retention_days.parse().unwrap_or(DEFAULT_LOG_RETENTION_DAYS), 
         theme,
         minimize_to_tray) {
         Ok(_) => {
-            log::info!("The server configuration is updated: listen_port={}, connection_limit={}, download_path={}, log_retention_days={}, theme={}, minimize_to_tray={}", listen_port, connection_limit, download_path, log_retention_days, theme, minimize_to_tray);
+            log::info!("The server configuration is updated: listen_port={}, connection_limit={}, download_path={}, download_interval_days={}, log_retention_days={}, theme={}, minimize_to_tray={}", listen_port, connection_limit, download_path, download_interval_days, log_retention_days, theme, minimize_to_tray);
             true
         }
         Err(e) => {
@@ -620,6 +636,7 @@ pub fn get_from_cache(section: CacheSection, key: &str) -> String {
                     "listen_port" => server.listen_port.to_string(),
                     "connection_limit" => server.connection_limit.to_string(),
                     "download_path" => server.download_path.clone(),
+                    "download_interval_days" => server.download_interval_days.to_string(),
                     _ => {
                         log::debug!("Unknown key for server section: {}", key);
                         "".to_string()
@@ -719,11 +736,24 @@ pub fn init_config() -> io::Result<()> {
         });
     }
 
+    // Correct a hand-edited interval above the regulatory cap, so config.yaml and the
+    // UI show what's actually enforced.
+    if let Some(server) = config.server.as_mut() {
+        if server.download_interval_days > MAX_DOWNLOAD_INTERVAL_DAYS {
+            eprintln!(
+                "download_interval_days {} exceeds the maximum of {}; using {}.",
+                server.download_interval_days, MAX_DOWNLOAD_INTERVAL_DAYS, MAX_DOWNLOAD_INTERVAL_DAYS
+            );
+            server.download_interval_days = MAX_DOWNLOAD_INTERVAL_DAYS;
+        }
+    }
+
     if config.server.is_none() {
         config.server = Some(ServerConfig {
             listen_port: 7878,
             connection_limit: 100,
             download_path: default_download_path(),
+            download_interval_days: DEFAULT_DOWNLOAD_INTERVAL_DAYS,
         });
     }
 
@@ -759,7 +789,7 @@ fn generate_default_config() -> ConfigurationFile {
             dark_theme: DarkTheme::Auto,
             minimize_to_tray: true,
         }),
-        server: Some(ServerConfig { listen_port: 7878, connection_limit: 100, download_path: default_download_path() }),
+        server: Some(ServerConfig { listen_port: 7878, connection_limit: 100, download_path: default_download_path(), download_interval_days: DEFAULT_DOWNLOAD_INTERVAL_DAYS }),
         logging: Some(LoggingConfig { retention_days: DEFAULT_LOG_RETENTION_DAYS }),
         cards: HashMap::new(),
     }
@@ -813,6 +843,7 @@ mod tests {
                 listen_port: 7878,
                 connection_limit: 100,
                 download_path: default_download_path(),
+                download_interval_days: DEFAULT_DOWNLOAD_INTERVAL_DAYS,
             }),
             logging: Some(LoggingConfig { retention_days: 7 }),
             cards,
@@ -934,6 +965,7 @@ pub fn emit_global_config_server(app: &tauri::AppHandle) -> Result<(), Box<dyn E
     let listen_port = get_from_cache(CacheSection::Server, "listen_port");
     let connection_limit = get_from_cache(CacheSection::Server, "connection_limit");
     let download_path = get_from_cache(CacheSection::Server, "download_path");
+    let download_interval_days = get_from_cache(CacheSection::Server, "download_interval_days");
     let logging_retention_days = get_from_cache(CacheSection::Logging, "retention_days");
     let appearance = get_from_cache(CacheSection::Appearance, "dark_theme");
     let minimize_to_tray = get_from_cache(CacheSection::Appearance, "minimize_to_tray");
@@ -942,6 +974,7 @@ pub fn emit_global_config_server(app: &tauri::AppHandle) -> Result<(), Box<dyn E
     config_app_payload.insert("listen_port", listen_port);
     config_app_payload.insert("connection_limit", connection_limit);
     config_app_payload.insert("download_path", download_path);
+    config_app_payload.insert("download_interval_days", download_interval_days);
     config_app_payload.insert("retention_days", logging_retention_days);
     config_app_payload.insert("dark_theme", appearance);
     config_app_payload.insert("minimize_to_tray", minimize_to_tray);

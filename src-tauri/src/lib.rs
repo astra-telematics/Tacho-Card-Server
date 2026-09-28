@@ -10,6 +10,7 @@ mod socket_server;      // TCP listen server (replacement for the outbound MQTT 
 mod device_protocol;    // Device protocol message definitions and parsing.
 mod card_pool;          // Bounded pool of physical cards shared across authenticating devices.
 mod vu_download;        // VU data download: CRC verification, VRN extraction, storage.
+mod download_db;        // SQLite record of downloads; enforces one verified download per device per day.
 // mod com_port;          // COM port handling.
 
 // ───── External Crates ─────

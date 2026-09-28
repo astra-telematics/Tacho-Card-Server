@@ -4,19 +4,38 @@
     persistent
     @update:model-value="$emit('update:modelValue', $event)"
   >
-    <q-card style="min-width: 350px">
+    <q-card style="min-width: 350px; width: 75vw">
       <q-card-section>
         <div class="text-h6">Server</div>
         <q-input
           label="Listen Port"
           dense
-          v-model="listenPortValue"
+          type="number"
+          v-model.number="listenPortValue"
+          :min="1"
+          :max="65535"
+          :rules="[inRange(1, 65535)]"
           @keyup.enter="$emit('update:modelValue', false)"
         />
         <q-input
           label="Connection Limit"
           dense
-          v-model="connectionLimitValue"
+          type="number"
+          v-model.number="connectionLimitValue"
+          :min="1"
+          :max="65535"
+          :rules="[inRange(1, 65535)]"
+          @keyup.enter="$emit('update:modelValue', false)"
+        />
+        <q-input
+          label="Download Interval (days)"
+          dense
+          type="number"
+          v-model.number="downloadIntervalDaysValue"
+          :min="0"
+          :max="MAX_DOWNLOAD_INTERVAL_DAYS"
+          :rules="[inRange(0, MAX_DOWNLOAD_INTERVAL_DAYS)]"
+          hint="Minimum days between downloads per device (max 60). 0 = no limit."
           @keyup.enter="$emit('update:modelValue', false)"
         />
         <q-input
@@ -26,13 +45,7 @@
           @keyup.enter="$emit('update:modelValue', false)"
         >
           <template #append>
-            <q-btn
-              flat
-              round
-              dense
-              icon="mdi-folder-open"
-              @click="browseDownloadPath"
-            >
+            <q-btn flat round dense icon="mdi-folder-open" @click="browseDownloadPath">
               <q-tooltip>Browse…</q-tooltip>
             </q-btn>
           </template>
@@ -44,7 +57,11 @@
         <q-input
           label="Log Retention Days"
           dense
-          v-model="logRetentionDaysValue"
+          type="number"
+          v-model.number="logRetentionDaysValue"
+          :min="1"
+          :max="MAX_DAYS"
+          :rules="[inRange(1, MAX_DAYS)]"
           @keyup.enter="$emit('update:modelValue', false)"
         />
         <q-btn
@@ -82,7 +99,7 @@
       </q-card-section>
       <q-card-actions align="right" class="text-primary">
         <q-btn flat label="Cancel" v-close-popup />
-        <q-btn flat label="Save" v-close-popup @click="saveServerConfig" />
+        <q-btn flat label="Save" v-close-popup :disable="!isValid" @click="saveServerConfig" />
       </q-card-actions>
     </q-card>
   </q-dialog>
@@ -90,7 +107,7 @@
 
 <script setup lang="ts">
 import { useQuasar, Notify } from 'quasar'
-import { ref } from 'vue'
+import { computed, ref } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
 import { open } from '@tauri-apps/plugin-dialog'
@@ -103,11 +120,34 @@ defineEmits<{
   'update:modelValue': [value: boolean]
 }>()
 
-const listenPortValue = ref(7878)
-const connectionLimitValue = ref(100)
-const logRetentionDaysValue = ref(7)
+// v-model.number yields '' while a number field is empty, hence `number | string`.
+const listenPortValue = ref<number | string>(7878)
+const connectionLimitValue = ref<number | string>(100)
+const downloadIntervalDaysValue = ref<number | string>(1)
+const logRetentionDaysValue = ref<number | string>(7)
 const downloadPathValue = ref('')
 const minimizeToTrayValue = ref(true)
+
+// Upper bound for the day-count fields: ten years is far beyond any sensible value.
+const MAX_DAYS = 3650
+// Regulations require a VU download at least every 90 days; matches
+// MAX_DOWNLOAD_INTERVAL_DAYS in config.rs.
+const MAX_DOWNLOAD_INTERVAL_DAYS = 60
+
+const isIntInRange = (value: number | string, min: number, max: number) =>
+  typeof value === 'number' && Number.isInteger(value) && value >= min && value <= max
+
+// Quasar rule: true when valid, otherwise the message shown under the field.
+const inRange = (min: number, max: number) => (value: number | string) =>
+  isIntInRange(value, min, max) || `Enter a whole number from ${min} to ${max}`
+
+const isValid = computed(
+  () =>
+    isIntInRange(listenPortValue.value, 1, 65535) &&
+    isIntInRange(connectionLimitValue.value, 1, 65535) &&
+    isIntInRange(downloadIntervalDaysValue.value, 0, MAX_DOWNLOAD_INTERVAL_DAYS) &&
+    isIntInRange(logRetentionDaysValue.value, 1, MAX_DAYS),
+)
 
 const $q = useQuasar()
 const selectedTheme = ref('')
@@ -136,6 +176,7 @@ const saveServerConfig = async () => {
       listenPort: listenPortValue.value.toString(),
       connectionLimit: connectionLimitValue.value.toString(),
       downloadPath: downloadPathValue.value,
+      downloadIntervalDays: downloadIntervalDaysValue.value.toString(),
       logRetentionDays: logRetentionDaysValue.value.toString(),
       theme: selectedTheme.value,
       minimizeToTray: minimizeToTrayValue.value,
@@ -167,11 +208,13 @@ const saveServerConfig = async () => {
 
 // Listen for config updates from backend
 listen('global-config-server', (event) => {
+  // All values arrive as strings (see config.rs::get_from_cache).
   const payload = event.payload as {
-    listen_port: number
-    connection_limit: number
+    listen_port: string
+    connection_limit: string
     download_path: string
-    retention_days: number
+    download_interval_days: string
+    retention_days: string
     dark_theme: string
     minimize_to_tray: string
   }
@@ -184,10 +227,11 @@ listen('global-config-server', (event) => {
     payload.dark_theme,
   )
 
-  listenPortValue.value = payload.listen_port
-  connectionLimitValue.value = payload.connection_limit
+  listenPortValue.value = Number(payload.listen_port)
+  connectionLimitValue.value = Number(payload.connection_limit)
   downloadPathValue.value = payload.download_path
-  logRetentionDaysValue.value = payload.retention_days
+  downloadIntervalDaysValue.value = Number(payload.download_interval_days)
+  logRetentionDaysValue.value = Number(payload.retention_days)
   // Backend cache values are plain strings; empty (no appearance section yet) means on.
   minimizeToTrayValue.value = payload.minimize_to_tray !== 'false'
 
