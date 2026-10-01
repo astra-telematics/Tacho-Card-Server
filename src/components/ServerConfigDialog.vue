@@ -15,7 +15,7 @@
           :min="1"
           :max="65535"
           :rules="[inRange(1, 65535)]"
-          @keyup.enter="$emit('update:modelValue', false)"
+          @keyup.enter="saveAndClose"
         />
         <q-input
           label="Connection Limit"
@@ -25,7 +25,7 @@
           :min="1"
           :max="65535"
           :rules="[inRange(1, 65535)]"
-          @keyup.enter="$emit('update:modelValue', false)"
+          @keyup.enter="saveAndClose"
         />
         <q-input
           label="Download Interval (days)"
@@ -36,13 +36,13 @@
           :max="MAX_DOWNLOAD_INTERVAL_DAYS"
           :rules="[inRange(0, MAX_DOWNLOAD_INTERVAL_DAYS)]"
           hint="Minimum days between downloads per device (max 60). 0 = no limit."
-          @keyup.enter="$emit('update:modelValue', false)"
+          @keyup.enter="saveAndClose"
         />
         <q-input
           label="Download Path"
           dense
           v-model="downloadPathValue"
-          @keyup.enter="$emit('update:modelValue', false)"
+          @keyup.enter="saveAndClose"
         >
           <template #append>
             <q-btn flat round dense icon="mdi-folder-open" @click="browseDownloadPath">
@@ -62,7 +62,7 @@
           :min="1"
           :max="MAX_DAYS"
           :rules="[inRange(1, MAX_DAYS)]"
-          @keyup.enter="$emit('update:modelValue', false)"
+          @keyup.enter="saveAndClose"
         />
         <q-btn
           flat
@@ -116,7 +116,7 @@ defineProps<{
   modelValue: boolean
 }>()
 
-defineEmits<{
+const emit = defineEmits<{
   'update:modelValue': [value: boolean]
 }>()
 
@@ -166,6 +166,13 @@ const changeTheme = (value: string) => {
     default:
       console.log('Unknown theme value:', value)
   }
+}
+
+// Enter in any field: same as clicking Save, which is disabled while a field is invalid.
+const saveAndClose = async () => {
+  if (!isValid.value) return
+  emit('update:modelValue', false)
+  await saveServerConfig()
 }
 
 const saveServerConfig = async () => {
