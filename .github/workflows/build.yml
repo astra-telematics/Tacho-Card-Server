@@ -167,7 +167,6 @@ jobs:
           prerelease: ${{ contains(github.ref_name, '-') }}
           generate_release_notes: true
           files: |
-            dist/*.exe
             dist/*.msi
             dist/*.AppImage
           fail_on_unmatched_files: true
