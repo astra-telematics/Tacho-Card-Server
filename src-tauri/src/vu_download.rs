@@ -137,15 +137,13 @@ fn skip_record_array(data: &[u8], offset: usize) -> Option<usize> {
 /// the buffer, or `Err(offset)` with the byte offset where it stopped making
 /// sense — either a header that doesn't fit in the remaining bytes, a
 /// declared size that would run past the end of the buffer, or leftover
-/// trailing bytes too short to be another header. Confirmed against a real
-/// 4-block capture (Overview + EventsAndFaults + DetailedSpeed +
-/// TechnicalData) that this correctly walks through the first three blocks;
-/// TechnicalData's own internal record layout (specifically calibration
-/// records, which appear to embed variable-length text fields like a
-/// workshop name) isn't understood/verified yet, so a download that includes
-/// it will currently — correctly, not as a bug — report a malformed offset
-/// once the walk reaches content it doesn't recognize, rather than silently
-/// accept it.
+/// trailing bytes too short to be another header. Section (TREP) and record
+/// types are never inspected, so sections or record types it hasn't seen
+/// before pass as long as their declared sizes are consistent.
+///
+/// Diagnostic only: the result is logged and tagged in the saved filename
+/// (`unparsed_at_<offset>`) but never fails a download — the CRC is the sole
+/// pass/fail check (see `socket_server`'s `DownloadComplete` handling).
 ///
 /// Gen1-only note: there's no equivalent check for generation 1 — its
 /// certificates/fields are fixed-offset, not self-describing, so there's
@@ -219,7 +217,7 @@ pub fn extract_vrn(generation: u8, data: &[u8]) -> Option<String> {
 /// if none is set. Read from the cache on every save, so a change from the UI applies
 /// to the next download.
 fn downloads_dir() -> std::io::Result<PathBuf> {
-    let configured = get_from_cache(CacheSection::Server, "download_path");
+    let configured = get_from_cache(CacheSection::Download, "download_path");
     let dir = if configured.trim().is_empty() {
         PathBuf::from(crate::config::default_download_path())
     } else {

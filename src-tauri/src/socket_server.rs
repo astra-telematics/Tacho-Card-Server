@@ -285,6 +285,14 @@ async fn poll_pending(pending: &mut Option<PendingCardEvent>) -> CardEvent {
     }
 }
 
+/// Whether downloads that failed (CRC mismatch) or never finished are still written to
+/// disk, tagged, for debugging (`download.retain_failed_downloads` in config.yaml). Off
+/// by default: such a download is then only logged and recorded in the database. Read
+/// on every download, so a change from the UI applies to the next one.
+fn retain_failed_downloads() -> bool {
+    get_from_cache(CacheSection::Download, "retain_failed_downloads") == "true"
+}
+
 /// Per-connection handler.
 ///
 /// `Ready`/`Abort(CardRemoved)` are server-initiated: the device announces itself
@@ -431,7 +439,7 @@ async fn handle_connection(mut stream: TcpStream, peer_addr: SocketAddr, over_so
                             // else queues for a card, however long the wait.
                             let download_allowed_at = crate::database::next_download_allowed_at(
                                 &conn_announce_message.imei,
-                                get_from_cache(CacheSection::Server, "download_interval_days")
+                                get_from_cache(CacheSection::Download, "download_interval_days")
                                     .parse()
                                     .unwrap_or(DEFAULT_DOWNLOAD_INTERVAL_DAYS),
                             ).await;
@@ -640,50 +648,54 @@ async fn handle_connection(mut stream: TcpStream, peer_addr: SocketAddr, over_so
                                 peer_addr, download_buffer.len(), download_complete_message.crc32, actual_crc32, matches
                             );
 
-                            // Structural sanity check: every declared block must be
-                            // exactly its declared size, with nothing left over and
-                            // nothing overrunning — independent of the CRC (which only
-                            // says "the bytes match what the device thinks it sent," not
-                            // "the bytes make internal sense") and independent of VRN
-                            // extraction (which only walks as far as the 4th block and
-                            // would happily succeed even if something later is corrupt).
-                            // Only meaningful for generation 2 — Gen1's fields are
-                            // fixed-offset, not self-describing, so there's nothing in
-                            // the byte stream itself to check sizes against.
+                            // Structural check: every declared block must be exactly
+                            // its declared size, with nothing left over and nothing
+                            // overrunning. Diagnostic only — it never fails a download.
+                            // The CRC is the sole pass/fail: a match proves the bytes
+                            // arrived exactly as the device sent them, whereas a
+                            // structure failure only means this parser doesn't fully
+                            // understand the file. Only meaningful for generation 2 —
+                            // Gen1's fields are fixed-offset, not self-describing, so
+                            // there's nothing in the byte stream to check sizes against.
                             let structure_issue = if generation == 2 {
                                 crate::vu_download::validate_gen2_structure(&download_buffer).err()
                             } else {
                                 None
                             };
                             if let Some(offset) = structure_issue {
-                                log::warn!("[TCP] peer={} action=download_malformed offset={}", peer_addr, offset);
+                                log::warn!("[TCP] peer={} action=download_unparsed offset={}", peer_addr, offset);
                             }
 
-                            // Save regardless of whether the CRC matched or the structure
-                            // validated — for testing/debugging visibility into what
-                            // actually arrived, any issue is tagged rather than silently
-                            // discarded. Only a fully clean result (CRC match AND, where
-                            // checkable, valid structure) gets the plain (untagged)
-                            // filename that downstream tooling should treat as verified.
+                            // A CRC-matched download is always saved. A failed one is
+                            // saved, tagged in the filename for debugging, only if
+                            // `retain_failed_downloads` is on; either way it's recorded in
+                            // the database. Only a fully clean result (CRC match and,
+                            // where checkable, a structure this parser understands) gets
+                            // the plain untagged filename.
                             let vrn = crate::vu_download::extract_vrn(generation, &download_buffer);
                             let imei_value = imei.clone().unwrap_or_default();
-                            let verified = matches && structure_issue.is_none();
+                            let verified = matches;
                             let mut tag_parts: Vec<String> = Vec::new();
                             if !matches {
                                 tag_parts.push("crc_mismatch".to_string());
                             }
                             if let Some(offset) = structure_issue {
-                                tag_parts.push(format!("malformed_at_{}", offset));
+                                tag_parts.push(format!("unparsed_at_{}", offset));
                             }
                             let tag = if tag_parts.is_empty() { None } else { Some(tag_parts.join("_")) };
-                            let saved_path = match crate::vu_download::save_download(vrn.as_deref(), &imei_value, &download_buffer, tag.as_deref()) {
-                                Ok(path) => {
-                                    log::info!("[TCP] peer={} action=download_saved path={:?} vrn={:?} verified={}", peer_addr, path, vrn, verified);
-                                    Some(path)
-                                }
-                                Err(e) => {
-                                    log::error!("[TCP] peer={} action=download_save_failed err={}", peer_addr, e);
-                                    None
+                            let saved_path = if !verified && !retain_failed_downloads() {
+                                log::warn!("[TCP] peer={} action=download_discarded reason=crc_mismatch bytes={} vrn={:?} note=retain_failed_downloads_off", peer_addr, download_buffer.len(), vrn);
+                                None
+                            } else {
+                                match crate::vu_download::save_download(vrn.as_deref(), &imei_value, &download_buffer, tag.as_deref()) {
+                                    Ok(path) => {
+                                        log::info!("[TCP] peer={} action=download_saved path={:?} vrn={:?} verified={}", peer_addr, path, vrn, verified);
+                                        Some(path)
+                                    }
+                                    Err(e) => {
+                                        log::error!("[TCP] peer={} action=download_save_failed err={}", peer_addr, e);
+                                        None
+                                    }
                                 }
                             };
                             // Only a download that's both verified and actually on disk
@@ -786,19 +798,24 @@ async fn handle_connection(mut stream: TcpStream, peer_addr: SocketAddr, over_so
         let tag = if generation == 2 {
             match crate::vu_download::validate_gen2_structure(&download_buffer) {
                 Ok(_) => "incomplete".to_string(),
-                Err(offset) => format!("incomplete_malformed_at_{}", offset),
+                Err(offset) => format!("incomplete_unparsed_at_{}", offset),
             }
         } else {
             "incomplete".to_string()
         };
-        let saved_path = match crate::vu_download::save_download(vrn.as_deref(), &imei_value, &download_buffer, Some(&tag)) {
-            Ok(path) => {
-                log::warn!("[TCP] peer={} action=download_saved_incomplete path={:?} bytes={}", peer_addr, path, download_buffer.len());
-                Some(path)
-            }
-            Err(e) => {
-                log::error!("[TCP] peer={} action=download_save_failed err={}", peer_addr, e);
-                None
+        let saved_path = if !retain_failed_downloads() {
+            log::warn!("[TCP] peer={} action=download_discarded reason={} bytes={} note=retain_failed_downloads_off", peer_addr, tag, download_buffer.len());
+            None
+        } else {
+            match crate::vu_download::save_download(vrn.as_deref(), &imei_value, &download_buffer, Some(&tag)) {
+                Ok(path) => {
+                    log::warn!("[TCP] peer={} action=download_saved_incomplete path={:?} bytes={}", peer_addr, path, download_buffer.len());
+                    Some(path)
+                }
+                Err(e) => {
+                    log::error!("[TCP] peer={} action=download_save_failed err={}", peer_addr, e);
+                    None
+                }
             }
         };
         // Recorded for visibility only — never verified, so it doesn't count

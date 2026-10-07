@@ -104,8 +104,17 @@ pub fn run() {
                     if BACKEND_STARTED.swap(true, Ordering::SeqCst) {
                         log::debug!("Frontend reloaded; re-sending state.");
                         config::emit_card_configs();
-                        if let Err(e) = config::emit_global_config_server(&front_app_handle) {
-                            log::error!("Failed to emit global config server: {:?}", e);
+                        if let Err(e) = config::emit_global_config_connection(&front_app_handle) {
+                            log::error!("Failed to emit global config connection: {:?}", e);
+                        }
+                        if let Err(e) = config::emit_global_config_download(&front_app_handle) {
+                            log::error!("Failed to emit global config connection: {:?}", e);
+                        }
+                        if let Err(e) = config::emit_global_config_logging(&front_app_handle) {
+                            log::error!("Failed to emit global config logging: {:?}", e);
+                        }
+                        if let Err(e) = config::emit_global_config_appearance(&front_app_handle) {
+                            log::error!("Failed to emit global config appearance: {:?}", e);
                         }
                         async_runtime::spawn(async {
                             if let Err(e) = smart_card::manual_sync_cards(String::new(), false).await {
@@ -132,9 +141,21 @@ pub fn run() {
 
                     log::debug!("Received event with payload: {:?}", event.payload());
                     // Load server configuration from cache to frontend using event
-                    match config::emit_global_config_server(&front_app_handle) {
-                        Ok(_) => log::debug!("Global config server emitted successfully."),
-                        Err(e) => log::error!("Failed to emit global config server: {:?}", e),
+                    match config::emit_global_config_connection(&front_app_handle) {
+                        Ok(_) => log::debug!("Global config connection emitted successfully."),
+                        Err(e) => log::error!("Failed to emit global config connection: {:?}", e),
+                    }
+                    match config::emit_global_config_download(&front_app_handle) {
+                        Ok(_) => log::debug!("Global config download emitted successfully."),
+                        Err(e) => log::error!("Failed to emit global config download: {:?}", e),
+                    }
+                    match config::emit_global_config_logging(&front_app_handle) {
+                        Ok(_) => log::debug!("Global config logging emitted successfully."),
+                        Err(e) => log::error!("Failed to emit global config logging: {:?}", e),
+                    }
+                    match config::emit_global_config_appearance(&front_app_handle) {
+                        Ok(_) => log::debug!("Global config appearance emitted successfully."),
+                        Err(e) => log::error!("Failed to emit global config appearance: {:?}", e),
                     }
 
                     // Run async function in the background with the Tauri runtime
@@ -154,8 +175,8 @@ pub fn run() {
                         // listen_port / connection_limit come from the `server` section of
                         // config.yaml; changes saved from the UI are applied live
                         // (see socket_server::apply_settings).
-                        let listen_port: u16 = get_from_cache(CacheSection::Server, "listen_port").parse().unwrap_or(config::DEFAULT_SERVER_LISTEN_PORT);
-                        let connection_limit: u16 = get_from_cache(CacheSection::Server, "connection_limit").parse().unwrap_or(config::DEFAULT_SERVER_CONNECTION_LIMIT);
+                        let listen_port: u16 = get_from_cache(CacheSection::Connection, "listen_port").parse().unwrap_or(config::DEFAULT_SERVER_LISTEN_PORT);
+                        let connection_limit: u16 = get_from_cache(CacheSection::Connection, "connection_limit").parse().unwrap_or(config::DEFAULT_SERVER_CONNECTION_LIMIT);
                         socket_server::run(listen_port, connection_limit).await;
                     });
                 });
@@ -187,8 +208,12 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             config::update_card,           // update list of cards from the frontend
-            config::update_server,         // update server config from the frontend
-            config::remove_card,            // remove card from config
+            config::update_connection,     // update connection config from the frontend
+            config::update_download,       // update download config from the frontend
+            config::update_logging,        // update logging config from the frontend
+            config::update_appearance,     // update appearance config from the frontend
+            config::get_config,            // current settings, for the config dialog's tabs
+            config::remove_card,           // remove card from config
             smart_card::manual_sync_cards, // manual sync cards from the frontend
             logger::open_logs_folder,      // open the log directory in the OS file manager
         ])
@@ -288,9 +313,9 @@ fn run_headless() {
 
     async_runtime::spawn(async {
         // Start the TCP listen server (replacement for the outbound MQTT client).
-        // listen_port / connection_limit come from the `server` section of config.yaml.
-        let listen_port: u16 = get_from_cache(CacheSection::Server, "listen_port").parse().expect("Invalid listen_port in cache");
-        let max_connections: u16 = get_from_cache(CacheSection::Server, "connection_limit").parse().expect("Invalid connection_limit in cache");
+        // listen_port / connection_limit come from the `connection` section of config.yaml.
+        let listen_port: u16 = get_from_cache(CacheSection::Connection, "listen_port").parse().expect("Invalid listen_port in cache");
+        let max_connections: u16 = get_from_cache(CacheSection::Connection, "connection_limit").parse().expect("Invalid connection_limit in cache");
         socket_server::run(listen_port, max_connections).await;
     });
 

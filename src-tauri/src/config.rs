@@ -7,7 +7,6 @@ use std::fs::File;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 // ───── External Crates ─────
 use serde::{Deserialize, Serialize};
@@ -38,24 +37,28 @@ pub struct ConfigurationFile {
     version: String,                        // The version of the application.
     description: String,                    // A brief description of the application.
     appearance: Option<AppearanceConfig>,   // Optional UI configuration settings.
-    server: Option<ServerConfig>,           // Optional server configuration settings.
+    connection: Option<ConnectionConfig>,   // Optional server configuration settings.
     logging: Option<LoggingConfig>,         // Optional log rotation/retention settings.
+    download: Option<DownloadConfig>,       // Optional download configuration settings.
     cards: HashMap<String, CardConfig>,     // Hashmap of the cards with the CardConfig structure
 }
 
-// Server Configuration structure, part of ConfigurationFile that contains data about the server.
 #[derive(Serialize, Deserialize, Clone, Debug)]
-pub struct ServerConfig {
+pub struct ConnectionConfig {
     pub listen_port: u16,
     pub connection_limit: u16,
-    // Defaulted so configs written before this field existed still parse, rather than
-    // failing and being reset to defaults by init_config() (which would drop all cards).
+}
+// Each field is defaulted so a section missing one (hand-edited, or written by an older
+// version) still parses, rather than failing and init_config() resetting the whole
+// config — cards included — to defaults.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct DownloadConfig {
     #[serde(default = "default_download_path")]
     pub download_path: String,
-    /// Minimum whole days between verified downloads from the same device (rolling,
-    /// server-local dates): 1 = once a day, 7 = once a week, 0 = no limit.
     #[serde(default = "default_download_interval_days")]
     pub download_interval_days: u32,
+    #[serde(default)]
+    pub retain_failed_downloads: bool,
 }
 
 fn default_download_interval_days() -> u32 {
@@ -394,29 +397,67 @@ pub fn update_card(cardnumber: &str, content: CardConfig) -> bool {
     }
 }
 
-/// Updates the server address in the configuration.
-/// This function updates the configuration file with a new server address.
-pub fn update_server_config(
+pub fn update_connection_config(
     config_path: &Path,
     listen_port: u16,
     connection_limit: u16,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let mut config = load_config(config_path)?;
+
+    config.connection = Some(ConnectionConfig {
+        listen_port,
+        connection_limit,
+    });
+    save_config(config_path, &config)?;
+    load_config_to_cache(&config)?;
+
+    // Rebind / re-limit the running TCP server; no-op if neither value changed.
+    crate::socket_server::apply_settings(listen_port, connection_limit);
+
+    Ok(())
+}
+
+pub fn update_download_config(
+    config_path: &Path,
     download_path: String,
     download_interval_days: u32,
+    retain_failed_downloads: bool,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let mut config = load_config(config_path)?;
+
+    config.download = Some(DownloadConfig {
+        download_path,
+        download_interval_days,
+        retain_failed_downloads,
+    });
+    save_config(config_path, &config)?;
+    load_config_to_cache(&config)?;
+
+    Ok(())
+}
+
+pub fn update_logging_config(
+    config_path: &Path,
     log_retention_days: u32,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let mut config = load_config(config_path)?;
+
+    config.logging = Some(LoggingConfig {
+        retention_days: log_retention_days,
+    });
+    save_config(config_path, &config)?;
+    load_config_to_cache(&config)?;
+
+    Ok(())
+}
+
+pub fn update_appearance_config(
+    config_path: &Path,
     theme: &str,
     minimize_to_tray: bool,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut config = load_config(config_path)?;
 
-    config.server = Some(ServerConfig {
-        listen_port,
-        connection_limit,
-        download_path,
-        download_interval_days,
-    });
-    config.logging = Some(LoggingConfig {
-        retention_days: log_retention_days,
-    });
     config.appearance = Some(AppearanceConfig {
         dark_theme: match theme {
             "Auto" => DarkTheme::Auto,
@@ -428,9 +469,6 @@ pub fn update_server_config(
     });
     save_config(config_path, &config)?;
     load_config_to_cache(&config)?;
-
-    // Rebind / re-limit the running TCP server; no-op if neither value changed.
-    crate::socket_server::apply_settings(listen_port, connection_limit);
 
     Ok(())
 }
@@ -494,10 +532,8 @@ pub async fn remove_card_from_config(
     }
 }
 
-/// Public function to update the server address in the configuration.
-/// This function is a Tauri command that updates the configuration file with a new server address.
 #[tauri::command]
-pub fn update_server(listen_port: String, connection_limit: String, download_path: String, download_interval_days: String, log_retention_days: String, theme: &str, minimize_to_tray: bool) -> bool {
+pub fn update_connection(listen_port: String, connection_limit: String) -> bool {
     let config_path = match get_config_path() {
         Ok(path) => path,
         Err(e) => {
@@ -505,22 +541,80 @@ pub fn update_server(listen_port: String, connection_limit: String, download_pat
             return false;
         }
     };
-    log::info!("Updating server configuration: listen_port={}, connection_limit={}, download_path={}, download_interval_days={}, log_retention_days={}, theme={}, minimize_to_tray={}", listen_port, connection_limit, download_path, download_interval_days, log_retention_days, theme, minimize_to_tray);
-
-    match update_server_config(&config_path, 
-        listen_port.parse().unwrap_or(DEFAULT_SERVER_LISTEN_PORT), 
-        connection_limit.parse().unwrap_or(DEFAULT_SERVER_CONNECTION_LIMIT), 
-        if download_path.trim().is_empty() { default_download_path() } else { download_path.trim().to_string() },
-        download_interval_days.parse().unwrap_or(DEFAULT_DOWNLOAD_INTERVAL_DAYS).min(MAX_DOWNLOAD_INTERVAL_DAYS),
-        log_retention_days.parse().unwrap_or(DEFAULT_LOG_RETENTION_DAYS), 
-        theme,
-        minimize_to_tray) {
+    log::info!("Updating connection configuration: listen_port={}, connection_limit={}", listen_port, connection_limit);
+    match update_connection_config(&config_path, listen_port.parse().unwrap_or(DEFAULT_SERVER_LISTEN_PORT), connection_limit.parse().unwrap_or(DEFAULT_SERVER_CONNECTION_LIMIT)) {
         Ok(_) => {
-            log::info!("The server configuration is updated: listen_port={}, connection_limit={}, download_path={}, download_interval_days={}, log_retention_days={}, theme={}, minimize_to_tray={}", listen_port, connection_limit, download_path, download_interval_days, log_retention_days, theme, minimize_to_tray);
+            log::info!("The connection configuration is updated: listen_port={}, connection_limit={}", listen_port, connection_limit);
             true
         }
         Err(e) => {
-            log::error!("Failed to update server address: {}", e);
+            log::error!("Failed to update connection configuration: {}", e);
+            false
+        }
+    }
+}
+
+#[tauri::command]
+pub fn update_appearance(theme: &str, minimize_to_tray: bool) -> bool {
+    let config_path = match get_config_path() {
+        Ok(path) => path,
+        Err(e) => {
+            log::error!("Failed to get config path: {}", e);
+            return false;
+        }
+    };
+    log::info!("Updating appearance configuration: theme={}, minimize_to_tray={}", theme, minimize_to_tray);
+    match update_appearance_config(&config_path, theme, minimize_to_tray) {
+        Ok(_) => {
+            log::info!("The appearance configuration is updated: theme={}, minimize_to_tray={}", theme, minimize_to_tray);
+            true
+        }
+        Err(e) => {
+            log::error!("Failed to update appearance configuration: {}", e);
+            false
+        }
+    }
+}
+
+#[tauri::command]
+pub fn update_download(download_path: String, download_interval_days: String, retain_failed_downloads: bool) -> bool {
+    let config_path = match get_config_path() {
+        Ok(path) => path,
+        Err(e) => {
+            log::error!("Failed to get config path: {}", e);
+            return false;
+        }
+    };
+    log::info!("Updating download configuration: download_path={}, download_interval_days={}, retain_failed_downloads={}", download_path, download_interval_days, retain_failed_downloads);
+    match update_download_config(&config_path, if download_path.trim().is_empty() { default_download_path() } else { download_path.trim().to_string() }, download_interval_days.parse().unwrap_or(DEFAULT_DOWNLOAD_INTERVAL_DAYS).min(MAX_DOWNLOAD_INTERVAL_DAYS), retain_failed_downloads) {
+        Ok(_) => {
+            log::info!("The download configuration is updated: download_path={}, download_interval_days={}, retain_failed_downloads={}", download_path, download_interval_days, retain_failed_downloads);
+            true
+        }
+        Err(e) => {
+            log::error!("Failed to update download configuration: {}", e);
+            false
+        }
+    }
+}
+
+#[tauri::command]
+pub fn update_logging(log_retention_days: String) -> bool {
+    let config_path = match get_config_path() {
+        Ok(path) => path,
+        Err(e) => {
+            log::error!("Failed to get config path: {}", e);
+            return false;
+        }
+    };
+    log::info!("Updating logging configuration: log_retention_days={}", log_retention_days);
+    match update_logging_config(&config_path, log_retention_days.parse().unwrap_or(DEFAULT_LOG_RETENTION_DAYS)) {
+        Ok(_) => {
+            log::info!("The logging configuration is updated: log_retention_days={}", log_retention_days);
+            true
+        }
+        Err(e) => {
+            log::error!("Failed to update logging configuration: {}", e);
             false
         }
     }
@@ -534,7 +628,8 @@ pub fn update_server(listen_port: String, connection_limit: String, download_pat
 #[derive(Default, Debug)]
 pub struct CacheConfigData {
     pub cards: HashMap<String, CardConfig>,
-    pub server: Option<ServerConfig>,
+    pub connection: Option<ConnectionConfig>,
+    pub download: Option<DownloadConfig>,
     pub appearance: Option<AppearanceConfig>,
     pub logging: Option<LoggingConfig>,
 }
@@ -549,7 +644,8 @@ lazy_static! {
 #[derive(Debug)]
 pub enum CacheSection {
     Cards,
-    Server,
+    Connection,
+    Download,
     Appearance,
     Logging,
 }
@@ -628,22 +724,20 @@ pub fn get_from_cache(section: CacheSection, key: &str) -> String {
             "".to_string()
         }
 
-        CacheSection::Server => {
-            log::debug!("Accessing Server config");
-            if let Some(server) = &cache.server {
-                log::debug!("Server config: listen port = {}, connection limit = {}", server.listen_port, server.connection_limit);
+        CacheSection::Connection => {
+            log::debug!("Accessing Connection config");
+            if let Some(connection) = &cache.connection {
+                log::debug!("Connection config: listen port = {}, connection limit = {}", connection.listen_port, connection.connection_limit);
                 match key {
-                    "listen_port" => server.listen_port.to_string(),
-                    "connection_limit" => server.connection_limit.to_string(),
-                    "download_path" => server.download_path.clone(),
-                    "download_interval_days" => server.download_interval_days.to_string(),
+                    "listen_port" => connection.listen_port.to_string(),
+                    "connection_limit" => connection.connection_limit.to_string(),
                     _ => {
-                        log::debug!("Unknown key for server section: {}", key);
+                        log::debug!("Unknown key for connection section: {}", key);
                         "".to_string()
                     }
                 }
             } else {
-                log::debug!("No server config found");
+                log::debug!("No connection config found");
                 "".to_string()
             }
         }
@@ -681,6 +775,24 @@ pub fn get_from_cache(section: CacheSection, key: &str) -> String {
                 "".to_string()
             }
         }
+
+        CacheSection::Download => {
+            log::debug!("Accessing Download config");
+            if let Some(download) = &cache.download {
+                match key {
+                    "download_path" => download.download_path.clone(),
+                    "download_interval_days" => download.download_interval_days.to_string(),
+                    "retain_failed_downloads" => download.retain_failed_downloads.to_string(),
+                    _ => {
+                        log::debug!("Unknown key for download section: {}", key);
+                        "".to_string()
+                    }
+                }
+            } else {
+                log::debug!("No download config found");
+                "".to_string()
+            }
+        }
     }
 }
 
@@ -695,9 +807,10 @@ pub fn load_config_to_cache(
     let mut cache = CACHE.lock().unwrap();
     *cache = CacheConfigData {
         cards: config.cards.clone(),
-        server: config.server.clone(),
+        connection: config.connection.clone(),
         appearance: config.appearance.clone(),
         logging: config.logging.clone(),
+        download: config.download.clone(),
     };
 
     // trace_cache(&*cache);
@@ -736,24 +849,30 @@ pub fn init_config() -> io::Result<()> {
         });
     }
 
+    if config.download.is_none() {
+        config.download = Some(DownloadConfig {
+            download_path: default_download_path(),
+            download_interval_days: DEFAULT_DOWNLOAD_INTERVAL_DAYS,
+            retain_failed_downloads: false,
+        });
+    }
+
     // Correct a hand-edited interval above the regulatory cap, so config.yaml and the
     // UI show what's actually enforced.
-    if let Some(server) = config.server.as_mut() {
-        if server.download_interval_days > MAX_DOWNLOAD_INTERVAL_DAYS {
+    if let Some(download) = config.download.as_mut() {
+        if download.download_interval_days > MAX_DOWNLOAD_INTERVAL_DAYS {
             eprintln!(
                 "download_interval_days {} exceeds the maximum of {}; using {}.",
-                server.download_interval_days, MAX_DOWNLOAD_INTERVAL_DAYS, MAX_DOWNLOAD_INTERVAL_DAYS
+                download.download_interval_days, MAX_DOWNLOAD_INTERVAL_DAYS, MAX_DOWNLOAD_INTERVAL_DAYS
             );
-            server.download_interval_days = MAX_DOWNLOAD_INTERVAL_DAYS;
+            download.download_interval_days = MAX_DOWNLOAD_INTERVAL_DAYS;
         }
     }
 
-    if config.server.is_none() {
-        config.server = Some(ServerConfig {
+    if config.connection.is_none() {
+        config.connection = Some(ConnectionConfig {
             listen_port: 7878,
             connection_limit: 100,
-            download_path: default_download_path(),
-            download_interval_days: DEFAULT_DOWNLOAD_INTERVAL_DAYS,
         });
     }
 
@@ -789,7 +908,8 @@ fn generate_default_config() -> ConfigurationFile {
             dark_theme: DarkTheme::Auto,
             minimize_to_tray: true,
         }),
-        server: Some(ServerConfig { listen_port: 7878, connection_limit: 100, download_path: default_download_path(), download_interval_days: DEFAULT_DOWNLOAD_INTERVAL_DAYS }),
+        connection: Some(ConnectionConfig { listen_port: 7878, connection_limit: 100 }),
+        download: Some(DownloadConfig { download_path: default_download_path(), download_interval_days: DEFAULT_DOWNLOAD_INTERVAL_DAYS, retain_failed_downloads: false }),
         logging: Some(LoggingConfig { retention_days: DEFAULT_LOG_RETENTION_DAYS }),
         cards: HashMap::new(),
     }
@@ -839,11 +959,14 @@ mod tests {
                 dark_theme: DarkTheme::Auto,
                 minimize_to_tray: true,
             }),
-            server: Some(ServerConfig {
+            connection: Some(ConnectionConfig {
                 listen_port: 7878,
                 connection_limit: 100,
+            }),
+            download: Some(DownloadConfig {
                 download_path: default_download_path(),
                 download_interval_days: DEFAULT_DOWNLOAD_INTERVAL_DAYS,
+                retain_failed_downloads: false,
             }),
             logging: Some(LoggingConfig { retention_days: 7 }),
             cards,
@@ -865,11 +988,11 @@ mod tests {
         assert_eq!(card.card_type, Some(4));
         assert_eq!(card.last_auth, Some((1_700_000_500, true)));
         assert_eq!(
-            loaded.server.as_ref().map(|s| s.listen_port),
+            loaded.connection.as_ref().map(|s| s.listen_port),
             Some(DEFAULT_SERVER_LISTEN_PORT)
         );
         assert_eq!(
-            loaded.server.as_ref().map(|s| s.connection_limit),
+            loaded.connection.as_ref().map(|s| s.connection_limit),
             Some(DEFAULT_SERVER_CONNECTION_LIMIT)
         );
 
@@ -957,30 +1080,75 @@ pub fn emit_card_configs() {
     }
 }
 
-pub fn emit_global_config_server(app: &tauri::AppHandle) -> Result<(), Box<dyn Error>> {
-    // small note: the structure requires the clone trait because the configuration is passed by reference,
-    // so the value cannot be fully transferred to ownership.
+/// Every setting the frontend's config dialog shows, keyed as in the
+/// `global-config-*` events. All values are strings (see `get_from_cache`).
+fn config_payload() -> HashMap<&'static str, String> {
+    HashMap::from([
+        ("listen_port", get_from_cache(CacheSection::Connection, "listen_port")),
+        ("connection_limit", get_from_cache(CacheSection::Connection, "connection_limit")),
+        ("download_path", get_from_cache(CacheSection::Download, "download_path")),
+        ("download_interval_days", get_from_cache(CacheSection::Download, "download_interval_days")),
+        ("retain_failed_downloads", get_from_cache(CacheSection::Download, "retain_failed_downloads")),
+        ("retention_days", get_from_cache(CacheSection::Logging, "retention_days")),
+        ("dark_theme", get_from_cache(CacheSection::Appearance, "dark_theme")),
+        ("minimize_to_tray", get_from_cache(CacheSection::Appearance, "minimize_to_tray")),
+    ])
+}
 
-    // Gettting Host value from the "operation cahce" with the ServerConfig structure
-    let listen_port = get_from_cache(CacheSection::Server, "listen_port");
-    let connection_limit = get_from_cache(CacheSection::Server, "connection_limit");
-    let download_path = get_from_cache(CacheSection::Server, "download_path");
-    let download_interval_days = get_from_cache(CacheSection::Server, "download_interval_days");
-    let logging_retention_days = get_from_cache(CacheSection::Logging, "retention_days");
-    let appearance = get_from_cache(CacheSection::Appearance, "dark_theme");
-    let minimize_to_tray = get_from_cache(CacheSection::Appearance, "minimize_to_tray");
+/// Current settings, for a config section to load when it's created — the dialog's
+/// contents only exist while it's open, so they miss the startup `global-config-*`
+/// events.
+#[tauri::command]
+pub fn get_config() -> HashMap<&'static str, String> {
+    config_payload()
+}
 
-    let mut config_app_payload = HashMap::new();
-    config_app_payload.insert("listen_port", listen_port);
-    config_app_payload.insert("connection_limit", connection_limit);
-    config_app_payload.insert("download_path", download_path);
-    config_app_payload.insert("download_interval_days", download_interval_days);
-    config_app_payload.insert("retention_days", logging_retention_days);
-    config_app_payload.insert("dark_theme", appearance);
-    config_app_payload.insert("minimize_to_tray", minimize_to_tray);
+pub fn emit_global_config_connection(app: &tauri::AppHandle) -> Result<(), Box<dyn Error>> {
+    let payload: HashMap<&'static str, String> = HashMap::from([
+        ("listen_port", get_from_cache(CacheSection::Connection, "listen_port")),
+        ("connection_limit", get_from_cache(CacheSection::Connection, "connection_limit")),
+    ]);
+    // Emit this data as a global event to update front-end fields
+    if let Err(e) = app.emit("global-config-connection", payload) {
+        return Err(Box::new(e));
+    }
 
-    // Emit this data as a global event to update fornt-end fields
-    if let Err(e) = app.emit("global-config-server", config_app_payload) {
+    Ok(())
+}
+
+pub fn emit_global_config_download(app: &tauri::AppHandle) -> Result<(), Box<dyn Error>> {
+    let payload: HashMap<&'static str, String> = HashMap::from([
+        ("download_path", get_from_cache(CacheSection::Download, "download_path")),
+        ("download_interval_days", get_from_cache(CacheSection::Download, "download_interval_days")),
+        ("retain_failed_downloads", get_from_cache(CacheSection::Download, "retain_failed_downloads")),
+    ]);
+    // Emit this data as a global event to update front-end fields
+    if let Err(e) = app.emit("global-config-download", payload) {
+        return Err(Box::new(e));
+    }
+
+    Ok(())
+}
+
+pub fn emit_global_config_logging(app: &tauri::AppHandle) -> Result<(), Box<dyn Error>> {
+    let payload: HashMap<&'static str, String> = HashMap::from([
+        ("retention_days", get_from_cache(CacheSection::Logging, "retention_days")),
+    ]);
+    // Emit this data as a global event to update front-end fields
+    if let Err(e) = app.emit("global-config-logging", payload) {
+        return Err(Box::new(e));
+    }
+
+    Ok(())
+}
+
+pub fn emit_global_config_appearance(app: &tauri::AppHandle) -> Result<(), Box<dyn Error>> {
+    let payload: HashMap<&'static str, String> = HashMap::from([
+        ("dark_theme", get_from_cache(CacheSection::Appearance, "dark_theme")),
+        ("minimize_to_tray", get_from_cache(CacheSection::Appearance, "minimize_to_tray")),
+    ]);
+    // Emit this data as a global event to update front-end fields
+    if let Err(e) = app.emit("global-config-appearance", payload) {
         return Err(Box::new(e));
     }
 

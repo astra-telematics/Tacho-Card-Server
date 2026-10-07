@@ -5,10 +5,10 @@
 //!   between downloads from the same device (`server.download_interval_days` in
 //!   config.yaml; 1 = once a day, 7 = once a week, 0 = no limit). A device (IMEI) whose
 //!   last verified download was less than that many days ago may not download again
-//!   until the start of the day it becomes eligible; `admission.rs` picks the exact
-//!   time to send it back. Days are the server's local calendar dates. Unverified
-//!   downloads (CRC mismatch, malformed, incomplete) are recorded for visibility but
-//!   don't count, so the device can retry straight away.
+//!   until the start of the day it becomes eligible; `admission.rs` works out when to
+//!   send it back. Days are the server's local calendar dates. Unverified downloads
+//!   (CRC mismatch, or incomplete) are recorded for visibility but don't count, so the
+//!   device can retry straight away.
 //! - **Card sessions**: how long each device held a card, so `admission.rs`'s average
 //!   survives restarts.
 //!
@@ -22,9 +22,6 @@ use chrono::{DateTime, Days, Local, NaiveDate, TimeZone};
 use rusqlite::{params, Connection};
 
 const DB_FILE_NAME: &str = "tcs.db";
-
-/// Bumped (with a matching step in `migrate`) whenever the schema changes.
-const SCHEMA_VERSION: i32 = 2;
 
 /// Opened on first use. `None` if opening failed (logged once); every call then
 /// behaves as if nothing is recorded.
@@ -305,13 +302,5 @@ mod tests {
         }
         let recent: Vec<u64> = recent_card_sessions(&conn, 3).unwrap().iter().map(|d| d.as_secs()).collect();
         assert_eq!(recent, vec![20, 30, 40]);
-    }
-
-    #[test]
-    fn migrate_is_idempotent() {
-        let mut conn = test_db();
-        migrate(&mut conn).expect("second migrate");
-        let version: i32 = conn.query_row("PRAGMA user_version", [], |row| row.get(0)).unwrap();
-        assert_eq!(version, SCHEMA_VERSION);
     }
 }
