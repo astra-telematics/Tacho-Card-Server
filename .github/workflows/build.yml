@@ -13,6 +13,7 @@ concurrency:
 
 jobs:
   macos-universal:
+    if: false
     name: macOS universal (x86_64 + arm64 DMG)
     runs-on: macos-latest
     steps:
@@ -136,7 +137,7 @@ jobs:
   release:
     name: Publish GitHub release (on v* tag)
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: [macos-universal, windows-amd64, ubuntu-2204-amd64]
+    needs: [windows-amd64, ubuntu-2204-amd64]
     runs-on: ubuntu-22.04
     permissions:
       contents: write
@@ -166,7 +167,6 @@ jobs:
           prerelease: ${{ contains(github.ref_name, '-') }}
           generate_release_notes: true
           files: |
-            dist/*.dmg
             dist/*.exe
             dist/*.msi
             dist/*.AppImage
