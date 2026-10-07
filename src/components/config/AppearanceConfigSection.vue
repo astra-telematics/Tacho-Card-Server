@@ -1,7 +1,6 @@
 <template>
     <q-card class="min-width: 350px; width: 75vw">
         <q-card-section>
-            <div class="text-h6">Appearance</div>
             <div class="q-mt-md row items-center">
                 <div class="text-caption text-grey q-mr-md">Theme</div>
                 <q-btn-toggle

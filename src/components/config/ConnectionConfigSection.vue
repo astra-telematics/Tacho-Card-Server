@@ -1,7 +1,6 @@
 <template>
     <q-card>
         <q-card-section>
-            <div class="text-h6">Connection</div>
             <q-input
                 label="Listen Port"
                 dense

@@ -1,7 +1,6 @@
 <template>
     <q-card>
         <q-card-section>
-            <div class="text-h6">Download</div>
             <q-input
                 label="Download Path"
                 dense
