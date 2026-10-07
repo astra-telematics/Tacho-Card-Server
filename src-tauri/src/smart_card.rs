@@ -486,6 +486,8 @@ fn catch_pcsc_panic<T>(f: impl FnOnce() -> T) -> DynResult<T> {
 pub struct ManagedCard {
     inner: Arc<Mutex<Card>>,
     reader_name: Arc<CStr>,
+    /// `Protocols` bits. pcsc's `DWORD` is `u32` on Windows/macOS but `u64` on 64-bit
+    /// Linux, so values are cast to/from `u32` at each use; every protocol flag fits.
     protocol: Arc<AtomicU32>,
     atr: Arc<[u8]>,
     pub iccid: OnceCell<String>,
@@ -507,7 +509,7 @@ impl ManagedCard {
 
     /// The protocol PCSC actually negotiated with the card at connect time.
     pub fn protocol(&self) -> Protocols {
-        Protocols::from_bits_retain(self.protocol.load(Ordering::Relaxed))
+        Protocols::from_bits_retain(self.protocol.load(Ordering::Relaxed) as pcsc::ffi::DWORD)
     }
 
     /// Connects using the protocol the ATR itself declares as the default
@@ -535,7 +537,7 @@ impl ManagedCard {
         Ok(Self {
             inner: Arc::new(Mutex::new(card)),
             reader_name: Arc::from(reader_name.to_owned()),
-            protocol: Arc::new(AtomicU32::new(protocol.bits())),
+            protocol: Arc::new(AtomicU32::new(protocol.bits() as u32)),
             atr: Arc::from(atr),
             iccid: OnceCell::new(),
         })
@@ -593,7 +595,7 @@ impl ManagedCard {
 
         match reconnect_result {
             Ok(_) => {
-                self.protocol.store(requested.bits(), Ordering::Relaxed);
+                self.protocol.store(requested.bits() as u32, Ordering::Relaxed);
                 debug!(
                     "Card reconnected successfully for reader: {}",
                     self.reader_name.to_string_lossy()
@@ -632,7 +634,7 @@ impl ManagedCard {
             card.reconnect(ShareMode::Shared, protocol, Disposition::ResetCard)
         })? {
             Ok(()) => {
-                self.protocol.store(protocol.bits(), Ordering::Relaxed);
+                self.protocol.store(protocol.bits() as u32, Ordering::Relaxed);
                 debug!(
                     "Reconnected reader '{}' onto protocol {:?}",
                     self.reader_name.to_string_lossy(),
@@ -648,7 +650,7 @@ impl ManagedCard {
         let (new_card, protocol) = Self::create_card(&self.reader_name, &self.atr)?;
         let mut lock = self.inner.lock().await;
         *lock = new_card;
-        self.protocol.store(protocol.bits(), Ordering::Relaxed);
+        self.protocol.store(protocol.bits() as u32, Ordering::Relaxed);
 
         info!(
             "Successfully recreated card object for reader: {}",
