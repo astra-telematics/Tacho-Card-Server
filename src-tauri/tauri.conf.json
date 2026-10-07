@@ -1,44 +1,44 @@
 {
-  "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
-  "productName": "Tacho Card Server",
-  "version": "0.0.1",
-  "identifier": "com.astra.tcs",
-  "build": {
-    "frontendDist": "../dist/spa",
-    "devUrl": "http://localhost:9000",
-    "beforeDevCommand": "npm run dev",
-    "beforeBuildCommand": "npm run build"
-  },
-  "app": {
-    "windows": [
-      {
-        "title": "Tacho Card Server",
-        "width": 800,
-        "height": 600,
-        "resizable": true,
-        "fullscreen": false
-      }
-    ],
-    "security": {
-      "csp": null
+    "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
+    "productName": "Tacho Card Server",
+    "version": "0.0.2",
+    "identifier": "com.astra.tcs",
+    "build": {
+        "frontendDist": "../dist/spa",
+        "devUrl": "http://localhost:9000",
+        "beforeDevCommand": "npm run dev",
+        "beforeBuildCommand": "npm run build"
+    },
+    "app": {
+        "windows": [
+            {
+                "title": "Tacho Card Server",
+                "width": 800,
+                "height": 600,
+                "resizable": true,
+                "fullscreen": false
+            }
+        ],
+        "security": {
+            "csp": null
+        }
+    },
+    "bundle": {
+        "active": true,
+        "targets": "all",
+        "icon": [
+            "icons/32x32.png",
+            "icons/128x128.png",
+            "icons/128x128@2x.png",
+            "icons/icon.icns",
+            "icons/icon.ico"
+        ],
+        "macOS": {
+            "frameworks": [],
+            "minimumSystemVersion": "10.13",
+            "signingIdentity": "@env:APPLE_IDENTITY",
+            "providerShortName": "@env:APPLE_TEAM_ID",
+            "entitlements": "entitlements.plist"
+        }
     }
-  },
-  "bundle": {
-    "active": true,
-    "targets": "all",
-    "icon": [
-      "icons/32x32.png",
-      "icons/128x128.png",
-      "icons/128x128@2x.png",
-      "icons/icon.icns",
-      "icons/icon.ico"
-    ],
-    "macOS": {
-      "frameworks": [],
-      "minimumSystemVersion": "10.13",
-      "signingIdentity": "@env:APPLE_IDENTITY",
-      "providerShortName": "@env:APPLE_TEAM_ID",
-      "entitlements": "entitlements.plist"
-    }
-  }
 }
