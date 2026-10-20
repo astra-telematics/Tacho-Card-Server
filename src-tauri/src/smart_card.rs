@@ -10,7 +10,7 @@ use log::{debug, error, info, warn};
 use once_cell::sync::OnceCell;
 use tokio::time::Duration;
 
-use tauri::async_runtime::Mutex;
+use tokio::sync::Mutex;
 
 // ───── PCSC ─────
 use pcsc::*;
@@ -83,10 +83,10 @@ fn setup_reader_states(
         if is_dead(rs) {
             log::debug!("Removing {:?}", rs.name());
             // The reader itself is gone (e.g. unplugged), not just its card —
-            // make sure CARD_POOL doesn't keep believing a card from this reader
+            // make sure CARD_POOLS doesn't keep believing a card from this reader
             // is still available/checked-out once the reader can't be monitored
             // any more.
-            crate::card_pool::CARD_POOL.remove_by_reader(rs.name());
+            crate::card_pool::CARD_POOLS.remove_by_reader(rs.name());
         }
     }
 
@@ -153,12 +153,14 @@ async fn process_reader_states(reader_states: &mut [ReaderState]) -> Result<(), 
                         iccid = received_iccid;
                         card_number = get_from_cache(CacheSection::Cards, &iccid);
 
+                        let company = crate::config::company_for_card(&card_number);
                         log::info!(
-                            "Card {} (reader {:?}) detected — added to the card pool for devices to check out",
+                            "Card {} (reader {:?}) detected — company {:?}",
                             card_number,
-                            rs.name()
+                            rs.name(),
+                            company
                         );
-                        crate::card_pool::CARD_POOL.add_card(managed_card);
+                        crate::card_pool::CARD_POOLS.add_card(company.as_deref(), managed_card);
                     }
                     Err(e) => {
                         log::error!("Failed to get ICCID: {}", e);
@@ -177,7 +179,7 @@ async fn process_reader_states(reader_states: &mut [ReaderState]) -> Result<(), 
                 // Drops the card if it's idle in the pool, or flags + wakes the
                 // holding session immediately if it was checked out — see
                 // CardGuard::revoked/replace_dead_card in card_pool.rs.
-                crate::card_pool::CARD_POOL.remove_by_reader(rs.name());
+                crate::card_pool::CARD_POOLS.remove_by_reader(rs.name());
             }
             CardProcessingResult::Ignore => {}
         }
@@ -218,9 +220,9 @@ pub async fn should_register_new_card(reader_name: &str, atr: &str) -> CardProce
     log::debug!("should_register_new_card");
 
     // Case 1: Both reader_name and atr are provided and not already known to
-    // CARD_POOL (idle or checked out) → register new card.
+    // any card pool (idle or checked out) or held as unassigned → register new card.
     if !reader_name.is_empty() && !atr.is_empty() {
-        if !crate::card_pool::CARD_POOL.contains_reader(reader_name) {
+        if !crate::card_pool::CARD_POOLS.contains_reader(reader_name) {
             return CardProcessingResult::Create;
         }
     }
@@ -408,7 +410,7 @@ pub fn atr_supported_protocols(atr: &[u8]) -> Protocols {
 // Manual card sync function.
 // This function is used to manually sync cards from anywhere in the program.
 // Manually sync cards. Clicking on the button in the frontend will trigger this function
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 pub async fn manual_sync_cards(
     _readername: String,
     restart: bool,
@@ -726,7 +728,7 @@ impl ManagedCard {
             "Cloned card for blocking transmission. Sending to spawn_blocking..."
         );
 
-        let response = tauri::async_runtime::spawn_blocking(move || {
+        let response = crate::rt::spawn_blocking(move || {
             debug!("Entered spawn_blocking thread. Preparing buffer and locking card...");
 
             let mut rapdu_buf = [0u8; MAX_BUFFER_SIZE];

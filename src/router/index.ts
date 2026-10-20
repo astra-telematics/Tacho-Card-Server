@@ -6,6 +6,7 @@ import {
   createWebHistory,
 } from 'vue-router';
 import routes from './routes';
+import { currentUser, getSession, isDesktop, onLoggedOut } from 'src/backend';
 
 /*
  * If not building with SSR mode, you can
@@ -29,6 +30,20 @@ export default defineRouter(function (/* { store, ssrContext } */) {
     // quasar.conf.js -> build -> vueRouterMode
     // quasar.conf.js -> build -> publicPath
     history: createHistory(process.env.VUE_ROUTER_BASE),
+  });
+
+  // The web UI needs a login; the desktop app is always admin.
+  Router.beforeEach(async (to) => {
+    if (isDesktop) return to.path === '/login' ? '/' : true;
+    if (to.path === '/login') return true;
+    if (currentUser.value !== null || (await getSession()) !== null) return true;
+    return { path: '/login', query: { redirect: to.fullPath } };
+  });
+  onLoggedOut(() => {
+    const current = Router.currentRoute.value;
+    if (current.path !== '/login') {
+      void Router.push({ path: '/login', query: { redirect: current.fullPath } });
+    }
   });
 
   return Router;

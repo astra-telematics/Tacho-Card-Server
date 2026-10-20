@@ -12,15 +12,44 @@
                     <span class="q-ml-xs">{{ serverStatus }}</span>
                 </q-toolbar-title>
 
+                <q-tabs inline-label no-caps shrink>
+                    <q-route-tab
+                        to="/"
+                        exact
+                        icon="mdi-card-account-details-outline"
+                        label="Readers"
+                    />
+                    <q-route-tab to="/companies" icon="mdi-domain" label="Companies" />
+                    <q-route-tab to="/devices" icon="mdi-truck-outline" label="Devices" />
+                    <q-route-tab to="/users" icon="mdi-account-multiple-outline" label="Users" />
+                </q-tabs>
+
                 <div class="q-pa-xs q-gutter-sm">
                     <q-btn flat round icon="mdi-cog" @click="configOpen = true" />
                     <ServerConfigDialog v-model="configOpen" />
+                    <q-btn v-if="!isDesktop" flat round icon="mdi-account-circle">
+                        <q-menu>
+                            <q-list style="min-width: 160px">
+                                <q-item-label header>Logged in as {{ currentUser }}</q-item-label>
+                                <q-item v-close-popup clickable @click="logout">
+                                    <q-item-section avatar><q-icon name="mdi-logout" /></q-item-section>
+                                    <q-item-section>Log out</q-item-section>
+                                </q-item>
+                            </q-list>
+                        </q-menu>
+                    </q-btn>
                 </div>
             </q-toolbar>
         </q-header>
 
         <q-page-container>
-            <router-view />
+            <!-- keep-alive: the Readers page holds live reader/card state from backend
+                 events, so it mustn't be rebuilt when switching pages. -->
+            <router-view v-slot="{ Component }">
+                <keep-alive>
+                    <component :is="Component" />
+                </keep-alive>
+            </router-view>
         </q-page-container>
     </q-layout>
 </template>
@@ -28,7 +57,7 @@
 <script setup lang="ts">
 import { Notify } from 'quasar'
 import { ref, onMounted, onUnmounted } from 'vue'
-import { listen, type UnlistenFn } from '@tauri-apps/api/event'
+import { currentUser, isDesktop, listen, logout, type UnlistenFn } from 'src/backend'
 import 'animate.css'
 import ServerConfigDialog from 'src/components/ServerConfigDialog.vue'
 import { applyTheme, getConfig, type AppConfig } from 'src/utils'

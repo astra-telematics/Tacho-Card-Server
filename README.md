@@ -107,6 +107,32 @@ sudo apt install -y pcscd libpcsclite-dev libccid usbutils
 sudo apt install -y squashfs-tools fuse
 ```
 
+### Headless build (servers and Docker)
+
+There are two builds: the **desktop app** above (a window and tray icon), and the
+**headless server**, which has no window and serves the same UI as a web app with a
+login. Install whichever fits; the desktop app has no headless mode.
+
+The headless build doesn't use Tauri, so it needs no GTK or WebKit, only PC/SC and
+OpenSSL (`sudo apt install -y build-essential pkg-config libssl-dev libpcsclite-dev libudev-dev pcscd libccid`):
+
+```
+npm run build                                   # the web UI, embedded in the binary
+cd src-tauri
+cargo build --release --no-default-features     # target/release/tacho-card-server
+```
+
+Run it with `--config <path>` to choose the config file (data, logs and downloads go
+next to it) and `--web-port <port>` for the web UI (default 8080). Log in as `admin`
+with the `admin_password` from config.yaml, which is generated on first start. The web
+UI is plain HTTP: keep it on the LAN or behind a TLS reverse proxy.
+
+**Docker:** `docker compose up -d` with [docker-compose.yml](docker-compose.yml) (pulls
+`ghcr.io/astra-telematics/tacho-card-server`, or uncomment `build: .`). Data is in
+`./data`, and the admin password is in `./data/config.yaml` after the first start.
+
+Unit tests run in the headless build: `cargo test --no-default-features --lib`.
+
 ## Icon generating & customizing
 
 The project stores icons in a directory: **src-tauri/icons**

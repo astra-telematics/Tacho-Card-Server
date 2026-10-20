@@ -1,0 +1,18 @@
+# Allow-list: only what the image build uses, so build outputs and local data (target
+# folders, node_modules, dist, configs) never end up in the build context.
+*
+!package.json
+!package-lock.json
+!quasar.config.ts
+!tsconfig.json
+!postcss.config.js
+!eslint.config.js
+!global.d.ts
+!index.html
+!public
+!src
+!src-tauri/Cargo.toml
+!src-tauri/Cargo.lock
+!src-tauri/build.rs
+!src-tauri/src
+!docker/entrypoint.sh

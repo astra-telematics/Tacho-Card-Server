@@ -1,5 +1,5 @@
 import { Dark } from 'quasar'
-import { invoke } from '@tauri-apps/api/core'
+import { invoke } from 'src/backend'
 
 export const isIntInRange = (value: number | string, min: number, max: number) =>
   typeof value === 'number' && Number.isInteger(value) && value >= min && value <= max
@@ -14,7 +14,6 @@ export interface AppConfig {
   listen_port: string
   connection_limit: string
   download_path: string
-  download_interval_days: string
   retain_failed_downloads: string
   retention_days: string
   dark_theme: string

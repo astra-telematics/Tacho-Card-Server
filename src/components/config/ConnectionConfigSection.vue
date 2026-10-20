@@ -38,7 +38,7 @@
 <script setup lang="ts">
 import { Notify } from 'quasar'
 import { computed, onMounted, ref } from 'vue'
-import { invoke } from '@tauri-apps/api/core'
+import { invoke } from 'src/backend'
 import { getConfig, inRange, isIntInRange } from 'src/utils'
 
 const listenPortValue = ref<number>(7878)

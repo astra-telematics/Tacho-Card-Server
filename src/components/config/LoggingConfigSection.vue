@@ -12,6 +12,7 @@
                 @keyup.enter="saveConfig"
             />
             <q-btn
+                v-if="isDesktop"
                 flat
                 label="Open Logs Folder"
                 color="primary"
@@ -35,7 +36,7 @@
 <script setup lang="ts">
 import { Notify } from 'quasar'
 import { computed, onMounted, ref } from 'vue'
-import { invoke } from '@tauri-apps/api/core'
+import { invoke, isDesktop } from 'src/backend'
 import { getConfig, inRange, isIntInRange } from 'src/utils'
 
 // Upper bound for the day-count fields: ten years is far beyond any sensible value.

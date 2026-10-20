@@ -33,7 +33,7 @@
 //!   straight to a waiting `replace_dead_card` caller via a oneshot channel, so
 //!   there's no permit-accounting race between it and the normal FIFO queue.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::ffi::{CStr, CString};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -46,11 +46,18 @@ use crate::smart_card::ManagedCard;
 
 struct CheckedOutEntry {
     reader_name: CString,
+    /// The card's ICCID, if read (it always is before a card is pooled).
+    iccid: Option<String>,
     revoked: Arc<AtomicBool>,
     notify: Arc<Notify>,
 }
 
 pub struct CardPool {
+    /// The company whose cards (and devices) this pool serves.
+    company: String,
+    /// Woken whenever a card leaves the pool for good, so devices waiting for a card
+    /// can give up once none are left (see `wait_until_no_cards`).
+    emptied: Notify,
     semaphore: Arc<Semaphore>,
     cards: Mutex<VecDeque<ManagedCard>>,
     waiting: AtomicUsize,
@@ -135,6 +142,7 @@ impl CardGuard {
         if let Some(old_card) = self.card.take() {
             self.pool.unregister_checked_out(old_card.reader_name());
             // old_card drops here without being recycled — it's confirmed dead.
+            self.pool.notify_if_empty();
         }
         self.had_replacement = true;
         // Fresh, inert placeholders: nothing will ever flip or notify these until a
@@ -160,20 +168,39 @@ impl CardGuard {
 impl Drop for CardGuard {
     fn drop(&mut self) {
         if !self.had_replacement {
-            crate::admission::record_card_session(self.checked_out_at.elapsed());
+            crate::admission::record_card_session(&self.pool.company, self.checked_out_at.elapsed());
         }
         match self.card.take() {
             Some(card) => {
-                self.pool.unregister_checked_out(card.reader_name());
                 if self.revoked.load(Ordering::SeqCst) {
                     // Known dead: discard rather than recycling a broken card to the
                     // next device. Forget the permit instead of releasing it, since
                     // there's no card left to pair it with.
+                    self.pool.unregister_checked_out(card.reader_name());
                     if let Some(permit) = self.permit.take() {
                         permit.forget();
                     }
+                    self.pool.notify_if_empty();
+                } else if let Some(target) = card
+                    .iccid
+                    .get()
+                    .and_then(|iccid| CARD_POOLS.take_pending_move(iccid))
+                {
+                    // Reassigned to another company while in use: it leaves this pool
+                    // rather than returning to it (see `CardPools::move_card`).
+                    self.pool.unregister_checked_out(card.reader_name());
+                    if let Some(permit) = self.permit.take() {
+                        permit.forget();
+                    }
+                    self.pool.notify_if_empty();
+                    CARD_POOLS.add_card(target.as_deref(), card);
                 } else {
+                    // Back to the idle queue *before* leaving the checked-out list, so
+                    // `card_count` never briefly reads zero while a card is returned
+                    // (that would wrongly tell waiting devices there are no cards).
+                    let reader_name = card.reader_name().to_owned();
                     self.pool.cards.lock().unwrap().push_back(card);
+                    self.pool.unregister_checked_out(&reader_name);
                     // permit drops normally right after this, releasing it for reuse.
                 }
             }
@@ -191,8 +218,10 @@ impl Drop for CardGuard {
 }
 
 impl CardPool {
-    pub fn new() -> Arc<Self> {
+    pub fn new(company: &str) -> Arc<Self> {
         Arc::new(Self {
+            company: company.to_string(),
+            emptied: Notify::new(),
             semaphore: Arc::new(Semaphore::new(0)),
             cards: Mutex::new(VecDeque::new()),
             waiting: AtomicUsize::new(0),
@@ -206,6 +235,7 @@ impl CardPool {
         let notify = Arc::new(Notify::new());
         self.checked_out.lock().unwrap().push(CheckedOutEntry {
             reader_name: card.reader_name().to_owned(),
+            iccid: card.iccid.get().cloned(),
             revoked: Arc::clone(&revoked),
             notify: Arc::clone(&notify),
         });
@@ -228,7 +258,7 @@ impl CardPool {
             while let Some(sender) = priority_waiters.pop_front() {
                 match sender.send(card) {
                     Ok(()) => {
-                        log::info!("[CARD_POOL] phase=add_card status=ok routed=priority_waiter");
+                        log::info!("[CARD_POOL] company={} phase=add_card status=ok routed=priority_waiter", self.company);
                         return;
                     }
                     Err(returned_card) => {
@@ -244,7 +274,8 @@ impl CardPool {
         self.cards.lock().unwrap().push_back(card);
         self.semaphore.add_permits(1);
         log::info!(
-            "[CARD_POOL] phase=add_card status=ok routed=pool idle_count={}",
+            "[CARD_POOL] company={} phase=add_card status=ok routed=pool idle_count={}",
+            self.company,
             self.idle_count()
         );
     }
@@ -273,7 +304,11 @@ impl CardPool {
                     let card_number = get_from_cache(CacheSection::Cards, iccid);
                     crate::apdu_sniffer::forget(&card_number);
                 }
-                log::info!("[CARD_POOL] phase=remove status=ok mode=idle reader={:?}", reader_name);
+                log::info!(
+                    "[CARD_POOL] company={} phase=remove status=ok mode=idle reader={:?}",
+                    self.company, reader_name
+                );
+                self.notify_if_empty();
                 return;
             }
         }
@@ -283,8 +318,8 @@ impl CardPool {
             entry.revoked.store(true, Ordering::SeqCst);
             entry.notify.notify_one();
             log::warn!(
-                "[CARD_POOL] phase=remove status=flagged mode=checked_out reader={:?}",
-                reader_name
+                "[CARD_POOL] company={} phase=remove status=flagged mode=checked_out reader={:?}",
+                self.company, reader_name
             );
         }
     }
@@ -318,6 +353,60 @@ impl CardPool {
     /// Total number of working cards: idle plus checked out to a session.
     pub fn card_count(&self) -> usize {
         self.idle_count() + self.checked_out.lock().unwrap().len()
+    }
+
+    /// Resolves once this pool has no cards at all — immediately if it has none now.
+    /// A device waiting for a card races this, so it can be told to try again later
+    /// instead of waiting for a card that isn't coming.
+    pub async fn wait_until_no_cards(&self) {
+        loop {
+            let notified = self.emptied.notified();
+            tokio::pin!(notified);
+            // Register before checking, so a removal in between can't be missed.
+            notified.as_mut().enable();
+            if self.card_count() == 0 {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    /// The company this pool serves.
+    pub fn company(&self) -> &str {
+        &self.company
+    }
+
+    /// Takes the idle card with this ICCID out of the pool, e.g. because it's been
+    /// reassigned to another company. `None` if no idle card has it, or it's about to
+    /// be checked out (a device has just been granted it).
+    fn take_idle_by_iccid(&self, iccid: &str) -> Option<ManagedCard> {
+        // Claim the card's permit first: if none is free, every idle card is already
+        // promised to a waiting device, and taking one would break its checkout.
+        let permit = Arc::clone(&self.semaphore).try_acquire_owned().ok()?;
+        let mut cards = self.cards.lock().unwrap();
+        let Some(index) = cards.iter().position(|c| c.iccid.get().map(String::as_str) == Some(iccid)) else {
+            drop(cards);
+            drop(permit); // not ours to keep
+            return None;
+        };
+        let card = cards.remove(index).expect("index just came from position()");
+        drop(cards);
+        permit.forget();
+        self.notify_if_empty();
+        Some(card)
+    }
+
+    /// True if this pool holds the card with this ICCID, idle or checked out.
+    fn has_iccid(&self, iccid: &str) -> bool {
+        self.cards.lock().unwrap().iter().any(|c| c.iccid.get().map(String::as_str) == Some(iccid))
+            || self.checked_out.lock().unwrap().iter().any(|c| c.iccid.as_deref() == Some(iccid))
+    }
+
+    /// Wakes `wait_until_no_cards` callers if the last card has just gone.
+    fn notify_if_empty(&self) {
+        if self.card_count() == 0 {
+            self.emptied.notify_waiters();
+        }
     }
 
     /// Current number of devices waiting in line for their first card. Observability
@@ -373,8 +462,10 @@ impl CardPool {
         // its lifetime in the reader. Never hand out state a previous session
         // left behind: force a reset (`reconnect()` already does
         // `Disposition::ResetCard`) before this new session ever sees it.
-        card.reconnect().await;
+        // Registered before the reset (which awaits) so the card is counted as checked
+        // out throughout, never briefly in neither list.
         let (revoked, notify) = self.register_checked_out(&card);
+        card.reconnect().await;
         CardGuard {
             card: Some(card),
             pool: Arc::clone(self),
@@ -387,11 +478,149 @@ impl CardPool {
     }
 }
 
+/// Every company's card pool, plus cards in a reader that aren't assigned to any
+/// company. A card is placed by `config::company_for_card` when it's inserted.
+pub struct CardPools {
+    pools: Mutex<HashMap<String, Arc<CardPool>>>,
+    /// Which company's pool each reader's card went into, so removal finds it.
+    reader_company: Mutex<HashMap<CString, String>>,
+    /// Cards not assigned to any company: held out of every pool (no device can use
+    /// them) so they aren't re-registered on every reader event.
+    unassigned: Mutex<Vec<ManagedCard>>,
+    /// Cards reassigned while checked out, by ICCID → new company (`None` = unassigned).
+    /// Applied when the card is released (see `CardGuard`'s drop).
+    pending_moves: Mutex<HashMap<String, Option<String>>>,
+}
+
+impl CardPools {
+    fn new() -> Self {
+        Self {
+            pools: Mutex::new(HashMap::new()),
+            reader_company: Mutex::new(HashMap::new()),
+            unassigned: Mutex::new(Vec::new()),
+            pending_moves: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// `company`'s pool, created empty the first time it's asked for.
+    pub fn pool(&self, company: &str) -> Arc<CardPool> {
+        Arc::clone(
+            self.pools
+                .lock()
+                .unwrap()
+                .entry(company.to_string())
+                .or_insert_with(|| CardPool::new(company)),
+        )
+    }
+
+    /// Every pool that exists so far.
+    pub fn all(&self) -> Vec<Arc<CardPool>> {
+        self.pools.lock().unwrap().values().cloned().collect()
+    }
+
+    /// Adds a newly inserted card to `company`'s pool, or holds it as unassigned.
+    pub fn add_card(&self, company: Option<&str>, card: ManagedCard) {
+        match company {
+            Some(company) => {
+                self.reader_company
+                    .lock()
+                    .unwrap()
+                    .insert(card.reader_name().to_owned(), company.to_string());
+                self.pool(company).add_card(card);
+            }
+            None => {
+                log::warn!(
+                    "[CARD_POOL] phase=add_card status=unassigned reader={:?} note=card_has_no_company",
+                    card.reader_name()
+                );
+                self.reader_company.lock().unwrap().remove(card.reader_name());
+                self.unassigned.lock().unwrap().push(card);
+            }
+        }
+    }
+
+    /// The card with this ICCID has been reassigned to `company` (`None` = unassigned).
+    /// If it's in a reader it follows: straight away if it's unassigned or idle, or when
+    /// its session ends if it's in use. A card not in any reader is placed when it's
+    /// next inserted (`config::company_for_card`), so there's nothing to do.
+    pub fn move_card(&self, iccid: &str, company: Option<&str>) {
+        let unassigned_card = {
+            let mut unassigned = self.unassigned.lock().unwrap();
+            unassigned
+                .iter()
+                .position(|c| c.iccid.get().map(String::as_str) == Some(iccid))
+                .map(|index| unassigned.remove(index))
+        };
+        if let Some(card) = unassigned_card {
+            log::info!("[CARD_POOL] phase=move status=ok iccid={} from=unassigned to={:?}", iccid, company);
+            self.add_card(company, card);
+            return;
+        }
+
+        for pool in self.all() {
+            if !pool.has_iccid(iccid) {
+                continue;
+            }
+            if Some(pool.company()) == company {
+                self.pending_moves.lock().unwrap().remove(iccid);
+                return; // already there
+            }
+            if let Some(card) = pool.take_idle_by_iccid(iccid) {
+                log::info!(
+                    "[CARD_POOL] phase=move status=ok iccid={} from={} to={:?}",
+                    iccid, pool.company(), company
+                );
+                self.add_card(company, card);
+            } else {
+                log::info!(
+                    "[CARD_POOL] phase=move status=pending iccid={} from={} to={:?} note=in_use",
+                    iccid, pool.company(), company
+                );
+                self.pending_moves
+                    .lock()
+                    .unwrap()
+                    .insert(iccid.to_string(), company.map(str::to_string));
+            }
+            return;
+        }
+    }
+
+    /// Where a released card should go instead of back to its pool, if it was
+    /// reassigned while in use.
+    fn take_pending_move(&self, iccid: &str) -> Option<Option<String>> {
+        self.pending_moves.lock().unwrap().remove(iccid)
+    }
+
+    /// A reader reported its card removed (or the reader itself went away).
+    pub fn remove_by_reader(&self, reader_name: &CStr) {
+        let company = self.reader_company.lock().unwrap().remove(reader_name);
+        match company {
+            Some(company) => self.pool(&company).remove_by_reader(reader_name),
+            None => self
+                .unassigned
+                .lock()
+                .unwrap()
+                .retain(|card| card.reader_name() != reader_name),
+        }
+    }
+
+    /// True if a card from this reader is already known, pooled or unassigned.
+    pub fn contains_reader(&self, reader_name: &str) -> bool {
+        let in_unassigned = self
+            .unassigned
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|card| card.reader_name().to_string_lossy().as_ref() == reader_name);
+        in_unassigned || self.all().iter().any(|pool| pool.contains_reader(reader_name))
+    }
+}
+
 lazy_static! {
-    /// Global card pool shared by the reader-monitoring loop (which adds/removes
-    /// cards as they're inserted/pulled) and the TCP server (which checks a card out
-    /// per authenticating device).
-    pub static ref CARD_POOL: Arc<CardPool> = CardPool::new();
+    /// Shared by the reader-monitoring loop (which adds/removes cards as they're
+    /// inserted/pulled) and the TCP server (which checks a card out of the device's
+    /// company's pool).
+    pub static ref CARD_POOLS: CardPools = CardPools::new();
 }
 
 #[cfg(test)]
@@ -405,7 +634,7 @@ mod tests {
 
     #[tokio::test]
     async fn acquire_blocks_until_a_card_is_added_then_resolves() {
-        let pool = CardPool::new();
+        let pool = CardPool::new("test");
         let pool_bg = Arc::clone(&pool);
         let waiter = tokio::spawn(async move { pool_bg.acquire().await });
 

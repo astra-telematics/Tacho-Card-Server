@@ -1,19 +1,24 @@
 //! Busyness estimate, and when to tell a turned-away device to come back.
 //!
+//! Everything here is kept per company (each has its own cards and queue), plus once
+//! more across all companies for connections turned away before they've announced —
+//! and so before their company is known.
+//!
 //! - **Average card session.** How long a device holds a card, from `Ready` until the
 //!   card is released (normally at `AuthOutcome`, i.e. its authentication time).
 //!   Averaged over the last `SESSION_SAMPLES` sessions and persisted in the database so
-//!   it survives restarts. `DEFAULT_CARD_SESSION` until there's any data.
+//!   it survives restarts. A company with no history yet uses the all-company average,
+//!   then `DEFAULT_CARD_SESSION`.
 //! - **Queue estimate.** With `c` cards and `q` devices already waiting, a new device
 //!   would wait roughly `(q + 1) × average ÷ c` for a card (zero if a card is free and
 //!   nobody is waiting). Informational for admitted devices — anyone who announces
 //!   queues, however long the wait.
-//! - **Backlog timer.** A rough "busy until" time for connections turned away over
-//!   `connection_limit`, which we expect back. Each one pushes it out by
+//! - **Backlog timer.** A rough "busy until" time for connections turned away over a
+//!   connection limit (global, or their company's), which we expect back. Each one pushes it out by
 //!   `BACKLOG_SHARE_FACTOR` of its share of the cards (`average ÷ c`), and it runs down
-//!   in real time. Those connections are
-//!   refused before they announce, so we can't tell when one comes back; its share
-//!   simply expires with the timer. The guide may read a little high just after a
+//!   in real time. We can't tell when a turned-away connection comes back (over the
+//!   global limit it hasn't even said who it is), so its share simply expires with
+//!   the timer. The guide may read a little high just after a
 //!   burst of rejections, which is fine for its purpose.
 //!
 //! A connection turned away over the limit is told to retry once a card should be
@@ -24,7 +29,7 @@
 //! midnight on the day they're allowed, spread over `MIDNIGHT_SPREAD_SECONDS`. They
 //! don't count towards the backlog: that's days away and says nothing about now.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Mutex;
 use std::time::Duration;
 
@@ -37,9 +42,9 @@ const SESSION_SAMPLES: usize = 100;
 /// Assumed card session length until any real session has been recorded (about what
 /// an authentication took in testing).
 const DEFAULT_CARD_SESSION: Duration = Duration::from_secs(30);
-/// Retry delay for a connection turned away while there are no cards at all, so no
-/// wait can be estimated.
-const NO_CARDS_RETRY: Duration = Duration::from_secs(5 * 60);
+/// Retry delay for a device turned away because its company has no cards at all, so
+/// no wait can be estimated.
+pub const NO_CARDS_RETRY: Duration = Duration::from_secs(5 * 60);
 /// Devices told to come back at midnight are spread over this window after it, so
 /// they don't all reconnect at 00:00:00.
 const MIDNIGHT_SPREAD_SECONDS: u64 = 15 * 60;
@@ -121,68 +126,119 @@ impl Backlog {
     }
 }
 
-struct State {
+/// Card session history and backlog for one company, or for all of them together.
+#[derive(Default)]
+struct Stats {
     /// Most recent card session lengths, oldest first.
     sessions: VecDeque<Duration>,
     backlog: Backlog,
 }
 
-impl State {
-    fn average_session(&self) -> Duration {
-        if self.sessions.is_empty() {
-            return DEFAULT_CARD_SESSION;
+impl Stats {
+    fn with_history(sessions: Vec<Duration>) -> Self {
+        Self { sessions: sessions.into(), backlog: Backlog::default() }
+    }
+
+    fn record(&mut self, duration: Duration) {
+        if self.sessions.len() == SESSION_SAMPLES {
+            self.sessions.pop_front();
         }
-        self.sessions.iter().sum::<Duration>() / self.sessions.len() as u32
+        self.sessions.push_back(duration);
+    }
+
+    fn average_session(&self) -> Option<Duration> {
+        if self.sessions.is_empty() {
+            return None;
+        }
+        Some(self.sessions.iter().sum::<Duration>() / self.sessions.len() as u32)
+    }
+}
+
+#[derive(Default)]
+struct State {
+    /// Every company together.
+    all: Stats,
+    companies: HashMap<String, Stats>,
+}
+
+impl State {
+    /// `company`'s average session, falling back to the all-company average and then
+    /// `DEFAULT_CARD_SESSION` until there's history. `None` for the all-company figure.
+    fn average_session(&self, company: Option<&str>) -> Duration {
+        company
+            .and_then(|company| self.companies.get(company))
+            .and_then(Stats::average_session)
+            .or_else(|| self.all.average_session())
+            .unwrap_or(DEFAULT_CARD_SESSION)
+    }
+
+    fn stats(&mut self, company: Option<&str>) -> &mut Stats {
+        match company {
+            Some(company) => self.companies.entry(company.to_string()).or_default(),
+            None => &mut self.all,
+        }
     }
 }
 
 lazy_static! {
-    static ref STATE: Mutex<State> = Mutex::new(State {
-        sessions: VecDeque::with_capacity(SESSION_SAMPLES),
-        backlog: Backlog::default(),
-    });
+    static ref STATE: Mutex<State> = Mutex::new(State::default());
 }
 
 fn state() -> std::sync::MutexGuard<'static, State> {
     STATE.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-/// Loads recent card session lengths from the database. Blocking; call once at
-/// startup, off the async runtime.
+/// Loads recent card session lengths from the database, for every configured company
+/// and overall. Blocking; call once at startup, off the async runtime.
 pub fn load_history() {
-    let sessions = crate::database::recent_card_sessions_blocking(SESSION_SAMPLES);
-    let count = sessions.len();
+    let all = crate::database::recent_card_sessions_blocking(None, SESSION_SAMPLES);
+    let companies: HashMap<String, Stats> = crate::config::company_ids()
+        .into_iter()
+        .map(|company| {
+            let history = crate::database::recent_card_sessions_blocking(Some(&company), SESSION_SAMPLES);
+            (company, Stats::with_history(history))
+        })
+        .collect();
     let mut state = state();
-    state.sessions = sessions.into();
+    state.all = Stats::with_history(all);
+    state.companies = companies;
     log::info!(
         "[ADMISSION] status=history_loaded sessions={} average_session_ms={}",
-        count,
-        state.average_session().as_millis()
+        state.all.sessions.len(),
+        state.average_session(None).as_millis()
     );
 }
 
-/// Records how long a device held a card. Called from `CardGuard`'s drop.
-pub fn record_card_session(duration: Duration) {
+/// Records how long one of `company`'s devices held a card. Called from `CardGuard`'s
+/// drop.
+pub fn record_card_session(company: &str, duration: Duration) {
     {
         let mut state = state();
-        if state.sessions.len() == SESSION_SAMPLES {
-            state.sessions.pop_front();
-        }
-        state.sessions.push_back(duration);
+        state.all.record(duration);
+        state.stats(Some(company)).record(duration);
     }
-    log::debug!("[ADMISSION] card_session_ms={}", duration.as_millis());
+    log::debug!("[ADMISSION] company={} card_session_ms={}", company, duration.as_millis());
     #[cfg(not(test))]
-    tauri::async_runtime::spawn_blocking(move || crate::database::record_card_session_blocking(duration));
+    {
+        let company = company.to_string();
+        crate::rt::spawn_blocking(move || {
+            crate::database::record_card_session_blocking(company, duration)
+        });
+    }
 }
 
-/// The card pool's current state and the average session length.
-pub fn snapshot() -> QueueSnapshot {
-    let pool = &crate::card_pool::CARD_POOL;
+/// The queue for one company (its own pool), or every company's pools added together
+/// for `None` — used before a device has announced and its company is known.
+pub fn snapshot(company: Option<&str>) -> QueueSnapshot {
+    let pools = match company {
+        Some(company) => vec![crate::card_pool::CARD_POOLS.pool(company)],
+        None => crate::card_pool::CARD_POOLS.all(),
+    };
     QueueSnapshot {
-        cards: pool.card_count(),
-        idle_cards: pool.idle_count(),
-        waiting: pool.waiting_count(),
-        average_session: state().average_session(),
+        cards: pools.iter().map(|pool| pool.card_count()).sum(),
+        idle_cards: pools.iter().map(|pool| pool.idle_count()).sum(),
+        waiting: pools.iter().map(|pool| pool.waiting_count()).sum(),
+        average_session: state().average_session(company),
     }
 }
 
@@ -198,24 +254,35 @@ pub struct Busyness {
     pub card_available_in: Option<Duration>,
 }
 
-pub fn busyness() -> Busyness {
-    let queue = snapshot();
+/// Busyness of one company, or of everything together for `None`.
+pub fn busyness(company: Option<&str>) -> Busyness {
+    let queue = snapshot(company);
     let now = Local::now();
     let mut state = state();
-    state.backlog.prune(now);
-    let backlog = state.backlog.remaining(now);
+    let stats = state.stats(company);
+    stats.backlog.prune(now);
+    let backlog = stats.backlog.remaining(now);
     Busyness {
         queue,
-        expected_returns: state.backlog.expected_returns.len(),
+        expected_returns: stats.backlog.expected_returns.len(),
         card_available_in: queue.estimated_wait().map(|wait| wait.max(backlog)),
     }
 }
 
-/// A connection is being turned away over `connection_limit`: how long it should wait
-/// before retrying (at least `min_retry`). Records it in the backlog.
+/// A connection is being turned away over the global `connection_limit`, before it has
+/// announced: how long it should wait before retrying (at least `min_retry`), from all
+/// companies' queues together. Records it in the all-company backlog.
 pub fn over_connection_limit_retry_delay(min_retry: Duration) -> Duration {
-    let snapshot = snapshot();
-    state().backlog.turn_away(&snapshot, Local::now(), min_retry)
+    let snapshot = snapshot(None);
+    state().all.backlog.turn_away(&snapshot, Local::now(), min_retry)
+}
+
+/// One of `company`'s devices is being turned away over the company's connection limit:
+/// how long it should wait before retrying (at least `min_retry`), from that company's
+/// queue. Records it in the company's backlog.
+pub fn over_company_limit_retry_delay(company: &str, min_retry: Duration) -> Duration {
+    let snapshot = snapshot(Some(company));
+    state().stats(Some(company)).backlog.turn_away(&snapshot, Local::now(), min_retry)
 }
 
 /// If the device may not download yet (`download_allowed_at` from
@@ -252,6 +319,17 @@ mod tests {
 
     fn secs(s: u64) -> Duration {
         Duration::from_secs(s)
+    }
+
+    #[test]
+    fn company_average_falls_back_to_overall_then_default() {
+        let mut state = State::default();
+        assert_eq!(state.average_session(Some("acme")), DEFAULT_CARD_SESSION);
+        state.all.record(secs(60));
+        assert_eq!(state.average_session(Some("acme")), secs(60));
+        state.stats(Some("acme")).record(secs(20));
+        assert_eq!(state.average_session(Some("acme")), secs(20));
+        assert_eq!(state.average_session(None), secs(60));
     }
 
     #[test]

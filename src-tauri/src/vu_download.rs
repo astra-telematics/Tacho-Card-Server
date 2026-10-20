@@ -213,21 +213,23 @@ pub fn extract_vrn(generation: u8, data: &[u8]) -> Option<String> {
     }
 }
 
-/// The configured `server.download_path`, or the default (`~/Documents/tcs/downloads`)
-/// if none is set. Read from the cache on every save, so a change from the UI applies
-/// to the next download.
-fn downloads_dir() -> std::io::Result<PathBuf> {
+/// `company`'s folder under the configured `download.download_path` (default
+/// `~/Documents/tcs/downloads`). Read from the cache on every save, so a change from
+/// the UI applies to the next download. Company ids are validated as folder-safe when
+/// the config loads (`config::is_valid_company_id`).
+fn downloads_dir(company: &str) -> std::io::Result<PathBuf> {
     let configured = get_from_cache(CacheSection::Download, "download_path");
-    let dir = if configured.trim().is_empty() {
+    let root = if configured.trim().is_empty() {
         PathBuf::from(crate::config::default_download_path())
     } else {
         PathBuf::from(configured.trim())
     };
+    let dir = root.join(company);
     std::fs::create_dir_all(&dir)?;
     Ok(dir)
 }
 
-/// Writes to `<server.download_path>/<filename>.ddd`. Filename is
+/// Writes to `<download.download_path>/<company>/<filename>.ddd`. Filename is
 /// `<sanitized VRN>_<IMEI>_<YYYYMMDD_HHMMSS>[_<tag>].ddd`, falling back to
 /// `UNKNOWN_VRN_<IMEI>_<timestamp>[_<tag>].ddd` when VRN wasn't extractable —
 /// a parse failure on our side must never mean data gets thrown away. `tag`
@@ -238,8 +240,8 @@ fn downloads_dir() -> std::io::Result<PathBuf> {
 /// regulation-mandated filename convention (checked against Annex 1C
 /// Appendix 7, requirement DDP_034 — the only rule is one physical file per
 /// VU download session), so this naming is our own choice.
-pub fn save_download(vrn: Option<&str>, imei: &str, data: &[u8], tag: Option<&str>) -> std::io::Result<PathBuf> {
-    let dir = downloads_dir()?;
+pub fn save_download(company: &str, vrn: Option<&str>, imei: &str, data: &[u8], tag: Option<&str>) -> std::io::Result<PathBuf> {
+    let dir = downloads_dir(company)?;
     let timestamp = chrono::Utc::now().format("%Y%m%d_%H%M%S");
     let vrn_part = match vrn {
         Some(v) => sanitize_for_filename(v),

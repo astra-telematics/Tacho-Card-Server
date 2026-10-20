@@ -81,6 +81,11 @@ export default defineConfig((/* ctx */) => {
     devServer: {
       // https: true,
       open: false, // opens browser window automatically
+      // For working on the web UI: run a headless backend (`--headless`, web port 8080)
+      // and open this dev server in a browser.
+      proxy: {
+        '/api': 'http://localhost:8080',
+      },
     },
 
     // https://v2.quasar.dev/quasar-cli-vite/quasar-config-file#framework

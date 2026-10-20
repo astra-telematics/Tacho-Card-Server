@@ -1,7 +1,6 @@
 // ───── Std Lib ─────
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::env;
-use std::error::Error;
 use std::fs;
 use std::fs::File;
 use std::io::{self, Read, Write};
@@ -12,10 +11,9 @@ use std::sync::{Mutex, OnceLock};
 use serde::{Deserialize, Serialize};
 use serde_yaml;
 use lazy_static::lazy_static;
-use tauri::Emitter;
 
 // ───── Local Modules ─────
-use crate::global_app_handle::emit_card_config_event;
+use crate::global_app_handle::{emit, emit_card_config_event};
 // use crate::smart_card::manual_sync_cards;
 
 
@@ -28,6 +26,11 @@ pub const DEFAULT_DOWNLOAD_INTERVAL_DAYS: u32 = 7;
 /// Upper bound for `download_interval_days`. Regulations require a VU download at least
 /// every 90 days; 60 leaves a month of headroom for devices that miss their slot.
 pub const MAX_DOWNLOAD_INTERVAL_DAYS: u32 = 60;
+/// Company created on first run, when config.yaml has no companies. Whatever its id,
+/// while there's only one company every device and card belongs to it, so a
+/// single-company install needs no setup. See `multi-company design.md`.
+pub const DEFAULT_COMPANY_ID: &str = "default";
+const DEFAULT_COMPANY_NAME: &str = "Default";
 
 
 /// Represents the configuration settings for the application.
@@ -36,11 +39,128 @@ pub struct ConfigurationFile {
     name: String,                           // The name of the application.
     version: String,                        // The version of the application.
     description: String,                    // A brief description of the application.
+    /// Password of the built-in `admin` account, in plaintext. The database is made to
+    /// match it on every startup; if missing or blank a random one is generated and
+    /// saved here (see `users.rs`).
+    #[serde(default)]
+    admin_password: Option<String>,
     appearance: Option<AppearanceConfig>,   // Optional UI configuration settings.
     connection: Option<ConnectionConfig>,   // Optional server configuration settings.
     logging: Option<LoggingConfig>,         // Optional log rotation/retention settings.
     download: Option<DownloadConfig>,       // Optional download configuration settings.
-    cards: HashMap<String, CardConfig>,     // Hashmap of the cards with the CardConfig structure
+    #[serde(default)]
+    companies: BTreeMap<String, CompanyConfig>, // Companies served, keyed by company id.
+    /// Cards configured (card number known) but not yet assigned to any company.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    unassigned_cards: BTreeMap<String, CardConfig>,
+}
+
+impl ConfigurationFile {
+    /// The only company, if there's exactly one: every device and card belongs to it.
+    fn sole_company(&self) -> Option<String> {
+        (self.companies.len() == 1).then(|| self.companies.keys().next().cloned()).flatten()
+    }
+
+    /// Every configured card keyed by card number, with its `company` filled in from
+    /// where it sits in the file (`None` for unassigned cards).
+    fn all_cards(&self) -> HashMap<String, CardConfig> {
+        let mut cards = HashMap::new();
+        for (company_id, company) in &self.companies {
+            for (card_number, card) in &company.cards {
+                let mut card = card.clone();
+                card.company = Some(company_id.clone());
+                cards.insert(card_number.clone(), card);
+            }
+        }
+        for (card_number, card) in &self.unassigned_cards {
+            let mut card = card.clone();
+            card.company = None;
+            cards.insert(card_number.clone(), card);
+        }
+        cards
+    }
+
+    /// One card, with its `company` filled in.
+    fn card(&self, card_number: &str) -> Option<CardConfig> {
+        self.all_cards().remove(card_number)
+    }
+
+    /// The stored entry for a card, wherever it sits.
+    fn card_mut(&mut self, card_number: &str) -> Option<&mut CardConfig> {
+        if let Some(company_id) = self
+            .companies
+            .iter()
+            .find(|(_, company)| company.cards.contains_key(card_number))
+            .map(|(id, _)| id.clone())
+        {
+            return self.companies.get_mut(&company_id)?.cards.get_mut(card_number);
+        }
+        self.unassigned_cards.get_mut(card_number)
+    }
+
+    /// Removes a card from wherever it sits.
+    fn remove_card(&mut self, card_number: &str) -> Option<CardConfig> {
+        for company in self.companies.values_mut() {
+            if let Some(card) = company.cards.remove(card_number) {
+                return Some(card);
+            }
+        }
+        self.unassigned_cards.remove(card_number)
+    }
+
+    /// Stores a newly configured card: under the company its `company` names if that
+    /// exists, else under `default` while that's the only company, else as unassigned.
+    /// `company` isn't stored on the card itself: where it sits says that.
+    fn insert_card(&mut self, card_number: &str, mut card: CardConfig) {
+        let company = card
+            .company
+            .take()
+            .filter(|company| self.companies.contains_key(company))
+            .or_else(|| self.sole_company());
+        match company.and_then(|company| self.companies.get_mut(&company)) {
+            Some(company) => {
+                company.cards.insert(card_number.to_string(), card);
+            }
+            None => {
+                self.unassigned_cards.insert(card_number.to_string(), card);
+            }
+        }
+    }
+
+}
+
+/// A company (client) served by this TCS: its devices, and limits that apply to them.
+/// Keyed in `companies:` by its id — lowercase letters, digits and `-` — which names its
+/// download subfolder and tags its database rows, so it must not change once data
+/// exists. Fields are defaulted so a hand-written entry needs only a name.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct CompanyConfig {
+    pub name: String,
+    /// Most devices of this company connected at once (checked at `ConnAnnounce`).
+    #[serde(default = "default_company_connection_limit")]
+    pub connection_limit: u16,
+    /// Minimum whole days between verified downloads per device: 1 = once a day,
+    /// 0 = no limit, at most `MAX_DOWNLOAD_INTERVAL_DAYS`.
+    #[serde(default = "default_download_interval_days")]
+    pub download_interval_days: u32,
+    /// IMEIs of this company's devices.
+    #[serde(default)]
+    pub devices: Vec<String>,
+    /// This company's cards, keyed by card number.
+    #[serde(default)]
+    pub cards: BTreeMap<String, CardConfig>,
+}
+
+fn default_company_connection_limit() -> u16 {
+    DEFAULT_SERVER_CONNECTION_LIMIT
+}
+
+/// Whether `id` is usable as a company id: non-empty, lowercase letters, digits and
+/// `-`, not starting with `-`. It names a download subfolder, so nothing else.
+pub fn is_valid_company_id(id: &str) -> bool {
+    !id.is_empty()
+        && !id.starts_with('-')
+        && id.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -53,10 +173,9 @@ pub struct ConnectionConfig {
 // config — cards included — to defaults.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct DownloadConfig {
+    /// Root folder; each company's downloads go in a subfolder named by its id.
     #[serde(default = "default_download_path")]
     pub download_path: String,
-    #[serde(default = "default_download_interval_days")]
-    pub download_interval_days: u32,
     #[serde(default)]
     pub retain_failed_downloads: bool,
 }
@@ -101,6 +220,12 @@ pub struct CardConfig {
     pub company_name: Option<String>,           // Company name (from EF_Identification, Company Card only)
     pub company_address: Option<String>,        // Company address (from EF_Identification, Company Card only)
     pub last_auth: Option<(u64, bool)>,         // Last completed authentication: (unix_timestamp, success_flag)
+    /// Id of the company whose devices this card serves. Not stored on the card in
+    /// config.yaml — the card's position (under a company, or in `unassigned_cards`)
+    /// says that; filled in when cards are read (`ConfigurationFile::all_cards`) so the
+    /// cache and frontend events have it. Never changed by `update_card`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub company: Option<String>,
 }
 // UI Configuration structure, part of ConfigurationFile that contains data about how UI looks like.
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -133,6 +258,7 @@ pub fn set_config_path_override(path: PathBuf) {
 /// detection is per config file: relaunching with the same config focuses the running
 /// window, while a different config starts its own instance. `None` for the default
 /// config, which keeps the plain identifier.
+#[cfg(feature = "desktop")]
 pub fn instance_id_suffix() -> Option<String> {
     use std::hash::{Hash, Hasher};
 
@@ -219,6 +345,15 @@ pub fn get_default_download_path() -> io::Result<String> {
     Ok(dir.to_str().unwrap_or("").to_string())
 }
 
+/// Held while config.yaml is read, changed and written back, so two writers (e.g. a UI
+/// change and an authentication result) can't each load the file and overwrite the
+/// other's change.
+static CONFIG_WRITE: Mutex<()> = Mutex::new(());
+
+fn config_write_lock() -> std::sync::MutexGuard<'static, ()> {
+    CONFIG_WRITE.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 /// Load the configuration from the file.
 /// This function reads the configuration file and parses it.
 fn load_config(
@@ -272,13 +407,14 @@ fn update_card_config(
     card_number: &str,
     content: CardConfig,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let _write = config_write_lock();
     let mut config = load_config(config_path)?;
     log::debug!("Loaded configuration: {:?}", config);
 
     // let mut needs_restart = false;
     let mut changed = false;
 
-    match config.cards.get_mut(card_number) {
+    match config.card_mut(card_number) {
         Some(existing_card) => {
             if existing_card.iccid.is_empty() {
                 // ICCID is being set for the first time
@@ -339,7 +475,7 @@ fn update_card_config(
                 content.name,
                 content.expire
             );
-            config.cards.insert(card_number.to_string(), content);
+            config.insert_card(card_number, content);
             // needs_restart = true;
             changed = true;
         }
@@ -355,11 +491,11 @@ fn update_card_config(
         log::debug!("Configuration loaded to cache successfully");
 
         // Emit frontend update event
-        if let Some(card_config) = config.cards.get(card_number) {
+        if let Some(card_config) = config.card(card_number) {
             emit_card_config_event(
                 "global-card-config-updated",
                 card_number.to_string(),
-                Some(card_config.clone())
+                Some(card_config)
             );
         }
 
@@ -375,7 +511,7 @@ fn update_card_config(
 
 /// Public function to update the configuration with a new card.
 /// This function is a Tauri command that updates the configuration file with a new card's ATR and card number.
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 pub fn update_card(cardnumber: &str, content: CardConfig) -> bool {
     let config_path = match get_config_path() {
         Ok(path) => path,
@@ -402,6 +538,7 @@ pub fn update_connection_config(
     listen_port: u16,
     connection_limit: u16,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let _write = config_write_lock();
     let mut config = load_config(config_path)?;
 
     config.connection = Some(ConnectionConfig {
@@ -420,14 +557,13 @@ pub fn update_connection_config(
 pub fn update_download_config(
     config_path: &Path,
     download_path: String,
-    download_interval_days: u32,
     retain_failed_downloads: bool,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let _write = config_write_lock();
     let mut config = load_config(config_path)?;
 
     config.download = Some(DownloadConfig {
         download_path,
-        download_interval_days,
         retain_failed_downloads,
     });
     save_config(config_path, &config)?;
@@ -440,6 +576,7 @@ pub fn update_logging_config(
     config_path: &Path,
     log_retention_days: u32,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let _write = config_write_lock();
     let mut config = load_config(config_path)?;
 
     config.logging = Some(LoggingConfig {
@@ -456,6 +593,7 @@ pub fn update_appearance_config(
     theme: &str,
     minimize_to_tray: bool,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let _write = config_write_lock();
     let mut config = load_config(config_path)?;
 
     config.appearance = Some(AppearanceConfig {
@@ -473,7 +611,7 @@ pub fn update_appearance_config(
     Ok(())
 }
 
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 pub async fn remove_card(
     cardnumber: String,
 ) -> Result<(), String> {
@@ -499,16 +637,21 @@ pub async fn remove_card_from_config(
     card_number: &str,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     log::debug!("Loading configuration from {:?}", config_path);
-    let mut config = load_config(config_path)?;
-    log::debug!("Loaded configuration: {:?}", config);
+    let removed = {
+        let _write = config_write_lock();
+        let mut config = load_config(config_path)?;
+        log::debug!("Loaded configuration: {:?}", config);
+        let removed = config.remove_card(card_number).is_some();
+        if removed {
+            save_config(config_path, &config)?;
+            log::debug!("Configuration saved successfully after removal");
+            load_config_to_cache(&config)?;
+            log::debug!("Configuration loaded to cache successfully");
+        }
+        removed
+    };
 
-    if config.cards.remove(card_number).is_some() {
-        save_config(config_path, &config)?;
-        log::debug!("Configuration saved successfully after removal");
-
-        load_config_to_cache(&config)?;
-        log::debug!("Configuration loaded to cache successfully");
-
+    if removed {
         emit_card_config_event("global-card-config-updated", card_number.to_string(), None);
 
         #[cfg(target_os = "linux")] {
@@ -532,7 +675,7 @@ pub async fn remove_card_from_config(
     }
 }
 
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 pub fn update_connection(listen_port: String, connection_limit: String) -> bool {
     let config_path = match get_config_path() {
         Ok(path) => path,
@@ -554,7 +697,7 @@ pub fn update_connection(listen_port: String, connection_limit: String) -> bool 
     }
 }
 
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 pub fn update_appearance(theme: &str, minimize_to_tray: bool) -> bool {
     let config_path = match get_config_path() {
         Ok(path) => path,
@@ -576,8 +719,8 @@ pub fn update_appearance(theme: &str, minimize_to_tray: bool) -> bool {
     }
 }
 
-#[tauri::command]
-pub fn update_download(download_path: String, download_interval_days: String, retain_failed_downloads: bool) -> bool {
+#[cfg_attr(feature = "desktop", tauri::command)]
+pub fn update_download(download_path: String, retain_failed_downloads: bool) -> bool {
     let config_path = match get_config_path() {
         Ok(path) => path,
         Err(e) => {
@@ -585,10 +728,10 @@ pub fn update_download(download_path: String, download_interval_days: String, re
             return false;
         }
     };
-    log::info!("Updating download configuration: download_path={}, download_interval_days={}, retain_failed_downloads={}", download_path, download_interval_days, retain_failed_downloads);
-    match update_download_config(&config_path, if download_path.trim().is_empty() { default_download_path() } else { download_path.trim().to_string() }, download_interval_days.parse().unwrap_or(DEFAULT_DOWNLOAD_INTERVAL_DAYS).min(MAX_DOWNLOAD_INTERVAL_DAYS), retain_failed_downloads) {
+    log::info!("Updating download configuration: download_path={}, retain_failed_downloads={}", download_path, retain_failed_downloads);
+    match update_download_config(&config_path, if download_path.trim().is_empty() { default_download_path() } else { download_path.trim().to_string() }, retain_failed_downloads) {
         Ok(_) => {
-            log::info!("The download configuration is updated: download_path={}, download_interval_days={}, retain_failed_downloads={}", download_path, download_interval_days, retain_failed_downloads);
+            log::info!("The download configuration is updated: download_path={}, retain_failed_downloads={}", download_path, retain_failed_downloads);
             true
         }
         Err(e) => {
@@ -598,7 +741,7 @@ pub fn update_download(download_path: String, download_interval_days: String, re
     }
 }
 
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 pub fn update_logging(log_retention_days: String) -> bool {
     let config_path = match get_config_path() {
         Ok(path) => path,
@@ -632,6 +775,18 @@ pub struct CacheConfigData {
     pub download: Option<DownloadConfig>,
     pub appearance: Option<AppearanceConfig>,
     pub logging: Option<LoggingConfig>,
+    pub companies: BTreeMap<String, CompanyConfig>,
+    /// IMEI → company id; `None` for an IMEI listed under more than one company,
+    /// which is treated as unregistered. Built in `load_config_to_cache`.
+    pub imei_index: HashMap<String, Option<String>>,
+}
+
+impl CacheConfigData {
+    /// The only company, if there's exactly one: every device and card belongs to it.
+    /// With more than one, a device's company comes from the IMEI registry.
+    fn sole_company(&self) -> Option<String> {
+        (self.companies.len() == 1).then(|| self.companies.keys().next().cloned()).flatten()
+    }
 }
 
 lazy_static! {
@@ -655,6 +810,43 @@ pub enum CacheSection {
 pub fn get_card_config_from_cache(card_number: &str) -> Option<CardConfig> {
     let cache = CACHE.lock().unwrap();
     cache.cards.get(card_number).cloned()
+}
+
+/// The company a device belongs to: the only company if there's just one, otherwise
+/// its IMEI's entry in the registry. `None` means unknown (unregistered, or listed
+/// under two companies). Use through `company_directory`, not directly.
+pub fn company_for_imei(imei: &str) -> Option<String> {
+    let cache = CACHE.lock().unwrap();
+    if let Some(company) = cache.sole_company() {
+        return Some(company);
+    }
+    cache.imei_index.get(imei.trim()).cloned().flatten()
+}
+
+/// The company whose pool a card belongs in: the company it's stored under, or the only
+/// company if there's just one. `card_number` may be empty (an ICCID not
+/// configured yet). `None` means unassigned: the card isn't pooled.
+pub fn company_for_card(card_number: &str) -> Option<String> {
+    let cache = CACHE.lock().unwrap();
+    let assigned = cache.cards.get(card_number).and_then(|card| card.company.clone());
+    match assigned {
+        Some(company) if cache.companies.contains_key(&company) => Some(company),
+        Some(company) => {
+            log::warn!("[CONFIG] card {} is assigned to unknown company {}", card_number, company);
+            None
+        }
+        None => cache.sole_company(),
+    }
+}
+
+/// A company's settings, if it exists.
+pub fn get_company(company_id: &str) -> Option<CompanyConfig> {
+    CACHE.lock().unwrap().companies.get(company_id).cloned()
+}
+
+/// Ids of every configured company.
+pub fn company_ids() -> Vec<String> {
+    CACHE.lock().unwrap().companies.keys().cloned().collect()
 }
 
 /// Records the final state of an authentication attempt in the card config:
@@ -781,7 +973,6 @@ pub fn get_from_cache(section: CacheSection, key: &str) -> String {
             if let Some(download) = &cache.download {
                 match key {
                     "download_path" => download.download_path.clone(),
-                    "download_interval_days" => download.download_interval_days.to_string(),
                     "retain_failed_downloads" => download.retain_failed_downloads.to_string(),
                     _ => {
                         log::debug!("Unknown key for download section: {}", key);
@@ -804,13 +995,35 @@ pub fn load_config_to_cache(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     log::debug!("load_config_to_cache");
 
+    let mut imei_index: HashMap<String, Option<String>> = HashMap::new();
+    for (company_id, company) in &config.companies {
+        for imei in &company.devices {
+            let imei = imei.trim().to_string();
+            match imei_index.get(&imei) {
+                None => {
+                    imei_index.insert(imei, Some(company_id.clone()));
+                }
+                Some(Some(other)) if other != company_id => {
+                    log::error!(
+                        "[CONFIG] IMEI {} is listed under companies {} and {}; treating it as unregistered",
+                        imei, other, company_id
+                    );
+                    imei_index.insert(imei, None);
+                }
+                Some(_) => {} // repeated within one company, or already marked duplicate
+            }
+        }
+    }
+
     let mut cache = CACHE.lock().unwrap();
     *cache = CacheConfigData {
-        cards: config.cards.clone(),
+        cards: config.all_cards(),
         connection: config.connection.clone(),
         appearance: config.appearance.clone(),
         logging: config.logging.clone(),
         download: config.download.clone(),
+        companies: config.companies.clone(),
+        imei_index,
     };
 
     // trace_cache(&*cache);
@@ -852,21 +1065,8 @@ pub fn init_config() -> io::Result<()> {
     if config.download.is_none() {
         config.download = Some(DownloadConfig {
             download_path: default_download_path(),
-            download_interval_days: DEFAULT_DOWNLOAD_INTERVAL_DAYS,
             retain_failed_downloads: false,
         });
-    }
-
-    // Correct a hand-edited interval above the regulatory cap, so config.yaml and the
-    // UI show what's actually enforced.
-    if let Some(download) = config.download.as_mut() {
-        if download.download_interval_days > MAX_DOWNLOAD_INTERVAL_DAYS {
-            eprintln!(
-                "download_interval_days {} exceeds the maximum of {}; using {}.",
-                download.download_interval_days, MAX_DOWNLOAD_INTERVAL_DAYS, MAX_DOWNLOAD_INTERVAL_DAYS
-            );
-            download.download_interval_days = MAX_DOWNLOAD_INTERVAL_DAYS;
-        }
     }
 
     if config.connection.is_none() {
@@ -876,20 +1076,78 @@ pub fn init_config() -> io::Result<()> {
         });
     }
 
+    // First run (or every company removed by hand): create the `default` company, which
+    // makes this a single-company install (see `DEFAULT_COMPANY_ID`).
+    if config.companies.is_empty() {
+        let connection_limit = config
+            .connection
+            .as_ref()
+            .map(|c| c.connection_limit)
+            .unwrap_or(DEFAULT_SERVER_CONNECTION_LIMIT);
+        println!("No companies configured; creating company '{}'.", DEFAULT_COMPANY_ID);
+        config.companies.insert(
+            DEFAULT_COMPANY_ID.to_string(),
+            CompanyConfig {
+                name: DEFAULT_COMPANY_NAME.to_string(),
+                connection_limit,
+                download_interval_days: DEFAULT_DOWNLOAD_INTERVAL_DAYS,
+                devices: Vec::new(),
+                cards: BTreeMap::new(),
+            },
+        );
+    }
+
+    // Drop companies with unusable ids (their cards become unassigned), and correct
+    // hand-edited intervals above the regulatory cap so config.yaml and the UI show
+    // what's actually enforced. No logger yet, hence eprintln!.
+    config.companies.retain(|id, _| {
+        let valid = is_valid_company_id(id);
+        if !valid {
+            eprintln!(
+                "Company id '{}' is invalid (use lowercase letters, digits and '-'); ignoring it.",
+                id
+            );
+        }
+        valid
+    });
+    for (id, company) in config.companies.iter_mut() {
+        if company.download_interval_days > MAX_DOWNLOAD_INTERVAL_DAYS {
+            eprintln!(
+                "Company '{}': download_interval_days {} exceeds the maximum of {}; using {}.",
+                id, company.download_interval_days, MAX_DOWNLOAD_INTERVAL_DAYS, MAX_DOWNLOAD_INTERVAL_DAYS
+            );
+            company.download_interval_days = MAX_DOWNLOAD_INTERVAL_DAYS;
+        }
+    }
+
+    // Built-in admin account: config.yaml holds its password. Missing or blank means
+    // generate a new one — which is also how a lost admin password is reset.
+    let admin_password = match &config.admin_password {
+        Some(password) if !password.trim().is_empty() => password.clone(),
+        _ => {
+            let password = crate::users::generate_password();
+            println!("No admin password in config.yaml; generated a new one and saved it there.");
+            config.admin_password = Some(password.clone());
+            password
+        }
+    };
+
     save_config(&config_path, &config)
         .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
 
     log::debug!("config: saved config");
 
+    // Only once the password is safely in config.yaml: if this failed first, nobody
+    // would know the new password. A failure here is retried on the next startup.
+    if let Err(e) = crate::users::ensure_admin(&admin_password) {
+        eprintln!("Failed to set the admin password in the database: {}", e);
+    }
+
     /*
         Send data of all cards in events one by one to the front.
     */
-    for (card_number, card_config) in &config.cards {
-        emit_card_config_event(
-            "global-card-config-updated",
-            card_number.clone(),
-            Some(card_config.clone()),
-        );
+    for (card_number, card_config) in config.all_cards() {
+        emit_card_config_event("global-card-config-updated", card_number, Some(card_config));
     }
 
     load_config_to_cache(&config)
@@ -904,14 +1162,17 @@ fn generate_default_config() -> ConfigurationFile {
         name: "Tacho Card Server".to_string(),
         version: env!("CARGO_PKG_VERSION").to_string(),
         description: "Application for the tachograph cards authentication".to_string(),
+        admin_password: None, // generated by init_config()
         appearance: Some(AppearanceConfig {
             dark_theme: DarkTheme::Auto,
             minimize_to_tray: true,
         }),
         connection: Some(ConnectionConfig { listen_port: 7878, connection_limit: 100 }),
-        download: Some(DownloadConfig { download_path: default_download_path(), download_interval_days: DEFAULT_DOWNLOAD_INTERVAL_DAYS, retain_failed_downloads: false }),
+        download: Some(DownloadConfig { download_path: default_download_path(), retain_failed_downloads: false }),
         logging: Some(LoggingConfig { retention_days: DEFAULT_LOG_RETENTION_DAYS }),
-        cards: HashMap::new(),
+        // init_config() adds the `default` company.
+        companies: BTreeMap::new(),
+        unassigned_cards: BTreeMap::new(),
     }
 }
 
@@ -937,7 +1198,7 @@ mod tests {
     }
 
     fn sample_config() -> ConfigurationFile {
-        let mut cards = HashMap::new();
+        let mut cards = BTreeMap::new();
         cards.insert(
             "ABCDEF0123456789".to_string(),
             CardConfig {
@@ -949,12 +1210,25 @@ mod tests {
                 company_name: Some("Acme Logistics".to_string()),
                 company_address: Some("Street 1".to_string()),
                 last_auth: Some((1_700_000_500, true)),
+                company: None,
+            },
+        );
+        let mut companies = BTreeMap::new();
+        companies.insert(
+            "acme".to_string(),
+            CompanyConfig {
+                name: "Acme Logistics".to_string(),
+                connection_limit: 50,
+                download_interval_days: 7,
+                devices: vec!["356938035643809".to_string()],
+                cards,
             },
         );
         ConfigurationFile {
             name: "TCS".to_string(),
             version: "0.0.0-test".to_string(),
             description: "test".to_string(),
+            admin_password: Some("test-password".to_string()),
             appearance: Some(AppearanceConfig {
                 dark_theme: DarkTheme::Auto,
                 minimize_to_tray: true,
@@ -965,11 +1239,11 @@ mod tests {
             }),
             download: Some(DownloadConfig {
                 download_path: default_download_path(),
-                download_interval_days: DEFAULT_DOWNLOAD_INTERVAL_DAYS,
                 retain_failed_downloads: false,
             }),
             logging: Some(LoggingConfig { retention_days: 7 }),
-            cards,
+            companies,
+            unassigned_cards: BTreeMap::new(),
         }
     }
 
@@ -982,21 +1256,80 @@ mod tests {
         save_config(&path, &cfg).expect("save");
 
         let loaded = load_config(&path).expect("load");
-        assert_eq!(loaded.cards.len(), 1);
-        let card = loaded.cards.get("ABCDEF0123456789").expect("card present");
+        let cards = loaded.all_cards();
+        assert_eq!(cards.len(), 1);
+        let card = cards.get("ABCDEF0123456789").expect("card present");
         assert_eq!(card.iccid, "1122334455667788");
         assert_eq!(card.card_type, Some(4));
         assert_eq!(card.last_auth, Some((1_700_000_500, true)));
+        assert_eq!(card.company.as_deref(), Some("acme"));
+        let acme = loaded.companies.get("acme").expect("company present");
+        assert_eq!(acme.connection_limit, 50);
+        assert_eq!(acme.download_interval_days, 7);
+        assert_eq!(acme.devices, vec!["356938035643809".to_string()]);
         assert_eq!(
             loaded.connection.as_ref().map(|s| s.listen_port),
-            Some(DEFAULT_SERVER_LISTEN_PORT)
+            cfg.connection.as_ref().map(|s| s.listen_port)
         );
         assert_eq!(
             loaded.connection.as_ref().map(|s| s.connection_limit),
-            Some(DEFAULT_SERVER_CONNECTION_LIMIT)
+            cfg.connection.as_ref().map(|s| s.connection_limit)
         );
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    fn card(iccid: &str) -> CardConfig {
+        CardConfig {
+            iccid: iccid.to_string(),
+            expire: None,
+            name: None,
+            card_type: Some(4),
+            structure_version: None,
+            company_name: None,
+            company_address: None,
+            last_auth: None,
+            company: None,
+        }
+    }
+
+    #[test]
+    fn cards_are_nested_under_their_company_on_disk() {
+        let yaml = serde_yaml::to_string(&sample_config()).unwrap();
+        let parsed: serde_yaml::Value = serde_yaml::from_str(&yaml).unwrap();
+        assert!(parsed["companies"]["acme"]["cards"]["ABCDEF0123456789"].is_mapping());
+        // Company is implied by position, not repeated on the card.
+        assert!(parsed["companies"]["acme"]["cards"]["ABCDEF0123456789"].get("company").is_none());
+    }
+
+    #[test]
+    fn new_cards_go_to_the_only_company() {
+        let mut cfg = generate_default_config();
+        cfg.companies.insert(
+            DEFAULT_COMPANY_ID.to_string(),
+            CompanyConfig {
+                name: "Default".to_string(),
+                connection_limit: 10,
+                download_interval_days: 1,
+                devices: Vec::new(),
+                cards: BTreeMap::new(),
+            },
+        );
+        cfg.insert_card("A", card("1"));
+        assert_eq!(cfg.card("A").unwrap().company.as_deref(), Some(DEFAULT_COMPANY_ID));
+        assert!(cfg.remove_card("A").is_some());
+        assert!(cfg.card("A").is_none());
+    }
+
+    #[test]
+    fn company_ids_are_validated() {
+        assert!(is_valid_company_id("acme"));
+        assert!(is_valid_company_id("acme-logistics-2"));
+        assert!(!is_valid_company_id(""));
+        assert!(!is_valid_company_id("-acme"));
+        assert!(!is_valid_company_id("Acme"));
+        assert!(!is_valid_company_id("acme/../x"));
+        assert!(!is_valid_company_id("acme logistics"));
     }
 
     #[test]
@@ -1021,11 +1354,11 @@ mod tests {
         let first_meta = fs::metadata(&path).expect("meta1");
 
         let mut second = sample_config();
-        second.cards.clear();
+        second.companies.values_mut().for_each(|company| company.cards.clear());
         save_config(&path, &second).expect("second save");
 
         let loaded = load_config(&path).expect("load second");
-        assert!(loaded.cards.is_empty(), "second save must replace contents");
+        assert!(loaded.all_cards().is_empty(), "second save must replace contents");
         assert!(first_meta.is_file());
 
         let _ = fs::remove_dir_all(&dir);
@@ -1048,7 +1381,7 @@ mod tests {
         let cfg = generate_default_config();
         assert!(!cfg.name.is_empty());
         assert!(!cfg.version.is_empty());
-        assert!(cfg.cards.is_empty());
+        assert!(cfg.all_cards().is_empty());
     }
 
     #[test]
@@ -1062,6 +1395,7 @@ mod tests {
             company_name: None,
             company_address: None,
             last_auth: None,
+            company: None,
         };
         let yaml = serde_yaml::to_string(&card).expect("ser");
         let back: CardConfig = serde_yaml::from_str(&yaml).expect("de");
@@ -1069,6 +1403,284 @@ mod tests {
         assert!(back.expire.is_none());
         assert!(back.last_auth.is_none());
     }
+}
+
+// ───── Companies, cards and devices: frontend commands ─────
+
+/// A configured card, as listed in the UI.
+#[derive(Serialize, Clone, Debug)]
+pub struct CardEntry {
+    pub card_number: String,
+    #[serde(flatten)]
+    pub card: CardConfig,
+}
+
+#[derive(Serialize, Clone, Debug)]
+pub struct CompanyView {
+    pub id: String,
+    pub name: String,
+    pub connection_limit: u16,
+    pub download_interval_days: u32,
+    pub devices: Vec<String>,
+    pub cards: Vec<CardEntry>,
+}
+
+#[derive(Serialize, Clone, Debug)]
+pub struct CompaniesView {
+    pub companies: Vec<CompanyView>,
+    pub unassigned_cards: Vec<CardEntry>,
+}
+
+fn card_entries<'a>(cards: impl Iterator<Item = (&'a String, &'a CardConfig)>) -> Vec<CardEntry> {
+    let mut entries: Vec<CardEntry> = cards
+        .map(|(card_number, card)| CardEntry { card_number: card_number.clone(), card: card.clone() })
+        .collect();
+    entries.sort_by(|a, b| a.card_number.cmp(&b.card_number));
+    entries
+}
+
+/// Loads config.yaml, applies `change`, then saves it and refreshes the cache — all
+/// under the write lock. Errors are strings for the UI to show.
+fn change_config<T>(change: impl FnOnce(&mut ConfigurationFile) -> Result<T, String>) -> Result<T, String> {
+    let path = get_config_path().map_err(|e| format!("Failed to find config.yaml: {}", e))?;
+    let _write = config_write_lock();
+    let mut config = load_config(&path).map_err(|e| format!("Failed to read config.yaml: {}", e))?;
+    let result = change(&mut config)?;
+    save_config(&path, &config).map_err(|e| format!("Failed to save config.yaml: {}", e))?;
+    load_config_to_cache(&config).map_err(|e| format!("Failed to apply config: {}", e))?;
+    Ok(result)
+}
+
+/// Every company with its devices and cards, plus cards not assigned to any company.
+#[cfg_attr(feature = "desktop", tauri::command)]
+pub fn get_companies() -> CompaniesView {
+    let cache = CACHE.lock().unwrap();
+    let companies = cache
+        .companies
+        .iter()
+        .map(|(id, company)| CompanyView {
+            id: id.clone(),
+            name: company.name.clone(),
+            connection_limit: company.connection_limit,
+            download_interval_days: company.download_interval_days,
+            devices: company.devices.clone(),
+            cards: card_entries(cache.cards.iter().filter(|(_, card)| card.company.as_deref() == Some(id))),
+        })
+        .collect();
+    CompaniesView {
+        companies,
+        unassigned_cards: card_entries(cache.cards.iter().filter(|(_, card)| card.company.is_none())),
+    }
+}
+
+/// Result of `save_company`.
+#[derive(Serialize, Clone, Debug)]
+pub struct SaveCompanyResult {
+    /// Devices registered to the existing company automatically because this created
+    /// the second company (see `save_company`).
+    pub auto_registered_devices: usize,
+}
+
+/// Creates (`create = true`) or edits a company. Creating the second company ends
+/// "every device belongs to the only company", so that company's devices — every IMEI
+/// in its download history — are registered to it first, rather than suddenly being
+/// rejected.
+#[cfg_attr(feature = "desktop", tauri::command)]
+pub fn save_company(
+    id: String,
+    name: String,
+    connection_limit: u16,
+    download_interval_days: u32,
+    create: bool,
+) -> Result<SaveCompanyResult, String> {
+    let id = id.trim().to_string();
+    let name = name.trim().to_string();
+    if !is_valid_company_id(&id) {
+        return Err("The id may only contain lowercase letters, digits and '-', and can't start with '-'.".into());
+    }
+    if name.is_empty() {
+        return Err("Enter a name.".into());
+    }
+    if connection_limit == 0 {
+        return Err("The connection limit must be at least 1.".into());
+    }
+    if download_interval_days > MAX_DOWNLOAD_INTERVAL_DAYS {
+        return Err(format!("The download interval can be at most {} days.", MAX_DOWNLOAD_INTERVAL_DAYS));
+    }
+
+    let result = change_config(|config| {
+        let mut auto_registered_devices = 0;
+        if create {
+            if config.companies.contains_key(&id) {
+                return Err(format!("A company with id '{}' already exists.", id));
+            }
+            if let Some(sole_id) = config.sole_company() {
+                let sole = config.companies.get_mut(&sole_id).expect("sole company exists");
+                for imei in crate::database::imeis_with_downloads_blocking(&sole_id) {
+                    if !sole.devices.contains(&imei) {
+                        sole.devices.push(imei);
+                        auto_registered_devices += 1;
+                    }
+                }
+            }
+            config.companies.insert(
+                id.clone(),
+                CompanyConfig {
+                    name: name.clone(),
+                    connection_limit,
+                    download_interval_days,
+                    devices: Vec::new(),
+                    cards: BTreeMap::new(),
+                },
+            );
+        } else {
+            let company = config
+                .companies
+                .get_mut(&id)
+                .ok_or_else(|| format!("No company with id '{}'.", id))?;
+            company.name = name.clone();
+            company.connection_limit = connection_limit;
+            company.download_interval_days = download_interval_days;
+        }
+        Ok(SaveCompanyResult { auto_registered_devices })
+    })?;
+    log::info!(
+        "[CONFIG] company={} action={} name={:?} connection_limit={} download_interval_days={} auto_registered_devices={}",
+        id,
+        if create { "created" } else { "updated" },
+        name,
+        connection_limit,
+        download_interval_days,
+        result.auto_registered_devices
+    );
+    Ok(result)
+}
+
+/// Deletes a company. Its cards become unassigned and its devices unknown. The last
+/// company can't be deleted.
+#[cfg_attr(feature = "desktop", tauri::command)]
+pub fn delete_company(id: String) -> Result<(), String> {
+    let moved_cards = change_config(|config| {
+        if config.companies.len() <= 1 {
+            return Err("The last company can't be deleted.".into());
+        }
+        let company = config
+            .companies
+            .remove(&id)
+            .ok_or_else(|| format!("No company with id '{}'.", id))?;
+        let moved: Vec<(String, String)> = company
+            .cards
+            .iter()
+            .map(|(card_number, card)| (card_number.clone(), card.iccid.clone()))
+            .collect();
+        config.unassigned_cards.extend(company.cards);
+        Ok(moved)
+    })?;
+    // Cards in a reader follow (to the remaining company if only one is left).
+    for (card_number, iccid) in &moved_cards {
+        crate::card_pool::CARD_POOLS.move_card(iccid, company_for_card(card_number).as_deref());
+        emit_card_config_event("global-card-config-updated", card_number.clone(), get_card_config_from_cache(card_number));
+    }
+    log::info!("[CONFIG] company={} action=deleted cards_unassigned={}", id, moved_cards.len());
+    Ok(())
+}
+
+/// Moves a configured card to `company`, or to unassigned for `None`. A card in a reader
+/// follows straight away if it's idle, or when its current session ends.
+#[cfg_attr(feature = "desktop", tauri::command)]
+pub fn assign_card(card_number: String, company: Option<String>) -> Result<(), String> {
+    let iccid = change_config(|config| {
+        if let Some(company) = &company {
+            if !config.companies.contains_key(company) {
+                return Err(format!("No company with id '{}'.", company));
+            }
+        }
+        let card = config
+            .remove_card(&card_number)
+            .ok_or_else(|| format!("No card {}.", card_number))?;
+        let iccid = card.iccid.clone();
+        match &company {
+            Some(company) => {
+                config.companies.get_mut(company).expect("checked above").cards.insert(card_number.clone(), card);
+            }
+            None => {
+                config.unassigned_cards.insert(card_number.clone(), card);
+            }
+        }
+        Ok(iccid)
+    })?;
+    if !iccid.is_empty() {
+        crate::card_pool::CARD_POOLS.move_card(&iccid, company_for_card(&card_number).as_deref());
+    }
+    emit_card_config_event("global-card-config-updated", card_number.clone(), get_card_config_from_cache(&card_number));
+    log::info!("[CONFIG] card={} action=assigned company={:?}", card_number, company);
+    Ok(())
+}
+
+/// Registers a device (IMEI) to `company`, moving it from any other, or unregisters it
+/// for `None`. Already-connected devices keep their current session.
+#[cfg_attr(feature = "desktop", tauri::command)]
+pub fn assign_device(imei: String, company: Option<String>) -> Result<(), String> {
+    let imei = imei.trim().to_string();
+    if imei.len() != 15 || !imei.chars().all(|c| c.is_ascii_digit()) || !luhn::valid(&imei) {
+        return Err(format!("'{}' isn't a valid IMEI (15 digits with a valid check digit).", imei));
+    }
+    change_config(|config| {
+        if let Some(company) = &company {
+            if !config.companies.contains_key(company) {
+                return Err(format!("No company with id '{}'.", company));
+            }
+        }
+        for existing in config.companies.values_mut() {
+            existing.devices.retain(|device| device.trim() != imei);
+        }
+        if let Some(company) = &company {
+            config.companies.get_mut(company).expect("checked above").devices.push(imei.clone());
+        }
+        Ok(())
+    })?;
+    if company.is_some() {
+        crate::database::forget_unknown_device_blocking(&imei);
+    }
+    log::info!("[CONFIG] imei={} action=assigned company={:?}", imei, company);
+    Ok(())
+}
+
+/// A registered device.
+#[derive(Serialize, Clone, Debug)]
+pub struct RegisteredDevice {
+    pub imei: String,
+    pub company: String,
+}
+
+#[derive(Serialize, Clone, Debug)]
+pub struct DevicesView {
+    /// Set when there's only one company: every device belongs to it, registered or not.
+    pub sole_company: Option<String>,
+    pub registered: Vec<RegisteredDevice>,
+    /// Devices turned away because their company isn't known, most recent first.
+    pub unknown: Vec<crate::database::UnknownDevice>,
+}
+
+#[cfg_attr(feature = "desktop", tauri::command)]
+pub fn get_devices() -> DevicesView {
+    let (sole_company, mut registered) = {
+        let cache = CACHE.lock().unwrap();
+        let registered: Vec<RegisteredDevice> = cache
+            .companies
+            .iter()
+            .flat_map(|(id, company)| {
+                company.devices.iter().map(|imei| RegisteredDevice { imei: imei.trim().to_string(), company: id.clone() })
+            })
+            .collect();
+        (cache.sole_company(), registered)
+    };
+    registered.sort_by(|a, b| a.company.cmp(&b.company).then(a.imei.cmp(&b.imei)));
+    let unknown = crate::database::unknown_devices_blocking()
+        .into_iter()
+        .filter(|device| !registered.iter().any(|r| r.imei == device.imei))
+        .collect();
+    DevicesView { sole_company, registered, unknown }
 }
 
 /// Re-sends every cached card config to the frontend, e.g. after a webview reload
@@ -1087,7 +1699,6 @@ fn config_payload() -> HashMap<&'static str, String> {
         ("listen_port", get_from_cache(CacheSection::Connection, "listen_port")),
         ("connection_limit", get_from_cache(CacheSection::Connection, "connection_limit")),
         ("download_path", get_from_cache(CacheSection::Download, "download_path")),
-        ("download_interval_days", get_from_cache(CacheSection::Download, "download_interval_days")),
         ("retain_failed_downloads", get_from_cache(CacheSection::Download, "retain_failed_downloads")),
         ("retention_days", get_from_cache(CacheSection::Logging, "retention_days")),
         ("dark_theme", get_from_cache(CacheSection::Appearance, "dark_theme")),
@@ -1098,59 +1709,38 @@ fn config_payload() -> HashMap<&'static str, String> {
 /// Current settings, for a config section to load when it's created — the dialog's
 /// contents only exist while it's open, so they miss the startup `global-config-*`
 /// events.
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 pub fn get_config() -> HashMap<&'static str, String> {
     config_payload()
 }
 
-pub fn emit_global_config_connection(app: &tauri::AppHandle) -> Result<(), Box<dyn Error>> {
+pub fn emit_global_config_connection() {
     let payload: HashMap<&'static str, String> = HashMap::from([
         ("listen_port", get_from_cache(CacheSection::Connection, "listen_port")),
         ("connection_limit", get_from_cache(CacheSection::Connection, "connection_limit")),
     ]);
-    // Emit this data as a global event to update front-end fields
-    if let Err(e) = app.emit("global-config-connection", payload) {
-        return Err(Box::new(e));
-    }
-
-    Ok(())
+    emit("global-config-connection", payload);
 }
 
-pub fn emit_global_config_download(app: &tauri::AppHandle) -> Result<(), Box<dyn Error>> {
+pub fn emit_global_config_download() {
     let payload: HashMap<&'static str, String> = HashMap::from([
         ("download_path", get_from_cache(CacheSection::Download, "download_path")),
-        ("download_interval_days", get_from_cache(CacheSection::Download, "download_interval_days")),
         ("retain_failed_downloads", get_from_cache(CacheSection::Download, "retain_failed_downloads")),
     ]);
-    // Emit this data as a global event to update front-end fields
-    if let Err(e) = app.emit("global-config-download", payload) {
-        return Err(Box::new(e));
-    }
-
-    Ok(())
+    emit("global-config-download", payload);
 }
 
-pub fn emit_global_config_logging(app: &tauri::AppHandle) -> Result<(), Box<dyn Error>> {
+pub fn emit_global_config_logging() {
     let payload: HashMap<&'static str, String> = HashMap::from([
         ("retention_days", get_from_cache(CacheSection::Logging, "retention_days")),
     ]);
-    // Emit this data as a global event to update front-end fields
-    if let Err(e) = app.emit("global-config-logging", payload) {
-        return Err(Box::new(e));
-    }
-
-    Ok(())
+    emit("global-config-logging", payload);
 }
 
-pub fn emit_global_config_appearance(app: &tauri::AppHandle) -> Result<(), Box<dyn Error>> {
+pub fn emit_global_config_appearance() {
     let payload: HashMap<&'static str, String> = HashMap::from([
         ("dark_theme", get_from_cache(CacheSection::Appearance, "dark_theme")),
         ("minimize_to_tray", get_from_cache(CacheSection::Appearance, "minimize_to_tray")),
     ]);
-    // Emit this data as a global event to update front-end fields
-    if let Err(e) = app.emit("global-config-appearance", payload) {
-        return Err(Box::new(e));
-    }
-
-    Ok(())
+    emit("global-config-appearance", payload);
 }

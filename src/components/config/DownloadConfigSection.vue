@@ -3,27 +3,17 @@
         <q-card-section>
             <q-input
                 label="Download Path"
+                hint="Each company's downloads are saved in a subfolder named after its id."
                 dense
                 v-model="downloadPathValue"
                 @keyup.enter="saveConfig"
             >
-                <template #append>
+                <template v-if="isDesktop" #append>
                     <q-btn flat round dense icon="mdi-folder-open" @click="browseDownloadPath">
                         <q-tooltip>Browse…</q-tooltip>
                     </q-btn>
                 </template>
             </q-input>
-            <q-input
-                label="Download Interval (days)"
-                dense
-                type="number"
-                v-model.number="downloadIntervalDaysValue"
-                :min="0"
-                :max="MAX_DOWNLOAD_INTERVAL_DAYS"
-                :rules="[inRange(0, MAX_DOWNLOAD_INTERVAL_DAYS)]"
-                hint="Minimum days between downloads per device (max 60). 0 = no limit."
-                @keyup.enter="saveConfig"
-            />
             <q-checkbox
                 label="Retain failed and partial downloads"
                 dense
@@ -47,27 +37,20 @@
 <script setup lang="ts">
 import { Notify } from 'quasar'
 import { computed, onMounted, ref } from 'vue'
-import { invoke } from '@tauri-apps/api/core'
+import { invoke, isDesktop } from 'src/backend'
 import { open } from '@tauri-apps/plugin-dialog'
-import { getConfig, inRange, isIntInRange } from 'src/utils'
+import { getConfig } from 'src/utils'
 
-const downloadIntervalDaysValue = ref<number>(21)
 const downloadPathValue = ref('')
 const retainFailedDownloadsValue = ref(false)
-const savedDownloadIntervalDays = ref(21)
 const savedDownloadPath = ref('')
 const savedRetainFailedDownloads = ref(false)
 
-// Regulations require a VU download at least every 90 days; matches
-// MAX_DOWNLOAD_INTERVAL_DAYS in config.rs.
-const MAX_DOWNLOAD_INTERVAL_DAYS = 60
-
+// The download interval is per company (Companies tab), not here.
 const isValid = computed(
     () =>
-        isIntInRange(downloadIntervalDaysValue.value, 0, MAX_DOWNLOAD_INTERVAL_DAYS) &&
-        (downloadIntervalDaysValue.value !== savedDownloadIntervalDays.value ||
-            downloadPathValue.value !== savedDownloadPath.value ||
-            retainFailedDownloadsValue.value !== savedRetainFailedDownloads.value),
+        downloadPathValue.value !== savedDownloadPath.value ||
+        retainFailedDownloadsValue.value !== savedRetainFailedDownloads.value,
 )
 
 const browseDownloadPath = async () => {
@@ -98,7 +81,6 @@ const saveConfig = async () => {
         // Tauri maps camelCase keys to the Rust command's snake_case parameters.
         const saved = await invoke<boolean>('update_download', {
             downloadPath: downloadPathValue.value,
-            downloadIntervalDays: downloadIntervalDaysValue.value.toString(),
             retainFailedDownloads: retainFailedDownloadsValue.value,
         })
         // The backend reports failure (e.g. config file not writable) as `false`.
@@ -111,7 +93,6 @@ const saveConfig = async () => {
             timeout: 3000,
         })
         savedDownloadPath.value = downloadPathValue.value
-        savedDownloadIntervalDays.value = downloadIntervalDaysValue.value
         savedRetainFailedDownloads.value = retainFailedDownloadsValue.value
     } catch (error) {
         console.log('Error updating download configuration:', error)
@@ -126,7 +107,6 @@ const saveConfig = async () => {
 
 const cancelConfig = () => {
     downloadPathValue.value = savedDownloadPath.value
-    downloadIntervalDaysValue.value = savedDownloadIntervalDays.value
     retainFailedDownloadsValue.value = savedRetainFailedDownloads.value
 }
 
@@ -138,8 +118,6 @@ onMounted(async () => {
         const config = await getConfig()
         downloadPathValue.value = config.download_path
         savedDownloadPath.value = config.download_path
-        downloadIntervalDaysValue.value = Number(config.download_interval_days)
-        savedDownloadIntervalDays.value = Number(config.download_interval_days)
         retainFailedDownloadsValue.value = config.retain_failed_downloads === 'true'
         savedRetainFailedDownloads.value = config.retain_failed_downloads === 'true'
     } catch (error) {

@@ -18,6 +18,7 @@
                 />
             </div>
             <q-toggle
+                v-if="isDesktop"
                 v-model="minimizeToTrayValue"
                 label="Minimise to tray when closed"
                 class="q-mt-sm"
@@ -39,7 +40,7 @@
 <script setup lang="ts">
 import { Notify } from 'quasar'
 import { computed, onMounted, ref } from 'vue'
-import { invoke } from '@tauri-apps/api/core'
+import { invoke, isDesktop } from 'src/backend'
 import { applyTheme, getConfig } from 'src/utils'
 
 const selectedTheme = ref('')

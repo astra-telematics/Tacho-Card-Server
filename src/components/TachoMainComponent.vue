@@ -167,8 +167,7 @@ import SmartCardList from './SmartCardList.vue'
 import type { SmartCard, Reader } from './models'
 import { formatStructureVersion, formatExpire, isExpired, formatAuthDate } from './cardFormatters'
 import { ref, reactive, computed, onMounted, onUnmounted } from 'vue'
-import { invoke } from '@tauri-apps/api/core'
-import { listen, emit, type UnlistenFn } from '@tauri-apps/api/event'
+import { emit, invoke, listen, type UnlistenFn } from 'src/backend'
 import { Notify } from 'quasar'
 
 const cardlist = ref<null | {

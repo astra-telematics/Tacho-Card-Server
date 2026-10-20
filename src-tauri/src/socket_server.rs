@@ -7,10 +7,11 @@
 //! of thread count — tokio's reactor (epoll/IOCP) is what actually lets one process
 //! serve tens of thousands of sockets at once.
 
+use std::collections::HashMap;
 use std::io;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use tokio::io::AsyncWriteExt;
 use tokio::net::tcp::WriteHalf;
@@ -18,10 +19,12 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::watch;
 use lazy_static::lazy_static;
 
+use crate::card_pool::CardPool;
 use crate::config::{
-    get_from_cache, CacheSection, DEFAULT_DOWNLOAD_INTERVAL_DAYS, DEFAULT_SERVER_CONNECTION_LIMIT,
+    get_from_cache, CacheSection, DEFAULT_COMPANY_ID, DEFAULT_SERVER_CONNECTION_LIMIT,
     DEFAULT_SERVER_LISTEN_PORT,
 };
+use crate::device_protocol::ConnResponseStatus;
 use crate::device_protocol::{AbortMessage, AbortReason};
 use crate::device_protocol::Message;
 use crate::global_app_handle::server_emit_event;
@@ -88,6 +91,42 @@ lazy_static! {
         listen_port: DEFAULT_SERVER_LISTEN_PORT,
         connection_limit: DEFAULT_SERVER_CONNECTION_LIMIT,
     });
+
+    /// Connections each company currently has admitted (see `CompanySlot`).
+    static ref COMPANY_CONNECTIONS: Mutex<HashMap<String, usize>> = Mutex::new(HashMap::new());
+}
+
+/// One of a company's connection slots, held from admission at `ConnAnnounce` until the
+/// connection ends (dropped with the connection's state), so one company's devices
+/// can't crowd out another's.
+struct CompanySlot {
+    company: String,
+}
+
+impl CompanySlot {
+    /// Claims a slot if `company` has fewer than `limit` connections admitted. Check and
+    /// claim happen under one lock, so two devices can't both take the last slot.
+    fn try_claim(company: &str, limit: u16) -> Option<Self> {
+        let mut connections = COMPANY_CONNECTIONS.lock().unwrap_or_else(|p| p.into_inner());
+        let count = connections.entry(company.to_string()).or_insert(0);
+        if *count >= limit as usize {
+            return None;
+        }
+        *count += 1;
+        Some(Self { company: company.to_string() })
+    }
+}
+
+impl Drop for CompanySlot {
+    fn drop(&mut self) {
+        let mut connections = COMPANY_CONNECTIONS.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(count) = connections.get_mut(&self.company) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                connections.remove(&self.company);
+            }
+        }
+    }
 }
 
 /// Pushes new listener settings to the running server (if any). Safe to call before
@@ -243,6 +282,23 @@ pub async fn run(listen_port: u16, connection_limit: u16) {
     updater.abort();
 }
 
+/// Sends a `ConnResponse`; `retry_after` is only meaningful with `TryAgainLater`.
+/// Returns the retry delay as sent, in whole seconds, for logging.
+async fn send_conn_response(
+    stream: &mut WriteHalf<'_>,
+    status: ConnResponseStatus,
+    retry_after: Option<std::time::Duration>,
+) -> Option<u32> {
+    let retry_after_seconds = retry_after.map(|wait| u32::try_from(wait.as_secs()).unwrap_or(u32::MAX));
+    let reply_bytes: Vec<u8> = Message::ConnResponse(crate::device_protocol::ConnResponseMessage {
+        status,
+        retry_after_seconds,
+    })
+    .into();
+    let _ = stream.write_all(&reply_bytes).await;
+    retry_after_seconds
+}
+
 async fn send_abort_message(stream: &mut WriteHalf<'_>, reason: AbortReason) {
     let abort_message = AbortMessage { reason };
     let abort_bytes: Vec<u8> = Message::Abort(abort_message).into();
@@ -264,6 +320,8 @@ enum CardEvent {
     Replaced(crate::smart_card::ManagedCard),
     /// The currently-held card was pulled.
     Revoked,
+    /// The device's company has no cards left, so there's nothing to wait for.
+    NoCards,
 }
 
 /// A boxed, pinned card-related wait, re-armed only at actual state transitions (not
@@ -306,7 +364,7 @@ async fn handle_connection(mut stream: TcpStream, peer_addr: SocketAddr, over_so
     if over_soft_limit {
         let retry_after = crate::admission::over_connection_limit_retry_delay(MIN_CONNECTION_LIMIT_RETRY);
         let retry_after_seconds = u32::try_from(retry_after.as_secs()).unwrap_or(u32::MAX);
-        let busyness = crate::admission::busyness();
+        let busyness = crate::admission::busyness(None);
         log::warn!(
             "[TCP] phase=connect status=over_soft_limit peer={} action=reject retry_after_seconds={} card_available_in_seconds={:?} cards={} waiting={} average_session_ms={} expected_returns={}",
             peer_addr,
@@ -343,6 +401,11 @@ async fn handle_connection(mut stream: TcpStream, peer_addr: SocketAddr, over_so
     // firmware version can narrow down a specific client, defeating that
     // data's anonymization).
     let mut device_firmware_version: Option<String> = None;
+    // Set at admission: the device's company, the card pool it queues in, and the
+    // connection slot it holds in that company (freed when this function returns).
+    let mut company: Option<String> = None;
+    let mut company_pool: Option<Arc<CardPool>> = None;
+    let mut _company_slot: Option<CompanySlot> = None;
     // Set once ConnAnnounce is admitted (ahead of actually holding a card) and stays
     // set until the first card is acquired. Distinct from `card` because there's a
     // real waiting period between admission and having a card in hand.
@@ -380,8 +443,12 @@ async fn handle_connection(mut stream: TcpStream, peer_addr: SocketAddr, over_so
 
         if pending.is_none() {
             pending = if awaiting_first_card {
-                Some(Box::pin(async {
-                    CardEvent::Acquired(crate::card_pool::CARD_POOL.acquire().await)
+                let pool = Arc::clone(company_pool.as_ref().expect("an admitted device has a company pool"));
+                Some(Box::pin(async move {
+                    tokio::select! {
+                        guard = pool.acquire() => CardEvent::Acquired(guard),
+                        _ = pool.wait_until_no_cards() => CardEvent::NoCards,
+                    }
                 }))
             } else if let Some(guard) = &card {
                 if has_card {
@@ -391,8 +458,12 @@ async fn handle_connection(mut stream: TcpStream, peer_addr: SocketAddr, over_so
                         CardEvent::Revoked
                     }))
                 } else {
-                    Some(Box::pin(async {
-                        CardEvent::Replaced(crate::card_pool::CARD_POOL.wait_for_replacement_card().await)
+                    let pool = Arc::clone(company_pool.as_ref().expect("an admitted device has a company pool"));
+                    Some(Box::pin(async move {
+                        tokio::select! {
+                            card = pool.wait_for_replacement_card() => CardEvent::Replaced(card),
+                            _ = pool.wait_until_no_cards() => CardEvent::NoCards,
+                        }
                     }))
                 }
             } else {
@@ -433,46 +504,73 @@ async fn handle_connection(mut stream: TcpStream, peer_addr: SocketAddr, over_so
                             let _ = write_half.write_all(&reply_bytes).await;
                             log::info!("[TCP] peer={} IMEI={} firmware_version={} message=ConnAnnounce action=reply status=Accepted note=duplicate", peer_addr, conn_announce_message.imei, conn_announce_message.firmware_version);
                         } else {
-                            // Beyond `connection_limit` at accept time (see `over_soft_limit`
-                            // above), the only check is the download interval: a device
-                            // that downloaded too recently is told when to come back. Anyone
-                            // else queues for a card, however long the wait.
+                            // Beyond the global `connection_limit` at accept time (see
+                            // `over_soft_limit` above), admission is decided per company —
+                            // see `multi-company design.md` §4. An admitted device queues for
+                            // one of its company's cards, however long the wait.
+                            let device_imei = conn_announce_message.imei.clone();
+                            let firmware_version = conn_announce_message.firmware_version.clone();
+                            let company_config = crate::company_directory::directory()
+                                .company_for_imei(&device_imei)
+                                .and_then(|id| crate::config::get_company(&id).map(|config| (id, config)));
+                            let Some((company_id, company_config)) = company_config else {
+                                send_conn_response(&mut write_half, ConnResponseStatus::Rejected, None).await;
+                                // Listed in the UI (Devices page) so it can be assigned.
+                                crate::database::record_unknown_device(&device_imei, &firmware_version).await;
+                                log::warn!(
+                                    "[TCP] peer={} IMEI={} firmware_version={} message=ConnAnnounce action=reply status=Rejected reason=unregistered_imei",
+                                    peer_addr, device_imei, firmware_version
+                                );
+                                break;
+                            };
+
                             let download_allowed_at = crate::database::next_download_allowed_at(
-                                &conn_announce_message.imei,
-                                get_from_cache(CacheSection::Download, "download_interval_days")
-                                    .parse()
-                                    .unwrap_or(DEFAULT_DOWNLOAD_INTERVAL_DAYS),
+                                &company_id,
+                                &device_imei,
+                                company_config.download_interval_days,
                             ).await;
                             if let Some(retry_after) = crate::admission::download_interval_retry_delay(download_allowed_at) {
-                                let retry_after_seconds = u32::try_from(retry_after.as_secs()).unwrap_or(u32::MAX);
-                                let reply = Message::ConnResponse(crate::device_protocol::ConnResponseMessage {
-                                    status: crate::device_protocol::ConnResponseStatus::TryAgainLater,
-                                    retry_after_seconds: Some(retry_after_seconds),
-                                });
-                                let reply_bytes: Vec<u8> = reply.into();
-                                let _ = write_half.write_all(&reply_bytes).await;
+                                let retry_after_seconds = send_conn_response(&mut write_half, ConnResponseStatus::TryAgainLater, Some(retry_after)).await;
                                 log::info!(
-                                    "[TCP] peer={} IMEI={} firmware_version={} message=ConnAnnounce action=reply status=TryAgainLater reason=download_interval_not_elapsed retry_after_seconds={}",
-                                    peer_addr, conn_announce_message.imei, conn_announce_message.firmware_version, retry_after_seconds
+                                    "[TCP] peer={} company={} IMEI={} firmware_version={} message=ConnAnnounce action=reply status=TryAgainLater reason=download_interval_not_elapsed retry_after_seconds={:?}",
+                                    peer_addr, company_id, device_imei, firmware_version, retry_after_seconds
                                 );
                                 break;
                             }
 
+                            let pool = crate::card_pool::CARD_POOLS.pool(&company_id);
+                            if pool.card_count() == 0 {
+                                let retry_after_seconds = send_conn_response(&mut write_half, ConnResponseStatus::TryAgainLater, Some(crate::admission::NO_CARDS_RETRY)).await;
+                                log::info!(
+                                    "[TCP] peer={} company={} IMEI={} firmware_version={} message=ConnAnnounce action=reply status=TryAgainLater reason=no_cards retry_after_seconds={:?}",
+                                    peer_addr, company_id, device_imei, firmware_version, retry_after_seconds
+                                );
+                                break;
+                            }
+
+                            let Some(slot) = CompanySlot::try_claim(&company_id, company_config.connection_limit) else {
+                                let retry_after = crate::admission::over_company_limit_retry_delay(&company_id, MIN_CONNECTION_LIMIT_RETRY);
+                                let retry_after_seconds = send_conn_response(&mut write_half, ConnResponseStatus::TryAgainLater, Some(retry_after)).await;
+                                log::warn!(
+                                    "[TCP] peer={} company={} IMEI={} firmware_version={} message=ConnAnnounce action=reply status=TryAgainLater reason=company_connection_limit limit={} retry_after_seconds={:?}",
+                                    peer_addr, company_id, device_imei, firmware_version, company_config.connection_limit, retry_after_seconds
+                                );
+                                break;
+                            };
+
                             announced = true;
                             awaiting_first_card = true;
-                            imei = Some(conn_announce_message.imei.clone());
-                            device_firmware_version = Some(conn_announce_message.firmware_version.clone());
+                            imei = Some(device_imei.clone());
+                            device_firmware_version = Some(firmware_version.clone());
+                            company = Some(company_id.clone());
+                            company_pool = Some(pool);
+                            _company_slot = Some(slot);
                             pending = None; // arm as "Acquired" wait next loop
-                            let reply = Message::ConnResponse(crate::device_protocol::ConnResponseMessage {
-                                status: crate::device_protocol::ConnResponseStatus::Accepted,
-                                retry_after_seconds: None,
-                            });
-                            let reply_bytes: Vec<u8> = reply.into();
-                            write_half.write_all(&reply_bytes).await.unwrap();
-                            let snapshot = crate::admission::snapshot();
+                            send_conn_response(&mut write_half, ConnResponseStatus::Accepted, None).await;
+                            let snapshot = crate::admission::snapshot(Some(&company_id));
                             log::info!(
-                                "[TCP] peer={} IMEI={} firmware_version={} message=ConnAnnounce action=reply status=Accepted estimated_wait_seconds={:?} cards={} waiting={} average_session_ms={}",
-                                peer_addr, conn_announce_message.imei, conn_announce_message.firmware_version,
+                                "[TCP] peer={} company={} IMEI={} firmware_version={} message=ConnAnnounce action=reply status=Accepted estimated_wait_seconds={:?} cards={} waiting={} average_session_ms={}",
+                                peer_addr, company_id, device_imei, firmware_version,
                                 snapshot.estimated_wait().map(|wait| wait.as_secs()), snapshot.cards, snapshot.waiting, snapshot.average_session.as_millis()
                             );
                         }
@@ -687,7 +785,7 @@ async fn handle_connection(mut stream: TcpStream, peer_addr: SocketAddr, over_so
                                 log::warn!("[TCP] peer={} action=download_discarded reason=crc_mismatch bytes={} vrn={:?} note=retain_failed_downloads_off", peer_addr, download_buffer.len(), vrn);
                                 None
                             } else {
-                                match crate::vu_download::save_download(vrn.as_deref(), &imei_value, &download_buffer, tag.as_deref()) {
+                                match crate::vu_download::save_download(company.as_deref().unwrap_or(DEFAULT_COMPANY_ID), vrn.as_deref(), &imei_value, &download_buffer, tag.as_deref()) {
                                     Ok(path) => {
                                         log::info!("[TCP] peer={} action=download_saved path={:?} vrn={:?} verified={}", peer_addr, path, vrn, verified);
                                         Some(path)
@@ -702,6 +800,7 @@ async fn handle_connection(mut stream: TcpStream, peer_addr: SocketAddr, over_so
                             // counts towards the once-a-day limit.
                             let success = verified && saved_path.is_some();
                             crate::database::record_download(crate::database::DownloadRecord {
+                                company: company.clone().unwrap_or_else(|| DEFAULT_COMPANY_ID.to_string()),
                                 imei: imei_value,
                                 vrn: vrn.clone(),
                                 verified: success,
@@ -777,6 +876,16 @@ async fn handle_connection(mut stream: TcpStream, peer_addr: SocketAddr, over_so
                         self::send_abort_message(&mut write_half, AbortReason::CardRemoved).await;
                         log::warn!("[TCP] peer={} action=card_removed status=notified", peer_addr);
                     }
+                    CardEvent::NoCards => {
+                        // The company's last card has gone: nothing to wait for. Tell the
+                        // device when to try again, as at announce.
+                        let retry_after_seconds = send_conn_response(&mut write_half, ConnResponseStatus::TryAgainLater, Some(crate::admission::NO_CARDS_RETRY)).await;
+                        log::warn!(
+                            "[TCP] peer={} company={:?} action=reply status=TryAgainLater reason=no_cards_left retry_after_seconds={:?}",
+                            peer_addr, company, retry_after_seconds
+                        );
+                        break;
+                    }
                 }
             }
         }
@@ -807,7 +916,7 @@ async fn handle_connection(mut stream: TcpStream, peer_addr: SocketAddr, over_so
             log::warn!("[TCP] peer={} action=download_discarded reason={} bytes={} note=retain_failed_downloads_off", peer_addr, tag, download_buffer.len());
             None
         } else {
-            match crate::vu_download::save_download(vrn.as_deref(), &imei_value, &download_buffer, Some(&tag)) {
+            match crate::vu_download::save_download(company.as_deref().unwrap_or(DEFAULT_COMPANY_ID), vrn.as_deref(), &imei_value, &download_buffer, Some(&tag)) {
                 Ok(path) => {
                     log::warn!("[TCP] peer={} action=download_saved_incomplete path={:?} bytes={}", peer_addr, path, download_buffer.len());
                     Some(path)
@@ -821,6 +930,7 @@ async fn handle_connection(mut stream: TcpStream, peer_addr: SocketAddr, over_so
         // Recorded for visibility only — never verified, so it doesn't count
         // towards the once-a-day limit.
         crate::database::record_download(crate::database::DownloadRecord {
+            company: company.clone().unwrap_or_else(|| DEFAULT_COMPANY_ID.to_string()),
             imei: imei_value,
             vrn,
             verified: false,

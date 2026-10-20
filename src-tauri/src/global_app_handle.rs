@@ -1,45 +1,75 @@
 // ───── Std Lib ─────
+#[cfg(feature = "desktop")]
 use std::sync::Mutex;
 
 // ───── External Crates ─────
-use lazy_static::lazy_static;
 use serde::Serialize;
+#[cfg(feature = "desktop")]
 use tauri::{AppHandle, Emitter};
+#[cfg(not(feature = "desktop"))]
+use {once_cell::sync::Lazy, tokio::sync::broadcast};
 
 // ───── Local Modules ─────
 use crate::config::CardConfig;
 
-// Global application handle used for emitting events from anywhere.
-// Wrapped in a Mutex to ensure safe concurrent access.
-lazy_static! {
-    static ref APP_HANDLE: Mutex<Option<AppHandle>> = Mutex::new(None);
+/// The desktop window's app handle, for emitting events to it.
+#[cfg(feature = "desktop")]
+static APP_HANDLE: Mutex<Option<AppHandle>> = Mutex::new(None);
+
+#[cfg(feature = "desktop")]
+fn app_handle_slot() -> std::sync::MutexGuard<'static, Option<AppHandle>> {
+    // Poisoned only by an earlier panic; keep emitting rather than cascading it.
+    APP_HANDLE.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-// initialize the global app handle
+/// Sets the desktop window's app handle, so `emit` reaches the window.
+#[cfg(feature = "desktop")]
 pub fn set_app_handle(handle: AppHandle) {
-    // Lock failure here means the mutex was poisoned by an earlier panic.
-    // Recover the inner value instead of cascading the panic so subsequent
-    // emit_* calls keep working.
-    let mut guard = match APP_HANDLE.lock() {
-        Ok(g) => g,
-        Err(poisoned) => {
-            log::warn!("APP_HANDLE mutex was poisoned — recovering");
-            poisoned.into_inner()
-        }
-    };
-    *guard = Some(handle);
+    *app_handle_slot() = Some(handle);
 }
 
-// getting the global app handle
-pub fn get_app_handle() -> Option<AppHandle> {
-    let guard = match APP_HANDLE.lock() {
-        Ok(g) => g,
-        Err(poisoned) => {
-            log::warn!("APP_HANDLE mutex was poisoned — recovering");
-            poisoned.into_inner()
+/// An event for the frontend, as sent to web clients (`web_server`'s `/api/events`).
+#[cfg(not(feature = "desktop"))]
+#[derive(Clone, Debug)]
+pub struct UiEvent {
+    pub name: String,
+    pub payload: serde_json::Value,
+}
+
+/// Events for web clients. Each `/api/events` stream subscribes; a client too slow to
+/// keep up skips what it missed (it reloads state when it reconnects).
+#[cfg(not(feature = "desktop"))]
+static WEB_EVENTS: Lazy<broadcast::Sender<UiEvent>> = Lazy::new(|| broadcast::channel(256).0);
+
+/// A receiver of every event emitted from now on, for a web client's event stream.
+#[cfg(not(feature = "desktop"))]
+pub fn subscribe_web_events() -> broadcast::Receiver<UiEvent> {
+    WEB_EVENTS.subscribe()
+}
+
+/// Sends an event to the frontend: the desktop window in the desktop build, logged-in
+/// web clients in the server build. Nobody being there to receive it is fine.
+pub fn emit<S: Serialize>(event_name: &str, payload: S) {
+    let payload = match serde_json::to_value(payload) {
+        Ok(value) => value,
+        Err(e) => {
+            log::error!("emit '{}' failed to serialise payload: {}", event_name, e);
+            return;
         }
     };
-    guard.clone()
+    #[cfg(feature = "desktop")]
+    {
+        let app_handle = app_handle_slot().clone();
+        if let Some(app_handle) = app_handle {
+            if let Err(e) = app_handle.emit(event_name, &payload) {
+                log::error!("emit '{}' failed: {:?}", event_name, e);
+            }
+        }
+    }
+    // Err only means no web client is connected.
+    #[cfg(not(feature = "desktop"))]
+    let _ = WEB_EVENTS.send(UiEvent { name: event_name.to_string(), payload });
+    log::debug!("'{}' has been sent", event_name);
 }
 
 /// Represents the state of a tachograph card.
@@ -74,15 +104,7 @@ pub fn card_emit_event(event_name: &str, iccid: String, reader_name: String, car
         authentication
     };
 
-    if let Some(app_handle) = get_app_handle() {
-        if let Err(e) = app_handle.emit(event_name, payload) {
-            log::error!("emit '{}' failed: {:?}", event_name, e);
-        } else {
-            log::debug!("'{}' has been sent", event_name);
-        }
-    } else {
-        log::warn!("emit '{}' skipped: app handle not set", event_name);
-    }
+    emit(event_name, payload);
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -97,15 +119,7 @@ pub fn emit_card_config_event(event_name: &str, card_number: String, config: Opt
         content: config,
     };
 
-    if let Some(app_handle) = get_app_handle() {
-        if let Err(e) = app_handle.emit(event_name, payload) {
-            log::error!("emit '{}' failed: {:?}", event_name, e);
-        } else {
-            log::debug!("'{}' has been sent", event_name);
-        }
-    } else {
-        log::warn!("emit '{}' skipped: app handle not set", event_name);
-    }
+    emit(event_name, payload);
 }
 
 #[derive(Clone, Serialize)]
@@ -116,21 +130,9 @@ pub struct NotificationPayload {
 
 /// Emits the server status to the frontend.
 pub fn server_emit_event(connections: u16) {
-    if let Some(app_handle) = get_app_handle() {
-        if let Err(e) = app_handle.emit("server-status", connections) {
-            log::error!("[CONN] failed to emit server status: {:?}", e);
-        }
-    }
+    emit("server-status", connections);
 }
 
 pub fn emit_notification_event(event_name: &str, payload: NotificationPayload) {
-    if let Some(app_handle) = get_app_handle() {
-        if let Err(e) = app_handle.emit(event_name, payload) {
-            log::error!("emit '{}' failed: {:?}", event_name, e);
-        } else {
-            log::debug!("'{}' has been sent", event_name);
-        }
-    } else {
-        log::warn!("emit '{}' skipped: app handle not set", event_name);
-    }
+    emit(event_name, payload);
 }

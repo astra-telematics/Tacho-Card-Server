@@ -5,7 +5,6 @@ use flexi_logger::{Age, Cleanup, Criterion, Duplicate, FileSpec, Logger, LoggerH
 use once_cell::sync::OnceCell;
 use reqwest;
 use serde::Deserialize;
-use tauri::async_runtime;
 
 use crate::global_app_handle::emit_notification_event;
 use crate::global_app_handle::NotificationPayload;
@@ -31,7 +30,8 @@ fn log_directory() -> PathBuf {
     }
 }
 
-/// Opens the log directory in the OS file manager.
+/// Opens the log directory in the OS file manager. Desktop only.
+#[cfg(feature = "desktop")]
 #[tauri::command]
 pub fn open_logs_folder() -> Result<(), String> {
     let log_dir = log_directory();
@@ -49,7 +49,7 @@ pub fn open_logs_folder() -> Result<(), String> {
 /// additional rollover once per calendar day if it keeps running that long,
 /// older rotated files compressed, and anything past the retention window
 /// deleted. Everything is also duplicated to stdout, so running interactively
-/// (or in `--headless` mode with a console attached) still shows live output
+/// (or the server build, which has a console) still shows live output
 /// — tailing the file and watching the console both work.
 ///
 /// Must be called *after* `config::init_config()` — it reads
@@ -112,7 +112,7 @@ pub fn setup_logging() {
     }
 
     // Check for the latest version asynchronously
-    async_runtime::spawn(async {
+    crate::rt::spawn(async {
         if let Err(e) = check_latest_version().await {
             log::error!("Error checking latest version: {}", e);
         }
