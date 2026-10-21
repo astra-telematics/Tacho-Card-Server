@@ -1,6 +1,6 @@
 [package]
 name = "tacho-card-server"
-version = "0.0.3"
+version = "0.0.5"
 description = "Tachograph authentication application"
 authors = ["Jessica Doyle"]
 license = ""
