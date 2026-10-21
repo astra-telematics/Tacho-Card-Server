@@ -12,9 +12,10 @@
         <q-banner rounded class="bg-primary text-white q-mb-md">
             <template #avatar><q-icon name="mdi-information-outline" /></template>
             Users log in to the web UI when the server runs headless. Every user can change
-            everything, so only give accounts to people who administer this server. The
-            <b>admin</b> password is set in config.yaml (<code>admin_password</code>); blank it
-            and restart to generate a new one.
+            everything, so only give accounts to people who administer this server. Everyone
+            changes their own password and theme in the account menu (top right). If the
+            <b>admin</b> password is lost, blank <code>admin_password</code> in config.yaml
+            and restart: a new one is generated there.
         </q-banner>
 
         <q-card flat bordered>

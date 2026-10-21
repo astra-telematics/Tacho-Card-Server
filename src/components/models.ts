@@ -8,6 +8,7 @@ export interface SmartCard {
     company_name?: string | null
     company_address?: string | null
     last_auth?: [number, boolean] | null
+    company?: string | null // id of the TCS company it's assigned to; none = unassigned
 }
 
 export interface Reader {
@@ -43,6 +44,10 @@ export interface CompaniesView {
 export interface RegisteredDevice {
     imei: string
     company: string
+    vrn: string | null // vehicle registration from the latest verified download
+    last_auth_at: number | null // unix seconds of the latest authentication attempt
+    last_auth_succeeded: boolean | null
+    last_download_at: number | null // unix seconds of the latest verified download
 }
 
 export interface UnknownDevice {
@@ -51,6 +56,7 @@ export interface UnknownDevice {
     last_seen: number // unix seconds
     attempts: number
     firmware_version: string | null
+    vrn: string | null // if it has downloaded before
 }
 
 export interface DevicesView {

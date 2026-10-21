@@ -291,9 +291,12 @@ jobs:
             exit 1
           fi
 
-      - name: Download all build artifacts
+      # Only our tcs-* artifacts: docker/build-push-action also uploads a build record
+      # (<repo>~<id>.dockerbuild), which isn't a release asset.
+      - name: Download build artifacts
         uses: actions/download-artifact@v4
         with:
+          pattern: tcs-*
           path: dist
           merge-multiple: true
 

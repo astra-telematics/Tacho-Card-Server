@@ -192,8 +192,9 @@ How it's untangled:
 
 - **Build:** three stages: the Vue UI (`quasar build`), the headless binary (`cargo build --release --no-default-features`, embedding the UI), and the runtime image.
 - **Base image:** `debian:bookworm-slim` with `pcscd`, `libccid`, `libssl3`, `ca-certificates` and `tzdata`. The entrypoint starts `pcscd` (with `--disable-polkit` where supported), unless the host's pcscd socket is mounted at `/run/pcscd`, then runs the server with `--config /data/config.yaml --web-port $TCS_WEB_PORT`. Extra container arguments are passed to the server.
-- **Volume:** `/data` holds `config.yaml` (with the generated admin password), `tcs.db`, `logs/` and `downloads/`. Logs also go to stdout.
-- **Ports:** 7878 for devices (must match `connection.listen_port`), 8080 for the web UI (`TCS_WEB_PORT`).
+- **Volumes:** `/data` holds `config.yaml` (with the generated admin password), `tcs.db` and `logs/`. `/downloads` holds the downloaded files, separately so it can be bound to any NAS folder (e.g. a shared one). Logs also go to stdout.
+- **Pinned settings:** the image sets `TCS_LISTEN_PORT=7878`, `TCS_WEB_PORT=8080` and `TCS_DOWNLOAD_PATH=/downloads`. `TCS_LISTEN_PORT` and `TCS_DOWNLOAD_PATH` override `connection.listen_port` and `download.download_path` (config.yaml's values are kept but ignored) and are read-only in the UI, so the exposed ports always match what the server listens on and downloads always land in the volume. Other ports are chosen with the host side of the port mapping. The same variables work outside Docker.
+- **Ports:** 7878 for devices, 8080 for the web UI.
 - **USB access:** `devices: /dev/bus/usb` and `device_cgroup_rules: c 189:* rmw`. The cgroup rule covers any USB device, so unplugging and replugging the reader (which changes its device path) keeps working.
 - **Time zone:** set `TZ`. The download interval uses *local* calendar dates, and containers default to UTC.
 - **Shutdown:** the server handles `SIGTERM` as well as Ctrl+C; Compose also sets `init: true`.
@@ -209,7 +210,8 @@ How it's untangled:
 
 ### Synology DSM
 
-- **Deployment:** deploy as a Container Manager **Project** (Compose). The Container Manager UI can't pass USB devices into a container; Compose can.
+- **Deployment:** `docker-compose` from the command line; the NAS has no Container Manager. Create `./data` before the first `up`: Synology's Docker doesn't create missing bind-mount folders.
+- **Registry:** the GHCR package is private (the org doesn't allow public packages), so the NAS logs in with `sudo docker login ghcr.io`. ghcr.io only accepts classic tokens (`read:packages`), not fine-grained ones.
 - **Tested so far:**
   - A `debian:bookworm-slim` container with the USB options above.
   - Inside it, `pcsc_scan` detected the **HID Global OMNIKEY 3x21** reader through PC/SC plug-and-play.
@@ -222,11 +224,13 @@ See `docker-compose.yml` for the Compose file.
 
 ### Users
 
-- **Storage:** a `users` table in `tcs.db`: username, Argon2id password hash (PHC string), created/updated times. Plaintext passwords are never stored there.
-- **Built-in `admin`:** always exists. Its password is `admin_password` in config.yaml, in plaintext, and the database is made to match it on every startup.
-  - **Changing it:** edit config.yaml and restart.
-  - **Missing or blank:** a random 20-character password is generated, written to config.yaml and applied to the database. Blanking it is how a lost admin password is recovered.
-  - config.yaml now holds a secret: keep it (and the Docker `/data` volume) readable only by the service.
+- **Storage:** a `users` table in `tcs.db`: username, Argon2id password hash (PHC string), created/updated times, and UI theme (`Light`/`Auto`/`Dark`). Plaintext passwords are never stored there.
+- **Own account:** every user changes their own password (current password required; their other sessions are logged out) and theme in the account menu. The theme follows the user to any browser. The desktop app has no login and uses admin's theme.
+- **Built-in `admin`:** always exists. Its password is `admin_password` in config.yaml, and the database is made to match it on every startup. That value is either:
+  - **Plaintext:** as generated on first start, or typed in by hand (then restart).
+  - **An Argon2id hash:** once admin changes the password in the account menu. The hash goes into config.yaml first, then the database, so the plaintext is gone from the file.
+  - **Missing or blank:** a random 20-character password is generated, written to config.yaml in plaintext and applied to the database. Blanking it is how a lost admin password is recovered.
+  - Other users can't set admin's password. Keep config.yaml (and the Docker `/data` volume) readable only by the service: it can hold the plaintext password, and anyone who can write it can reset admin.
 - **Logins fail closed:** if the database can't be read, a login is refused, unlike the rest of the database, which fails open so it never blocks a download.
 
 ### Desktop vs headless
@@ -244,7 +248,7 @@ See `docker-compose.yml` for the Compose file.
 - **API:** `POST /api/invoke/<command>` with the same JSON arguments as the desktop app's Tauri `invoke`, backed by the same Rust functions. One implementation serves both.
 - **Events:** `GET /api/events` is a Server-Sent Events stream carrying the same events the desktop app gets from Tauri (`global-cards-sync`, `global-card-config-updated`, `global-config-*`, `server-status`, …). `global_app_handle::emit` sends each event to the Tauri window (if any) and to a broadcast channel the streams read. A page that (re)connects calls `resend_state` to get current state.
 - **Frontend:** `src/backend.ts` has the same `invoke`, `listen` and `emit` as `@tauri-apps/api`, using Tauri in the desktop app and `fetch`/SSE in a browser. Components import from it, never from Tauri directly (except the desktop-only folder picker).
-- **Desktop-only features hidden in the browser:** minimise to tray, "Open logs folder", and the folder picker (the download path is typed instead). The theme is the server's saved one.
+- **Desktop-only features hidden in the browser:** minimise to tray, "Open logs folder", and the folder picker (the download path is typed instead), so the config dialog has no Window tab.
 
 ### Login and sessions
 

@@ -269,7 +269,7 @@ async fn invoke(headers: HeaderMap, Path(command): Path<String>, Json(args): Jso
     let Some((token, username)) = authenticate(&headers) else {
         return not_logged_in();
     };
-    match dispatch(&command, args, &token).await {
+    match dispatch(&command, args, &token, &username).await {
         Ok(value) => Json(value).into_response(),
         Err(Unknown) => error(StatusCode::NOT_FOUND, format!("Unknown command '{}'.", command)),
         Err(Failed(message)) => {
@@ -403,10 +403,15 @@ struct UpdateLoggingArgs {
 }
 
 #[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct UpdateAppearanceArgs {
+struct ThemeArg {
     theme: String,
-    minimize_to_tray: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ChangePasswordArgs {
+    current_password: String,
+    new_password: String,
 }
 
 #[derive(Deserialize)]
@@ -450,9 +455,22 @@ struct UserPasswordArgs {
 
 /// Runs a command for a web client: the same functions, arguments (camelCase, as
 /// Tauri's `invoke` takes them) and results as the desktop app. Desktop-only commands
-/// (`open_logs_folder`) aren't here. `token` is the caller's session.
-async fn dispatch(command: &str, args_value: Value, token: &str) -> Result<Value, DispatchError> {
+/// (`open_logs_folder`, `update_appearance`) aren't here. `token` and `username` are the
+/// caller's session; the `*_my_*` commands act on that user.
+async fn dispatch(command: &str, args_value: Value, token: &str, username: &str) -> Result<Value, DispatchError> {
     match command {
+        "get_my_theme" => json(users::get_theme(username.to_string()).await?),
+        "set_my_theme" => {
+            let a: ThemeArg = args(args_value)?;
+            json(users::set_theme(username.to_string(), a.theme).await?)
+        }
+        "change_my_password" => {
+            let a: ChangePasswordArgs = args(args_value)?;
+            users::change_own_password(username.to_string(), a.current_password, a.new_password).await?;
+            // Log out everywhere else with the old password.
+            end_user_sessions(username, Some(token));
+            Ok(Value::Null)
+        }
         "resend_state" => {
             crate::resend_state();
             Ok(Value::Null)
@@ -513,10 +531,6 @@ fn dispatch_blocking(command: &str, args_value: Value) -> Result<Value, Dispatch
         "update_logging" => {
             let a: UpdateLoggingArgs = args(args_value)?;
             json(config::update_logging(a.log_retention_days))
-        }
-        "update_appearance" => {
-            let a: UpdateAppearanceArgs = args(args_value)?;
-            json(config::update_appearance(&a.theme, a.minimize_to_tray))
         }
         "get_companies" => json(config::get_companies()),
         "save_company" => {

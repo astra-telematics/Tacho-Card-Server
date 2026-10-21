@@ -124,12 +124,19 @@ cargo build --release --no-default-features     # target/release/tacho-card-serv
 
 Run it with `--config <path>` to choose the config file (data, logs and downloads go
 next to it) and `--web-port <port>` for the web UI (default 8080). Log in as `admin`
-with the `admin_password` from config.yaml, which is generated on first start. The web
+with the `admin_password` from config.yaml, which is generated on first start; change it
+in the account menu (config.yaml then holds only its hash), or blank it and restart to
+generate a new one. The web
 UI is plain HTTP: keep it on the LAN or behind a TLS reverse proxy.
 
 **Docker:** `docker compose up -d` with [docker-compose.yml](docker-compose.yml) (pulls
 `ghcr.io/astra-telematics/tacho-card-server`, or uncomment `build: .`). Data is in
-`./data`, and the admin password is in `./data/config.yaml` after the first start.
+`./data`, downloads in `./downloads` (bind any folder there), and the admin password is
+in `./data/config.yaml` after the first start.
+
+Environment variables `TCS_LISTEN_PORT` (device port) and `TCS_DOWNLOAD_PATH` (download
+folder) override config.yaml and make those settings read-only in the UI. The Docker
+image sets both, so change ports with the host side of the compose port mappings.
 
 Unit tests run in the headless build: `cargo test --no-default-features --lib`.
 

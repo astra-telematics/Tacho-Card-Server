@@ -42,13 +42,20 @@ COPY --from=server /usr/local/bin/tacho-card-server /usr/local/bin/tacho-card-se
 COPY docker/entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh
 
-# /data holds config.yaml (including the generated admin password), tcs.db, logs/ and
-# downloads/.
-VOLUME /data
+# /data holds config.yaml (including the generated admin password), tcs.db and logs/.
+# /downloads holds the downloaded tachograph files, one subfolder per company; it's
+# separate so it can be mounted from wherever they should go (e.g. a shared folder).
+VOLUME /data /downloads
+# The ports and download folder are fixed here, overriding config.yaml, and shown
+# read-only in the UI: then the exposed ports always match what the server listens on,
+# and downloads always land in the volume. To use other ports, change the host side of
+# the port mappings (docker-compose.yml), not these.
 ENV TZ=UTC \
-    TCS_WEB_PORT=8080
-# 7878: devices (connection.listen_port in config.yaml). 8080: web UI (TCS_WEB_PORT).
-EXPOSE 7878 8080
+    TCS_LISTEN_PORT=7878 \
+    TCS_WEB_PORT=8080 \
+    TCS_DOWNLOAD_PATH=/downloads
+# Devices, and the web UI.
+EXPOSE ${TCS_LISTEN_PORT} ${TCS_WEB_PORT}
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s \
     CMD bash -c "</dev/tcp/127.0.0.1/${TCS_WEB_PORT}" || exit 1

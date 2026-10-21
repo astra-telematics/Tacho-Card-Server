@@ -112,6 +112,28 @@
               </q-item-label>
             </q-item-section>
 
+            <!-- The TCS company it serves (Companies page), not the one on the card. -->
+            <q-item-section side>
+              <q-chip
+                dense
+                size="sm"
+                :outline="!servedCompany(card)"
+                :color="servedCompany(card) ? 'primary' : 'orange'"
+                :text-color="servedCompany(card) ? 'white' : 'orange'"
+                icon="mdi-office-building-outline"
+                class="q-ma-none"
+              >
+                {{ companyName(servedCompany(card)) ?? 'Unassigned' }}
+                <q-tooltip>
+                  {{
+                    servedCompany(card)
+                      ? "Serves this company's devices"
+                      : 'Not assigned to a company: assign it on the Companies page'
+                  }}
+                </q-tooltip>
+              </q-chip>
+            </q-item-section>
+
             <!-- ICCID chip pinned to the right. Hidden if card has no ICCID yet. -->
             <q-item-section side>
               <q-chip
@@ -179,10 +201,30 @@
 </template>
 
 <script lang="ts" setup>
-import { ref, computed, watch } from 'vue'
+import { ref, computed, watch, onMounted, onActivated } from 'vue'
 import { Dialog } from 'quasar'
-import type { SmartCard } from './models'
+import { invoke } from 'src/backend'
+import type { CompaniesView, SmartCard } from './models'
 import { formatCardMeta, formatExpire, isExpired } from './cardFormatters'
+
+// Company names by id, for the assigned-company chip. Reloaded whenever the page is
+// shown, in case companies were renamed on the Companies page.
+const companyNames = ref<Record<string, string>>({})
+const loadCompanyNames = async () => {
+  try {
+    const view = await invoke<CompaniesView>('get_companies')
+    companyNames.value = Object.fromEntries(view.companies.map((c) => [c.id, c.name]))
+    soleCompany.value = view.companies.length === 1 ? view.companies[0]!.id : null
+  } catch (error) {
+    console.error('Error loading company names:', error)
+  }
+}
+onMounted(loadCompanyNames)
+onActivated(loadCompanyNames)
+const companyName = (id: string | null) => (id === null ? null : (companyNames.value[id] ?? id))
+// While there's only one company, every card serves it, assigned or not.
+const soleCompany = ref<string | null>(null)
+const servedCompany = (card: SmartCard) => card.company ?? soleCompany.value
 
 /** Company smart card regex: 16 alphanumeric uppercase characters */
 const TACHO_COMPANY_CARD_REGEXP = /^[A-Z0-9]{16}$/

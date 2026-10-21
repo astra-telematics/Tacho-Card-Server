@@ -12,7 +12,9 @@
 //!   device can retry straight away.
 //! - **Card sessions**: how long each device held a card, per company, so
 //!   `admission.rs`'s averages survive restarts.
-//! - **Users**: accounts and their password hashes (see `users.rs`).
+//! - **Device auths**: each device's latest authentication attempt and whether it
+//!   succeeded, for the Devices page.
+//! - **Users**: accounts, their password hashes and their UI themes (see `users.rs`).
 //! - **Unknown devices**: devices turned away because their company isn't known (more
 //!   than one company, and their IMEI isn't registered), so they can be listed in the UI
 //!   and assigned to a company.
@@ -134,6 +136,26 @@ fn migrate(conn: &mut Connection) -> rusqlite::Result<()> {
             );",
         )?;
         tx.pragma_update(None, "user_version", 5)?;
+        tx.commit()?;
+    }
+    if version < 6 {
+        let tx = conn.transaction()?;
+        tx.execute_batch(
+            "ALTER TABLE users ADD COLUMN theme TEXT NOT NULL DEFAULT 'Auto'; -- 'Light' | 'Auto' | 'Dark'",
+        )?;
+        tx.pragma_update(None, "user_version", 6)?;
+        tx.commit()?;
+    }
+    if version < 7 {
+        let tx = conn.transaction()?;
+        tx.execute_batch(
+            "CREATE TABLE IF NOT EXISTS device_auths (
+                imei      TEXT    PRIMARY KEY,
+                last_at   INTEGER NOT NULL, -- unix seconds (UTC) of the latest AuthOutcome
+                succeeded INTEGER NOT NULL  -- 1 = that authentication succeeded
+            );",
+        )?;
+        tx.pragma_update(None, "user_version", 7)?;
         tx.commit()?;
     }
     Ok(())
@@ -338,6 +360,30 @@ pub fn set_user_password_hash_blocking(username: &str, password_hash: &str) -> R
     set_user_password_hash(&conn, username, password_hash, Local::now().timestamp()).map_err(|e| e.to_string())
 }
 
+fn user_theme(conn: &Connection, username: &str) -> rusqlite::Result<Option<String>> {
+    match conn.query_row("SELECT theme FROM users WHERE username = ?1", params![username], |row| row.get(0)) {
+        Ok(theme) => Ok(Some(theme)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+/// A user's theme; `Ok(None)` if there's no such user. Blocking.
+pub fn user_theme_blocking(username: &str) -> Result<Option<String>, String> {
+    let db = DB.get_or_init(open).as_ref().ok_or("database unavailable")?;
+    let conn = db.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    user_theme(&conn, username).map_err(|e| e.to_string())
+}
+
+/// Sets a user's theme; `Ok(false)` if there's no such user. Blocking.
+pub fn set_user_theme_blocking(username: &str, theme: &str) -> Result<bool, String> {
+    let db = DB.get_or_init(open).as_ref().ok_or("database unavailable")?;
+    let conn = db.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    conn.execute("UPDATE users SET theme = ?2 WHERE username = ?1", params![username, theme])
+        .map(|updated| updated == 1)
+        .map_err(|e| e.to_string())
+}
+
 /// A user account as listed in the UI (no password hash).
 #[derive(serde::Serialize, Clone, Debug, PartialEq)]
 pub struct UserRecord {
@@ -416,6 +462,9 @@ pub struct UnknownDevice {
     /// How many times it has tried to connect.
     pub attempts: i64,
     pub firmware_version: Option<String>,
+    /// Vehicle registration, if it has downloaded before (filled in by
+    /// `config::get_devices`).
+    pub vrn: Option<String>,
 }
 
 fn upsert_unknown_device(conn: &Connection, imei: &str, firmware_version: &str, now: i64) -> rusqlite::Result<()> {
@@ -443,6 +492,7 @@ fn unknown_devices(conn: &Connection) -> rusqlite::Result<Vec<UnknownDevice>> {
             last_seen: row.get(2)?,
             attempts: row.get(3)?,
             firmware_version: row.get(4)?,
+            vrn: None,
         })
     })?;
     rows.collect()
@@ -478,6 +528,69 @@ fn imeis_with_downloads(conn: &Connection, company: &str) -> rusqlite::Result<Ve
     let mut stmt = conn.prepare("SELECT DISTINCT imei FROM downloads WHERE company = ?1 ORDER BY imei")?;
     let rows = stmt.query_map(params![company], |row| row.get(0))?;
     rows.collect()
+}
+
+/// Each IMEI's vehicle registration from its latest verified download that had one.
+fn latest_vrns(conn: &Connection) -> rusqlite::Result<std::collections::HashMap<String, String>> {
+    // SQLite takes the bare `vrn` from the row that has the MAX(id).
+    let mut stmt = conn.prepare(
+        "SELECT imei, vrn, MAX(id) FROM downloads
+         WHERE verified = 1 AND vrn IS NOT NULL AND vrn <> ''
+         GROUP BY imei",
+    )?;
+    let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+    rows.collect()
+}
+
+/// IMEI → vehicle registration from its latest verified download. Blocking.
+pub fn latest_vrns_blocking() -> std::collections::HashMap<String, String> {
+    with_db(Default::default(), latest_vrns)
+}
+
+/// Each IMEI's latest verified download time (unix seconds), across companies.
+fn last_downloads(conn: &Connection) -> rusqlite::Result<std::collections::HashMap<String, i64>> {
+    let mut stmt =
+        conn.prepare("SELECT imei, MAX(downloaded_at) FROM downloads WHERE verified = 1 GROUP BY imei")?;
+    let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+    rows.collect()
+}
+
+/// IMEI → latest verified download time (unix seconds). Blocking.
+pub fn last_downloads_blocking() -> std::collections::HashMap<String, i64> {
+    with_db(Default::default(), last_downloads)
+}
+
+fn upsert_device_auth(conn: &Connection, imei: &str, succeeded: bool, now: i64) -> rusqlite::Result<()> {
+    conn.execute(
+        "INSERT INTO device_auths (imei, last_at, succeeded) VALUES (?1, ?2, ?3)
+         ON CONFLICT(imei) DO UPDATE SET last_at = excluded.last_at, succeeded = excluded.succeeded",
+        params![imei, now, succeeded],
+    )?;
+    Ok(())
+}
+
+fn device_auths(conn: &Connection) -> rusqlite::Result<std::collections::HashMap<String, (i64, bool)>> {
+    let mut stmt = conn.prepare("SELECT imei, last_at, succeeded FROM device_auths")?;
+    let rows = stmt.query_map([], |row| Ok((row.get(0)?, (row.get(1)?, row.get(2)?))))?;
+    rows.collect()
+}
+
+/// Records a device's authentication outcome (its latest attempt). Runs on a blocking
+/// thread so the connection's task isn't stalled on disk I/O.
+pub async fn record_device_auth(imei: &str, succeeded: bool) {
+    let imei = imei.to_string();
+    let result = tokio::task::spawn_blocking(move || {
+        with_db((), |conn| upsert_device_auth(conn, &imei, succeeded, Local::now().timestamp()))
+    })
+    .await;
+    if let Err(e) = result {
+        log::error!("[DB] status=record_device_auth_failed err={:?}", e);
+    }
+}
+
+/// IMEI → (latest authentication time in unix seconds, whether it succeeded). Blocking.
+pub fn device_auths_blocking() -> std::collections::HashMap<String, (i64, bool)> {
+    with_db(Default::default(), device_auths)
 }
 
 /// IMEIs that have sent at least one download for `company`. Blocking.
@@ -601,6 +714,50 @@ mod tests {
         assert_eq!(devices[0].imei, IMEI);
         assert_eq!((devices[0].first_seen, devices[0].last_seen, devices[0].attempts), (100, 200, 2));
         assert_eq!(devices[0].firmware_version.as_deref(), Some("1.1"));
+    }
+
+    #[test]
+    fn latest_vrn_is_from_the_newest_verified_download_with_one() {
+        let conn = test_db();
+        let with_vrn = |vrn: Option<&str>, verified: bool| DownloadRecord {
+            vrn: vrn.map(str::to_string),
+            ..record("acme", IMEI, verified)
+        };
+        insert_download(&conn, &with_vrn(Some("OLD1"), true), local(2026, 9, 20, 10, 0)).unwrap();
+        insert_download(&conn, &with_vrn(Some("NEW1"), true), local(2026, 9, 21, 10, 0)).unwrap();
+        insert_download(&conn, &with_vrn(None, true), local(2026, 9, 22, 10, 0)).unwrap();
+        insert_download(&conn, &with_vrn(Some("BAD1"), false), local(2026, 9, 23, 10, 0)).unwrap();
+        let vrns = latest_vrns(&conn).unwrap();
+        assert_eq!(vrns.get(IMEI).map(String::as_str), Some("NEW1"));
+        assert_eq!(vrns.len(), 1);
+    }
+
+    #[test]
+    fn last_download_is_the_latest_verified_one() {
+        let conn = test_db();
+        insert_download(&conn, &record("acme", IMEI, true), local(2026, 9, 20, 10, 0)).unwrap();
+        insert_download(&conn, &record("other", IMEI, true), local(2026, 9, 21, 10, 0)).unwrap();
+        insert_download(&conn, &record("acme", IMEI, false), local(2026, 9, 22, 10, 0)).unwrap();
+        let last = last_downloads(&conn).unwrap();
+        assert_eq!(last.get(IMEI), Some(&local(2026, 9, 21, 10, 0).timestamp()));
+    }
+
+    #[test]
+    fn device_auth_keeps_the_latest_attempt() {
+        let conn = test_db();
+        upsert_device_auth(&conn, IMEI, true, 100).unwrap();
+        upsert_device_auth(&conn, IMEI, false, 200).unwrap();
+        assert_eq!(device_auths(&conn).unwrap().get(IMEI), Some(&(200, false)));
+    }
+
+    #[test]
+    fn user_theme_defaults_to_auto_and_can_be_set() {
+        let conn = test_db();
+        assert_eq!(user_theme(&conn, "bob").unwrap(), None);
+        create_user(&conn, "bob", "h", 100).unwrap();
+        assert_eq!(user_theme(&conn, "bob").unwrap().as_deref(), Some("Auto"));
+        conn.execute("UPDATE users SET theme = 'Dark' WHERE username = 'bob'", []).unwrap();
+        assert_eq!(user_theme(&conn, "bob").unwrap().as_deref(), Some("Dark"));
     }
 
     #[test]

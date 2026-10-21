@@ -162,6 +162,8 @@ pub fn run() {
             users::add_user,               // create a user
             users::set_user_password,      // change a user's password (not admin's)
             users::delete_user,            // delete a user (not admin)
+            users::get_my_theme,           // the UI theme (admin's: no login on desktop)
+            users::set_my_theme,           // change the UI theme
             smart_card::manual_sync_cards, // manual sync cards from the frontend
             logger::open_logs_folder,      // open the log directory in the OS file manager
         ])

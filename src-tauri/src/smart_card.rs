@@ -116,7 +116,19 @@ fn setup_reader_states(
     Ok(())
 }
 
-async fn process_reader_states(reader_states: &mut [ReaderState]) -> Result<(), SmartCardError> {
+/// ICCID of the card in each reader, by reader name, as last read when it was inserted.
+/// Lets a resync (`resend_known`) report cards that are already loaded.
+static READER_ICCIDS: once_cell::sync::Lazy<std::sync::Mutex<std::collections::HashMap<String, String>>> =
+    once_cell::sync::Lazy::new(Default::default);
+
+fn reader_iccids() -> std::sync::MutexGuard<'static, std::collections::HashMap<String, String>> {
+    READER_ICCIDS.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Registers inserted cards, drops removed ones, and tells the frontend
+/// (`global-cards-sync`). With `resend_known`, readers whose card is already loaded are
+/// reported too — for a page that has just (re)loaded and missed the original events.
+async fn process_reader_states(reader_states: &mut [ReaderState], resend_known: bool) -> Result<(), SmartCardError> {
     for rs in reader_states {
         if rs.name() == PNP_NOTIFICATION() {
             continue;
@@ -152,6 +164,7 @@ async fn process_reader_states(reader_states: &mut [ReaderState]) -> Result<(), 
 
                         iccid = received_iccid;
                         card_number = get_from_cache(CacheSection::Cards, &iccid);
+                        reader_iccids().insert(reader_name_string.to_string(), iccid.clone());
 
                         let company = crate::config::company_for_card(&card_number);
                         log::info!(
@@ -176,15 +189,24 @@ async fn process_reader_states(reader_states: &mut [ReaderState]) -> Result<(), 
             },
             CardProcessingResult::Delete => {
                 log::debug!("CARD DELETED {}", card_state_string);
+                reader_iccids().remove(reader_name_string);
                 // Drops the card if it's idle in the pool, or flags + wakes the
                 // holding session immediately if it was checked out — see
                 // CardGuard::revoked/replace_dead_card in card_pool.rs.
                 crate::card_pool::CARD_POOLS.remove_by_reader(rs.name());
             }
-            CardProcessingResult::Ignore => {}
+            CardProcessingResult::Ignore => {
+                if resend_known {
+                    if let Some(known) = reader_iccids().get(reader_name_string).cloned() {
+                        // Looked up again: the card may have been linked since.
+                        card_number = get_from_cache(CacheSection::Cards, &known);
+                        iccid = known;
+                    }
+                }
+            }
         }
 
-        if action != CardProcessingResult::Ignore {
+        if action != CardProcessingResult::Ignore || resend_known {
             card_emit_event(
                 "global-cards-sync",
                 iccid.into(),
@@ -298,7 +320,7 @@ pub async fn sc_monitor() -> ! {
             }
 
             if let Err(e) =
-                process_reader_states(&mut reader_states).await
+                process_reader_states(&mut reader_states, false).await
             {
                 match e {
                     SmartCardError::UnknownReader => {
@@ -453,7 +475,7 @@ pub async fn manual_sync_cards(
     ctx.get_status_change(Some(Duration::from_secs(MANUAL_SYNC_TIMEOUT_SECS)), &mut reader_states)
         .map_err(|e| format!("failed to get status change: {e}"))?;
 
-    process_reader_states(&mut reader_states)
+    process_reader_states(&mut reader_states, true)
         .await
         .map_err(|e| format!("Processing failed: {}", e))?;
 

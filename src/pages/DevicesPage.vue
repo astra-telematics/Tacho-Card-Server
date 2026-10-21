@@ -31,6 +31,7 @@
                     <thead>
                         <tr>
                             <th class="text-left">IMEI</th>
+                            <th class="text-left">Registration</th>
                             <th class="text-left">Firmware</th>
                             <th class="text-left">First seen</th>
                             <th class="text-left">Last seen</th>
@@ -41,6 +42,7 @@
                     <tbody>
                         <tr v-for="device in view.unknown" :key="device.imei">
                             <td>{{ device.imei }}</td>
+                            <td :class="{ 'text-grey': !device.vrn }">{{ device.vrn || '—' }}</td>
                             <td>{{ device.firmware_version || '—' }}</td>
                             <td>{{ formatTime(device.first_seen) }}</td>
                             <td>{{ formatTime(device.last_seen) }}</td>
@@ -105,7 +107,7 @@
                     v-model="filter"
                     dense
                     clearable
-                    placeholder="Filter by IMEI or company"
+                    placeholder="Filter by IMEI, registration or company"
                     class="q-mb-sm"
                 >
                     <template #prepend><q-icon name="mdi-magnify" /></template>
@@ -117,6 +119,15 @@
                     <thead>
                         <tr>
                             <th class="text-left">IMEI</th>
+                            <th class="text-left">
+                                Registration
+                                <q-tooltip>From the device's latest download</q-tooltip>
+                            </th>
+                            <th class="text-left">Last auth</th>
+                            <th class="text-left">
+                                Last download
+                                <q-tooltip>The latest download that passed its CRC check</q-tooltip>
+                            </th>
                             <th class="text-left">Company</th>
                             <th class="text-right"></th>
                         </tr>
@@ -124,6 +135,25 @@
                     <tbody>
                         <tr v-for="device in filteredRegistered" :key="device.imei">
                             <td>{{ device.imei }}</td>
+                            <td :class="{ 'text-grey': !device.vrn }">{{ device.vrn || '—' }}</td>
+                            <td>
+                                <template v-if="device.last_auth_at">
+                                    <q-icon
+                                        :name="device.last_auth_succeeded ? 'mdi-check-circle' : 'mdi-close-circle'"
+                                        :color="device.last_auth_succeeded ? 'positive' : 'negative'"
+                                        class="q-mr-xs"
+                                    >
+                                        <q-tooltip>
+                                            {{ device.last_auth_succeeded ? 'Succeeded' : 'Failed' }}
+                                        </q-tooltip>
+                                    </q-icon>
+                                    {{ formatTime(device.last_auth_at) }}
+                                </template>
+                                <span v-else class="text-grey">—</span>
+                            </td>
+                            <td :class="{ 'text-grey': !device.last_download_at }">
+                                {{ device.last_download_at ? formatTime(device.last_download_at) : '—' }}
+                            </td>
                             <td style="min-width: 180px">
                                 <q-select
                                     dense
@@ -246,7 +276,10 @@ const filteredRegistered = computed(() => {
     const needle = (filter.value ?? '').trim().toLowerCase()
     if (!needle) return view.value.registered
     return view.value.registered.filter(
-        (d) => d.imei.includes(needle) || companyName(d.company).toLowerCase().includes(needle),
+        (d) =>
+            d.imei.includes(needle) ||
+            (d.vrn ?? '').toLowerCase().includes(needle) ||
+            companyName(d.company).toLowerCase().includes(needle),
     )
 })
 </script>

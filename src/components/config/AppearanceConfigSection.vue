@@ -1,28 +1,8 @@
 <template>
+    <!-- Desktop only: the window's behaviour. The theme is per user, in the account menu. -->
     <q-card class="min-width: 350px; width: 75vw">
         <q-card-section>
-            <div class="q-mt-md row items-center">
-                <div class="text-caption text-grey q-mr-md">Theme</div>
-                <q-btn-toggle
-                    v-model="selectedTheme"
-                    no-caps
-                    rounded
-                    unelevated
-                    toggle-color="primary"
-                    :options="[
-                        { icon: 'mdi-white-balance-sunny', value: 'Light' },
-                        { icon: 'mdi-brightness-auto', value: 'Auto' },
-                        { icon: 'mdi-weather-night', value: 'Dark' },
-                    ]"
-                    @update:model-value="changeTheme"
-                />
-            </div>
-            <q-toggle
-                v-if="isDesktop"
-                v-model="minimizeToTrayValue"
-                label="Minimise to tray when closed"
-                class="q-mt-sm"
-            />
+            <q-toggle v-model="minimizeToTrayValue" label="Minimise to tray when closed" />
         </q-card-section>
         <q-card-actions align="right" class="text-primary">
             <q-btn flat label="Cancel" @click="cancelConfig" />
@@ -40,45 +20,33 @@
 <script setup lang="ts">
 import { Notify } from 'quasar'
 import { computed, onMounted, ref } from 'vue'
-import { invoke, isDesktop } from 'src/backend'
-import { applyTheme, getConfig } from 'src/utils'
+import { invoke } from 'src/backend'
+import { getConfig } from 'src/utils'
 
-const selectedTheme = ref('')
 const minimizeToTrayValue = ref(true)
-const savedSelectedTheme = ref('')
 const savedMinimizeToTray = ref(true)
 
-const isValid = computed(
-    () =>
-        selectedTheme.value !== '' &&
-        (selectedTheme.value !== savedSelectedTheme.value ||
-            minimizeToTrayValue.value !== savedMinimizeToTray.value),
-)
-
-// Previews the selected theme straight away; Cancel reverts it.
-const changeTheme = (value: string) => applyTheme(value)
+const isValid = computed(() => minimizeToTrayValue.value !== savedMinimizeToTray.value)
 
 const saveConfig = async () => {
     try {
         const saved = await invoke<boolean>('update_appearance', {
-            theme: selectedTheme.value,
             minimizeToTray: minimizeToTrayValue.value,
         })
         // The backend reports failure (e.g. config file not writable) as `false`.
         if (!saved) throw new Error('update_appearance returned false')
 
         Notify.create({
-            message: 'Appearance configuration has been updated.',
+            message: 'Window configuration has been updated.',
             color: 'green',
             position: 'bottom',
             timeout: 3000,
         })
-        savedSelectedTheme.value = selectedTheme.value
         savedMinimizeToTray.value = minimizeToTrayValue.value
     } catch (error) {
-        console.log('Error updating appearance configuration:', error)
+        console.log('Error updating window configuration:', error)
         Notify.create({
-            message: 'Error updating appearance configuration.',
+            message: 'Error updating window configuration.',
             color: 'red',
             position: 'bottom',
             timeout: 3000,
@@ -87,9 +55,7 @@ const saveConfig = async () => {
 }
 
 const cancelConfig = () => {
-    selectedTheme.value = savedSelectedTheme.value
     minimizeToTrayValue.value = savedMinimizeToTray.value
-    applyTheme(savedSelectedTheme.value) // undo any preview
 }
 
 // Load the current settings when the tab is created; the dialog's contents only exist
@@ -97,12 +63,10 @@ const cancelConfig = () => {
 onMounted(async () => {
     try {
         const config = await getConfig()
-        selectedTheme.value = config.dark_theme
-        savedSelectedTheme.value = config.dark_theme
         minimizeToTrayValue.value = config.minimize_to_tray !== 'false'
         savedMinimizeToTray.value = config.minimize_to_tray !== 'false'
     } catch (error) {
-        console.error('Error loading appearance configuration:', error)
+        console.error('Error loading window configuration:', error)
     }
 })
 </script>

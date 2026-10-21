@@ -1,11 +1,17 @@
 //! User accounts, stored in the database with Argon2id password hashes.
 //!
-//! There's always a built-in `admin` account. Its password lives in plaintext in
-//! config.yaml (`admin_password`), and the database is made to match it on every
-//! startup (`ensure_admin`), so the config file is how the admin password is set or
-//! changed. If it's missing or blank, a new random password is generated and written
-//! back to config.yaml — which also makes blanking it the way to recover a lost admin
-//! password. See `config::init_config`.
+//! There's always a built-in `admin` account. Its password lives in config.yaml
+//! (`admin_password`), and the database is made to match it on every startup
+//! (`ensure_admin`):
+//!
+//! - **Plaintext**, as generated on first start or typed in by hand.
+//! - **An Argon2id hash**, once admin changes the password in the UI
+//!   (`change_own_password`), so it's no longer readable there.
+//! - **Missing or blank**: a new random password is generated and written back in
+//!   plaintext — the way to recover a lost admin password. See `config::init_config`.
+//!
+//! Each user also has a UI theme (`get_theme` / `set_theme`); the desktop app, which has
+//! no login, uses admin's.
 
 use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
 use argon2::Argon2;
@@ -56,15 +62,30 @@ fn password_matches(password: &str, stored_hash: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// Makes the built-in `admin` account's password `password`: creates the account if
-/// it doesn't exist, and rehashes only if the stored hash doesn't already match (so a
-/// normal startup doesn't rewrite it). Blocking.
-pub fn ensure_admin(password: &str) -> Result<(), String> {
+/// Whether a config.yaml `admin_password` is a hash (set from the UI) rather than the
+/// password itself.
+fn is_password_hash(value: &str) -> bool {
+    value.starts_with("$argon2") && PasswordHash::new(value).is_ok_and(|hash| hash.salt.is_some() && hash.hash.is_some())
+}
+
+/// Makes the built-in `admin` account match config.yaml's `admin_password`, which is
+/// either the password or its hash: creates the account if it doesn't exist, and
+/// writes only if the stored hash doesn't already match (so a normal startup doesn't
+/// rewrite it). Blocking.
+pub fn ensure_admin(configured: &str) -> Result<(), String> {
     let stored = crate::database::user_password_hash_blocking(ADMIN_USERNAME)?;
-    if stored.as_deref().is_some_and(|hash| password_matches(password, hash)) {
-        return Ok(());
-    }
-    crate::database::set_user_password_hash_blocking(ADMIN_USERNAME, &hash_password(password)?)
+    let hash = if is_password_hash(configured) {
+        if stored.as_deref() == Some(configured) {
+            return Ok(());
+        }
+        configured.to_string()
+    } else {
+        if stored.as_deref().is_some_and(|hash| password_matches(configured, hash)) {
+            return Ok(());
+        }
+        hash_password(configured)?
+    };
+    crate::database::set_user_password_hash_blocking(ADMIN_USERNAME, &hash)
 }
 
 /// Whether `username` and `password` are a valid login. `false` for an unknown user, a
@@ -134,11 +155,72 @@ pub async fn add_user(username: String, password: String) -> Result<(), String> 
     Ok(())
 }
 
-/// Changes a user's password. Not for `admin`, whose password is set in config.yaml.
+/// Changes the logged-in user's own password, after checking their current one. For
+/// `admin` the new hash goes into config.yaml first (it's what the database is made to
+/// match on startup), replacing the plaintext there.
+#[cfg(not(feature = "desktop"))] // only the web UI has logins
+pub async fn change_own_password(username: String, current: String, new: String) -> Result<(), String> {
+    validate_password(&new)?;
+    let log_name = username.clone();
+    blocking(move || {
+        let stored = crate::database::user_password_hash_blocking(&username)?;
+        if !stored.is_some_and(|hash| password_matches(&current, &hash)) {
+            return Err("Your current password is wrong.".into());
+        }
+        let hash = hash_password(&new)?;
+        if username == ADMIN_USERNAME {
+            crate::config::set_admin_password(hash.clone())?;
+        }
+        if !crate::database::update_user_password_hash_blocking(&username, &hash)? {
+            return Err(format!("There's no user called '{}'.", username));
+        }
+        Ok(())
+    })
+    .await?;
+    log::info!("[USERS] username={} action=own_password_changed", log_name);
+    Ok(())
+}
+
+/// Themes a user can pick, as the frontend's `applyTheme` takes them.
+const THEMES: [&str; 3] = ["Light", "Auto", "Dark"];
+
+/// A user's UI theme.
+pub async fn get_theme(username: String) -> Result<String, String> {
+    let theme = blocking(move || crate::database::user_theme_blocking(&username)).await?;
+    Ok(theme.unwrap_or_else(|| "Auto".into()))
+}
+
+/// Sets a user's UI theme.
+pub async fn set_theme(username: String, theme: String) -> Result<(), String> {
+    if !THEMES.contains(&theme.as_str()) {
+        return Err(format!("Unknown theme '{}'.", theme));
+    }
+    let updated = blocking(move || crate::database::set_user_theme_blocking(&username, &theme)).await?;
+    if !updated {
+        return Err("Your account no longer exists.".into());
+    }
+    Ok(())
+}
+
+/// The desktop app's theme. It has no login, so it's admin's.
+#[cfg(feature = "desktop")]
+#[tauri::command]
+pub async fn get_my_theme() -> Result<String, String> {
+    get_theme(ADMIN_USERNAME.into()).await
+}
+
+#[cfg(feature = "desktop")]
+#[tauri::command]
+pub async fn set_my_theme(theme: String) -> Result<(), String> {
+    set_theme(ADMIN_USERNAME.into(), theme).await
+}
+
+/// Changes a user's password. Not for `admin`, who changes it themselves
+/// (`change_own_password`) or in config.yaml.
 #[cfg_attr(feature = "desktop", tauri::command)]
 pub async fn set_user_password(username: String, password: String) -> Result<(), String> {
     if username == ADMIN_USERNAME {
-        return Err("The admin password is set in config.yaml (admin_password).".into());
+        return Err("Only admin can change the admin password (account menu → Change password).".into());
     }
     validate_password(&password)?;
     let log_name = username.clone();
@@ -188,6 +270,13 @@ mod tests {
         assert!(validate_new_username("has space").is_err());
         assert!(validate_new_username("Admin").is_err());
         assert!(validate_new_username(&"a".repeat(MAX_USERNAME_LENGTH + 1)).is_err());
+    }
+
+    #[test]
+    fn only_real_hashes_count_as_hashes() {
+        assert!(is_password_hash(&hash_password("correct horse").unwrap()));
+        assert!(!is_password_hash("correct horse"));
+        assert!(!is_password_hash("$argon2id$not-really"));
     }
 
     #[test]

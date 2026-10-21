@@ -32,6 +32,42 @@ pub const MAX_DOWNLOAD_INTERVAL_DAYS: u32 = 60;
 pub const DEFAULT_COMPANY_ID: &str = "default";
 const DEFAULT_COMPANY_NAME: &str = "Default";
 
+// ----- Settings pinned by environment variables -----
+//
+// For containers: the image sets these so the device port matches the one it exposes,
+// and downloads land in the data volume. A pinned setting overrides config.yaml (whose
+// value is kept but ignored) and can't be changed from the UI.
+
+/// Device port (`connection.listen_port`).
+pub const LISTEN_PORT_ENV: &str = "TCS_LISTEN_PORT";
+/// Download folder (`download.download_path`).
+pub const DOWNLOAD_PATH_ENV: &str = "TCS_DOWNLOAD_PATH";
+
+/// The device port from `TCS_LISTEN_PORT`, if set. An invalid value is reported once
+/// and ignored.
+pub fn pinned_listen_port() -> Option<u16> {
+    static PORT: std::sync::OnceLock<Option<u16>> = std::sync::OnceLock::new();
+    *PORT.get_or_init(|| {
+        let value = std::env::var(LISTEN_PORT_ENV).ok()?;
+        match value.trim().parse::<u16>() {
+            Ok(port) if port > 0 => Some(port),
+            _ => {
+                eprintln!("{}={:?} isn't a port number (1-65535); ignoring it.", LISTEN_PORT_ENV, value);
+                None
+            }
+        }
+    })
+}
+
+/// The download folder from `TCS_DOWNLOAD_PATH`, if set and not blank.
+pub fn pinned_download_path() -> Option<String> {
+    static PATH: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    PATH.get_or_init(|| {
+        std::env::var(DOWNLOAD_PATH_ENV).ok().map(|v| v.trim().to_string()).filter(|v| !v.is_empty())
+    })
+    .clone()
+}
+
 
 /// Represents the configuration settings for the application.
 #[derive(Serialize, Deserialize, Debug)]
@@ -39,7 +75,8 @@ pub struct ConfigurationFile {
     name: String,                           // The name of the application.
     version: String,                        // The version of the application.
     description: String,                    // A brief description of the application.
-    /// Password of the built-in `admin` account, in plaintext. The database is made to
+    /// Password of the built-in `admin` account: in plaintext as generated (or typed in
+    /// by hand), or its Argon2id hash once changed in the UI. The database is made to
     /// match it on every startup; if missing or blank a random one is generated and
     /// saved here (see `users.rs`).
     #[serde(default)]
@@ -202,14 +239,6 @@ pub struct LoggingConfig {
     pub retention_days: u32,
 }
 
-// Dark Theme enum, part of AppearanceConfig that contains data about the theme.
-#[derive(Serialize, Deserialize, Clone, Debug)]
-pub enum DarkTheme {
-    Auto,
-    Dark,
-    Light,
-}
-
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct CardConfig {
     pub iccid: String,                          // ICCID
@@ -227,10 +256,9 @@ pub struct CardConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub company: Option<String>,
 }
-// UI Configuration structure, part of ConfigurationFile that contains data about how UI looks like.
+/// Desktop window behaviour. (The theme is per user, in the database: see `users.rs`.)
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct AppearanceConfig {
-    pub dark_theme: DarkTheme,
     /// Closing the window hides it to the tray instead of exiting. Defaulted so
     /// configs written before this field existed still parse.
     #[serde(default = "default_minimize_to_tray")]
@@ -541,15 +569,20 @@ pub fn update_connection_config(
     let _write = config_write_lock();
     let mut config = load_config(config_path)?;
 
+    // A pinned port (TCS_LISTEN_PORT) can't be changed: keep whatever the file has.
+    let stored_listen_port = match pinned_listen_port() {
+        Some(_) => config.connection.as_ref().map_or(DEFAULT_SERVER_LISTEN_PORT, |c| c.listen_port),
+        None => listen_port,
+    };
     config.connection = Some(ConnectionConfig {
-        listen_port,
+        listen_port: stored_listen_port,
         connection_limit,
     });
     save_config(config_path, &config)?;
     load_config_to_cache(&config)?;
 
     // Rebind / re-limit the running TCP server; no-op if neither value changed.
-    crate::socket_server::apply_settings(listen_port, connection_limit);
+    crate::socket_server::apply_settings(pinned_listen_port().unwrap_or(stored_listen_port), connection_limit);
 
     Ok(())
 }
@@ -562,6 +595,11 @@ pub fn update_download_config(
     let _write = config_write_lock();
     let mut config = load_config(config_path)?;
 
+    // A pinned folder (TCS_DOWNLOAD_PATH) can't be changed: keep whatever the file has.
+    let download_path = match pinned_download_path() {
+        Some(_) => config.download.as_ref().map_or_else(default_download_path, |d| d.download_path.clone()),
+        None => download_path,
+    };
     config.download = Some(DownloadConfig {
         download_path,
         retain_failed_downloads,
@@ -588,23 +626,15 @@ pub fn update_logging_config(
     Ok(())
 }
 
+#[cfg(feature = "desktop")] // window behaviour only
 pub fn update_appearance_config(
     config_path: &Path,
-    theme: &str,
     minimize_to_tray: bool,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let _write = config_write_lock();
     let mut config = load_config(config_path)?;
 
-    config.appearance = Some(AppearanceConfig {
-        dark_theme: match theme {
-            "Auto" => DarkTheme::Auto,
-            "Dark" => DarkTheme::Dark,
-            "Light" => DarkTheme::Light,
-            _ => DarkTheme::Auto,
-        },
-        minimize_to_tray,
-    });
+    config.appearance = Some(AppearanceConfig { minimize_to_tray });
     save_config(config_path, &config)?;
     load_config_to_cache(&config)?;
 
@@ -697,8 +727,9 @@ pub fn update_connection(listen_port: String, connection_limit: String) -> bool 
     }
 }
 
-#[cfg_attr(feature = "desktop", tauri::command)]
-pub fn update_appearance(theme: &str, minimize_to_tray: bool) -> bool {
+#[cfg(feature = "desktop")]
+#[tauri::command]
+pub fn update_appearance(minimize_to_tray: bool) -> bool {
     let config_path = match get_config_path() {
         Ok(path) => path,
         Err(e) => {
@@ -706,10 +737,10 @@ pub fn update_appearance(theme: &str, minimize_to_tray: bool) -> bool {
             return false;
         }
     };
-    log::info!("Updating appearance configuration: theme={}, minimize_to_tray={}", theme, minimize_to_tray);
-    match update_appearance_config(&config_path, theme, minimize_to_tray) {
+    log::info!("Updating appearance configuration: minimize_to_tray={}", minimize_to_tray);
+    match update_appearance_config(&config_path, minimize_to_tray) {
         Ok(_) => {
-            log::info!("The appearance configuration is updated: theme={}, minimize_to_tray={}", theme, minimize_to_tray);
+            log::info!("The appearance configuration is updated: minimize_to_tray={}", minimize_to_tray);
             true
         }
         Err(e) => {
@@ -939,7 +970,6 @@ pub fn get_from_cache(section: CacheSection, key: &str) -> String {
             if let Some(appearance) = &cache.appearance {
                 log::debug!("Appearance config: {:?}", appearance);
                 match key {
-                    "dark_theme" => format!("{:?}", appearance.dark_theme),
                     "minimize_to_tray" => appearance.minimize_to_tray.to_string(),
                     _ => {
                         log::debug!("Unknown key for appearance section: {}", key);
@@ -1015,13 +1045,32 @@ pub fn load_config_to_cache(
         }
     }
 
+    // Settings pinned by environment variables replace config.yaml's in the cache, which
+    // is what everything reads them from.
+    let mut connection = config.connection.clone();
+    if let Some(port) = pinned_listen_port() {
+        connection
+            .get_or_insert(ConnectionConfig {
+                listen_port: port,
+                connection_limit: DEFAULT_SERVER_CONNECTION_LIMIT,
+            })
+            .listen_port = port;
+    }
+    let mut download = config.download.clone();
+    if let Some(path) = pinned_download_path() {
+        match download.as_mut() {
+            Some(download) => download.download_path = path,
+            None => download = Some(DownloadConfig { download_path: path, retain_failed_downloads: false }),
+        }
+    }
+
     let mut cache = CACHE.lock().unwrap();
     *cache = CacheConfigData {
         cards: config.all_cards(),
-        connection: config.connection.clone(),
+        connection,
         appearance: config.appearance.clone(),
         logging: config.logging.clone(),
-        download: config.download.clone(),
+        download,
         companies: config.companies.clone(),
         imei_index,
     };
@@ -1120,8 +1169,9 @@ pub fn init_config() -> io::Result<()> {
         }
     }
 
-    // Built-in admin account: config.yaml holds its password. Missing or blank means
-    // generate a new one — which is also how a lost admin password is reset.
+    // Built-in admin account: config.yaml holds its password (or, once changed in the
+    // UI, its hash). Missing or blank means generate a new one — which is also how a
+    // lost admin password is reset.
     let admin_password = match &config.admin_password {
         Some(password) if !password.trim().is_empty() => password.clone(),
         _ => {
@@ -1163,10 +1213,7 @@ fn generate_default_config() -> ConfigurationFile {
         version: env!("CARGO_PKG_VERSION").to_string(),
         description: "Application for the tachograph cards authentication".to_string(),
         admin_password: None, // generated by init_config()
-        appearance: Some(AppearanceConfig {
-            dark_theme: DarkTheme::Auto,
-            minimize_to_tray: true,
-        }),
+        appearance: Some(AppearanceConfig { minimize_to_tray: true }),
         connection: Some(ConnectionConfig { listen_port: 7878, connection_limit: 100 }),
         download: Some(DownloadConfig { download_path: default_download_path(), retain_failed_downloads: false }),
         logging: Some(LoggingConfig { retention_days: DEFAULT_LOG_RETENTION_DAYS }),
@@ -1229,10 +1276,7 @@ mod tests {
             version: "0.0.0-test".to_string(),
             description: "test".to_string(),
             admin_password: Some("test-password".to_string()),
-            appearance: Some(AppearanceConfig {
-                dark_theme: DarkTheme::Auto,
-                minimize_to_tray: true,
-            }),
+            appearance: Some(AppearanceConfig { minimize_to_tray: true }),
             connection: Some(ConnectionConfig {
                 listen_port: 7878,
                 connection_limit: 100,
@@ -1451,6 +1495,16 @@ fn change_config<T>(change: impl FnOnce(&mut ConfigurationFile) -> Result<T, Str
     Ok(result)
 }
 
+/// Replaces `admin_password` in config.yaml, e.g. with the hash of a password changed in
+/// the UI. Blocking.
+#[cfg(not(feature = "desktop"))] // changed from the web UI's account menu
+pub fn set_admin_password(value: String) -> Result<(), String> {
+    change_config(|config| {
+        config.admin_password = Some(value);
+        Ok(())
+    })
+}
+
 /// Every company with its devices and cards, plus cards not assigned to any company.
 #[cfg_attr(feature = "desktop", tauri::command)]
 pub fn get_companies() -> CompaniesView {
@@ -1651,6 +1705,13 @@ pub fn assign_device(imei: String, company: Option<String>) -> Result<(), String
 pub struct RegisteredDevice {
     pub imei: String,
     pub company: String,
+    /// Vehicle registration from its latest verified download; `None` until it has one.
+    pub vrn: Option<String>,
+    /// Unix seconds of its latest authentication attempt, and whether it succeeded.
+    pub last_auth_at: Option<i64>,
+    pub last_auth_succeeded: Option<bool>,
+    /// Unix seconds of its latest verified download.
+    pub last_download_at: Option<i64>,
 }
 
 #[derive(Serialize, Clone, Debug)]
@@ -1670,16 +1731,34 @@ pub fn get_devices() -> DevicesView {
             .companies
             .iter()
             .flat_map(|(id, company)| {
-                company.devices.iter().map(|imei| RegisteredDevice { imei: imei.trim().to_string(), company: id.clone() })
+                company.devices.iter().map(|imei| RegisteredDevice {
+                    imei: imei.trim().to_string(),
+                    company: id.clone(),
+                    vrn: None,
+                    last_auth_at: None,
+                    last_auth_succeeded: None,
+                    last_download_at: None,
+                })
             })
             .collect();
         (cache.sole_company(), registered)
     };
     registered.sort_by(|a, b| a.company.cmp(&b.company).then(a.imei.cmp(&b.imei)));
+    let vrns = crate::database::latest_vrns_blocking();
     let unknown = crate::database::unknown_devices_blocking()
         .into_iter()
         .filter(|device| !registered.iter().any(|r| r.imei == device.imei))
+        .map(|device| crate::database::UnknownDevice { vrn: vrns.get(&device.imei).cloned(), ..device })
         .collect();
+    let auths = crate::database::device_auths_blocking();
+    let downloads = crate::database::last_downloads_blocking();
+    for device in &mut registered {
+        device.vrn = vrns.get(&device.imei).cloned();
+        let auth = auths.get(&device.imei);
+        device.last_auth_at = auth.map(|&(at, _)| at);
+        device.last_auth_succeeded = auth.map(|&(_, succeeded)| succeeded);
+        device.last_download_at = downloads.get(&device.imei).copied();
+    }
     DevicesView { sole_company, registered, unknown }
 }
 
@@ -1701,8 +1780,10 @@ fn config_payload() -> HashMap<&'static str, String> {
         ("download_path", get_from_cache(CacheSection::Download, "download_path")),
         ("retain_failed_downloads", get_from_cache(CacheSection::Download, "retain_failed_downloads")),
         ("retention_days", get_from_cache(CacheSection::Logging, "retention_days")),
-        ("dark_theme", get_from_cache(CacheSection::Appearance, "dark_theme")),
         ("minimize_to_tray", get_from_cache(CacheSection::Appearance, "minimize_to_tray")),
+        // Name of the environment variable pinning the setting, or empty if it isn't.
+        ("listen_port_env", pinned_listen_port().map_or("", |_| LISTEN_PORT_ENV).to_string()),
+        ("download_path_env", pinned_download_path().map_or("", |_| DOWNLOAD_PATH_ENV).to_string()),
     ])
 }
 
@@ -1739,7 +1820,6 @@ pub fn emit_global_config_logging() {
 
 pub fn emit_global_config_appearance() {
     let payload: HashMap<&'static str, String> = HashMap::from([
-        ("dark_theme", get_from_cache(CacheSection::Appearance, "dark_theme")),
         ("minimize_to_tray", get_from_cache(CacheSection::Appearance, "minimize_to_tray")),
     ]);
     emit("global-config-appearance", payload);

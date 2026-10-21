@@ -8,9 +8,13 @@
                 v-model.number="listenPortValue"
                 :min="1"
                 :max="65535"
+                :readonly="!!listenPortEnv"
+                :hint="listenPortEnv ? `Set by the ${listenPortEnv} environment variable` : undefined"
                 :rules="[inRange(1, 65535)]"
                 @keyup.enter="saveConfig"
-            />
+            >
+                <template v-if="listenPortEnv" #prepend><q-icon name="mdi-lock-outline" /></template>
+            </q-input>
             <q-input
                 label="Connection Limit"
                 dense
@@ -45,6 +49,8 @@ const listenPortValue = ref<number>(7878)
 const connectionLimitValue = ref<number>(100)
 const savedListenPort = ref(7878)
 const savedConnectionLimit = ref(100)
+// Set when the port is pinned by an environment variable (e.g. in Docker).
+const listenPortEnv = ref('')
 
 // True when every field is valid and something has changed
 const isValid = computed(
@@ -98,6 +104,7 @@ onMounted(async () => {
         savedListenPort.value = Number(config.listen_port)
         connectionLimitValue.value = Number(config.connection_limit)
         savedConnectionLimit.value = Number(config.connection_limit)
+        listenPortEnv.value = config.listen_port_env
     } catch (error) {
         console.error('Error loading connection configuration:', error)
     }

@@ -3,12 +3,18 @@
         <q-card-section>
             <q-input
                 label="Download Path"
-                hint="Each company's downloads are saved in a subfolder named after its id."
+                :hint="
+                    downloadPathEnv
+                        ? `Set by the ${downloadPathEnv} environment variable. Each company's downloads are saved in a subfolder named after its id.`
+                        : `Each company's downloads are saved in a subfolder named after its id.`
+                "
                 dense
                 v-model="downloadPathValue"
+                :readonly="!!downloadPathEnv"
                 @keyup.enter="saveConfig"
             >
-                <template v-if="isDesktop" #append>
+                <template v-if="downloadPathEnv" #prepend><q-icon name="mdi-lock-outline" /></template>
+                <template v-if="isDesktop && !downloadPathEnv" #append>
                     <q-btn flat round dense icon="mdi-folder-open" @click="browseDownloadPath">
                         <q-tooltip>Browse…</q-tooltip>
                     </q-btn>
@@ -45,6 +51,8 @@ const downloadPathValue = ref('')
 const retainFailedDownloadsValue = ref(false)
 const savedDownloadPath = ref('')
 const savedRetainFailedDownloads = ref(false)
+// Set when the folder is pinned by an environment variable (e.g. in Docker).
+const downloadPathEnv = ref('')
 
 // The download interval is per company (Companies tab), not here.
 const isValid = computed(
@@ -120,6 +128,7 @@ onMounted(async () => {
         savedDownloadPath.value = config.download_path
         retainFailedDownloadsValue.value = config.retain_failed_downloads === 'true'
         savedRetainFailedDownloads.value = config.retain_failed_downloads === 'true'
+        downloadPathEnv.value = config.download_path_env
     } catch (error) {
         console.error('Error loading download configuration:', error)
     }

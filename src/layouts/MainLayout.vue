@@ -27,17 +27,51 @@
                 <div class="q-pa-xs q-gutter-sm">
                     <q-btn flat round icon="mdi-cog" @click="configOpen = true" />
                     <ServerConfigDialog v-model="configOpen" />
-                    <q-btn v-if="!isDesktop" flat round icon="mdi-account-circle">
+                    <!-- Account menu. The desktop app has no login, so it only has the theme. -->
+                    <q-btn
+                        flat
+                        round
+                        :icon="isDesktop ? 'mdi-theme-light-dark' : 'mdi-account-circle'"
+                    >
                         <q-menu>
-                            <q-list style="min-width: 160px">
-                                <q-item-label header>Logged in as {{ currentUser }}</q-item-label>
-                                <q-item v-close-popup clickable @click="logout">
-                                    <q-item-section avatar><q-icon name="mdi-logout" /></q-item-section>
-                                    <q-item-section>Log out</q-item-section>
+                            <q-list style="min-width: 200px">
+                                <q-item-label v-if="!isDesktop" header>
+                                    Logged in as {{ currentUser }}
+                                </q-item-label>
+                                <q-item>
+                                    <q-item-section>
+                                        <div class="text-caption text-grey q-mb-xs">Theme</div>
+                                        <q-btn-toggle
+                                            :model-value="theme"
+                                            no-caps
+                                            rounded
+                                            unelevated
+                                            size="sm"
+                                            toggle-color="primary"
+                                            :options="THEME_OPTIONS"
+                                            @update:model-value="changeTheme"
+                                        />
+                                    </q-item-section>
                                 </q-item>
+                                <template v-if="!isDesktop">
+                                    <q-separator />
+                                    <q-item v-close-popup clickable @click="passwordOpen = true">
+                                        <q-item-section avatar>
+                                            <q-icon name="mdi-key-variant" />
+                                        </q-item-section>
+                                        <q-item-section>Change password</q-item-section>
+                                    </q-item>
+                                    <q-item v-close-popup clickable @click="logout">
+                                        <q-item-section avatar>
+                                            <q-icon name="mdi-logout" />
+                                        </q-item-section>
+                                        <q-item-section>Log out</q-item-section>
+                                    </q-item>
+                                </template>
                             </q-list>
                         </q-menu>
                     </q-btn>
+                    <ChangePasswordDialog v-if="!isDesktop" v-model="passwordOpen" />
                 </div>
             </q-toolbar>
         </q-header>
@@ -57,17 +91,39 @@
 <script setup lang="ts">
 import { Notify } from 'quasar'
 import { ref, onMounted, onUnmounted } from 'vue'
-import { currentUser, isDesktop, listen, logout, type UnlistenFn } from 'src/backend'
+import { currentUser, invoke, isDesktop, listen, logout, type UnlistenFn } from 'src/backend'
 import 'animate.css'
+import ChangePasswordDialog from 'src/components/ChangePasswordDialog.vue'
 import ServerConfigDialog from 'src/components/ServerConfigDialog.vue'
-import { applyTheme, getConfig, type AppConfig } from 'src/utils'
+import { applyTheme, THEME_OPTIONS } from 'src/utils'
 
 defineOptions({
     name: 'MainLayout',
 })
 
 const configOpen = ref(false)
+const passwordOpen = ref(false)
 const serverStatus = ref(-1)
+
+// The logged-in user's theme (admin's on the desktop). Applied straight away, then saved.
+const theme = ref('Auto')
+const changeTheme = async (value: string) => {
+    const previous = theme.value
+    theme.value = value
+    applyTheme(value)
+    try {
+        await invoke('set_my_theme', { theme: value })
+    } catch (error) {
+        theme.value = previous
+        applyTheme(previous)
+        Notify.create({
+            message: typeof error === 'string' ? `Failed to save the theme: ${error}` : 'Failed to save the theme.',
+            color: 'red',
+            position: 'bottom',
+            timeout: 4000,
+        })
+    }
+}
 
 // Registered Tauri listeners. Stored so we can detach them on unmount —
 // otherwise stale handlers keep mutating dead reactive state and pile up
@@ -78,18 +134,11 @@ const ACCESS_NOTIFICATION_TEXT =
     "The application cannot access the directory '~/Documents/tcs' and cannot continue to operate. Perhaps such a directory has already been created by another version of the program, therefore it has local access restrictions. A possible solution may be: rename the current directory, for example, to tcs1 and restart the application. It will create a new directory with the necessary access rights."
 
 onMounted(async () => {
-    // Apply the saved theme at startup (and after a webview reload). Lives here rather
-    // than in the config dialog, whose contents only exist while it's open. The event is
-    // triggered by TachoMainComponent's `frontend-loaded`, which can race this listener
-    // being registered, so also fetch once afterwards: whichever arrives first applies.
-    // Empty means the backend hasn't loaded its config yet; the event will follow.
+    // Apply the user's theme. The layout is rebuilt after each login, so a different
+    // user gets theirs.
     try {
-        const unlisten = await listen('global-config-appearance', (event) => {
-            applyTheme((event.payload as AppConfig).dark_theme)
-        })
-        unlistenFns.push(unlisten)
-        const { dark_theme } = await getConfig()
-        if (dark_theme) applyTheme(dark_theme)
+        theme.value = await invoke<string>('get_my_theme')
+        applyTheme(theme.value)
     } catch (error) {
         console.error('Error loading theme:', error)
     }

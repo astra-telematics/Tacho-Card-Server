@@ -10,7 +10,8 @@
         <q-tab name="connection" icon="mdi-lan-connect" label="Connection" />
         <q-tab name="download" icon="mdi-download" label="Download" />
         <q-tab name="logging" icon="mdi-text-box-outline" label="Logging" />
-        <q-tab name="appearance" icon="mdi-palette" label="Appearance" />
+        <!-- Window behaviour, desktop only. The theme is per user, in the account menu. -->
+        <q-tab v-if="isDesktop" name="appearance" icon="mdi-application-outline" label="Window" />
       </q-tabs>
 
       <q-separator />
@@ -26,7 +27,7 @@
         <q-tab-panel name="logging">
           <LoggingConfigSection />
         </q-tab-panel>
-        <q-tab-panel name="appearance">
+        <q-tab-panel v-if="isDesktop" name="appearance">
           <AppearanceConfigSection />
         </q-tab-panel>
       </q-tab-panels>
@@ -40,6 +41,7 @@
 
 <script setup lang="ts">
 import { ref } from 'vue'
+import { isDesktop } from 'src/backend'
 import ConnectionConfigSection from 'src/components/config/ConnectionConfigSection.vue'
 import DownloadConfigSection from 'src/components/config/DownloadConfigSection.vue'
 import LoggingConfigSection from 'src/components/config/LoggingConfigSection.vue'

@@ -1,5 +1,6 @@
-# Tacho Card Server, headless. On a Synology NAS: Container Manager → Project → Create,
-# with this file, in a folder such as /volume1/docker/tcs.
+# Tacho Card Server, headless. Put this file in a folder such as /volume1/docker/tcs and
+# run `docker-compose up -d` there. Create the folders mounted below (./data and the
+# downloads folder) first: Synology's Docker won't create a missing bind-mount folder.
 #
 # First start: the admin password is generated and saved in ./data/config.yaml
 # (admin_password). Log in to the web UI as "admin" with it.
@@ -13,17 +14,21 @@ services:
     restart: unless-stopped
     # Reaps pcscd if it exits, and forwards docker stop's SIGTERM to the server.
     init: true
+    # host:container. The container side is fixed by the image (and read-only in the
+    # UI); to use other ports, change only the host side, e.g. "17878:7878".
     ports:
-      # Devices connect here: the one port to open in the firewall. Must match
-      # connection.listen_port in config.yaml (7878 unless changed).
+      # Devices connect here: the one port to open in the firewall.
       - "7878:7878"
       # Web UI. Plain HTTP: keep it on the LAN, e.g. "192.168.1.10:8080:8080" to listen
       # on one address, or put it behind a TLS reverse proxy (DSM: Control Panel → Login
       # Portal → Advanced → Reverse Proxy, with a Let's Encrypt certificate).
       - "8080:8080"
     volumes:
-      # config.yaml, tcs.db, logs/ and downloads/.
+      # config.yaml, tcs.db and logs/.
       - ./data:/data
+      # Downloaded tachograph files, one subfolder per company. Point the left side at
+      # wherever they should go, e.g. a shared folder: "/volume1/tacho-downloads:/downloads".
+      - ./downloads:/downloads
     devices:
       # The USB card reader(s), for the container's own pcscd.
       - /dev/bus/usb:/dev/bus/usb
@@ -34,4 +39,3 @@ services:
     environment:
       # Download intervals count calendar days in this time zone.
       TZ: Europe/London
-      # TCS_WEB_PORT: "8080"   # change the port mapping above to match

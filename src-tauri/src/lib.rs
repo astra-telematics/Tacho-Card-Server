@@ -93,12 +93,20 @@ fn run_headless(web_port: u16) {
 
     logger::setup_logging();
 
+    if let Some(port) = config::pinned_listen_port() {
+        log::info!("[CONFIG] listen_port={} pinned_by={}", port, config::LISTEN_PORT_ENV);
+    }
+    if let Some(path) = config::pinned_download_path() {
+        log::info!("[CONFIG] download_path={:?} pinned_by={}", path, config::DOWNLOAD_PATH_ENV);
+    }
+
     rt::spawn(async {
         smart_card::sc_monitor().await;
     });
 
     rt::spawn(async {
-        // listen_port / connection_limit come from the `connection` section of config.yaml;
+        // listen_port / connection_limit come from the `connection` section of config.yaml
+        // (or TCS_LISTEN_PORT);
         // changes saved from the UI are applied live (see socket_server::apply_settings).
         let listen_port: u16 = get_from_cache(CacheSection::Connection, "listen_port").parse().unwrap_or(config::DEFAULT_SERVER_LISTEN_PORT);
         let connection_limit: u16 = get_from_cache(CacheSection::Connection, "connection_limit").parse().unwrap_or(config::DEFAULT_SERVER_CONNECTION_LIMIT);

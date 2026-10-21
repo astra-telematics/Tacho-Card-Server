@@ -690,6 +690,9 @@ async fn handle_connection(mut stream: TcpStream, peer_addr: SocketAddr, over_so
                         } else {
                             let guard = card.as_ref().unwrap();
                             log::info!("[TCP] peer={} action=auth_outcome success={}", peer_addr, auth_outcome_message.success);
+                            if let Some(imei) = imei.as_deref() {
+                                crate::database::record_device_auth(imei, auth_outcome_message.success).await;
+                            }
 
                             // Cache-only, same transparency invariant as the sniffer hook
                             // above: never touch the card ourselves to find this out.
