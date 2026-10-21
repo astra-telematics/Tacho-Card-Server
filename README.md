@@ -140,6 +140,16 @@ image sets both, so change ports with the host side of the compose port mappings
 
 Unit tests run in the headless build: `cargo test --no-default-features --lib`.
 
+### Releasing
+
+Push a tag `v<version>`, e.g. `git tag v1.2.3 && git push origin v1.2.3`. The build
+workflow sets that version in package.json, tauri.conf.json and Cargo.toml (with their
+lock files) before building, then publishes the GitHub release and Docker image, so
+nothing needs bumping by hand. A tag with a `-` (e.g. `v1.2.3-1`) is a pre-release. The
+Windows MSI only accepts a numeric pre-release (`-1`, not `-rc.1`).
+
+To set the version locally: `node scripts/set-version.mjs 1.2.3`.
+
 ## Icon generating & customizing
 
 The project stores icons in a directory: **src-tauri/icons**

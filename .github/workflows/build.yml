@@ -19,6 +19,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Release builds take their version from the tag (v1.2.3 -> 1.2.3), so the
+      # version in the repo never has to be bumped by hand. Other builds keep it.
+      - name: Set version from the release tag
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: node scripts/set-version.mjs "${{ github.ref_name }}"
+
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
@@ -61,6 +67,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Release builds take their version from the tag (v1.2.3 -> 1.2.3), so the
+      # version in the repo never has to be bumped by hand. Other builds keep it.
+      - name: Set version from the release tag
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: node scripts/set-version.mjs "${{ github.ref_name }}"
+
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
@@ -94,6 +106,12 @@ jobs:
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
+
+      # Release builds take their version from the tag (v1.2.3 -> 1.2.3), so the
+      # version in the repo never has to be bumped by hand. Other builds keep it.
+      - name: Set version from the release tag
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: node scripts/set-version.mjs "${{ github.ref_name }}"
 
       - name: Install system dependencies (Tauri + PCSC + AppImage)
         run: |
@@ -142,6 +160,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Release builds take their version from the tag (v1.2.3 -> 1.2.3), so the
+      # version in the repo never has to be bumped by hand. Other builds keep it.
+      - name: Set version from the release tag
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: node scripts/set-version.mjs "${{ github.ref_name }}"
+
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
@@ -183,6 +207,12 @@ jobs:
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
+
+      # Release builds take their version from the tag (v1.2.3 -> 1.2.3), so the
+      # version in the repo never has to be bumped by hand. Other builds keep it.
+      - name: Set version from the release tag
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: node scripts/set-version.mjs "${{ github.ref_name }}"
 
       - name: Install system dependencies (PCSC, OpenSSL, udev for serialport)
         run: |
@@ -239,6 +269,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Release builds take their version from the tag (v1.2.3 -> 1.2.3), so the
+      # version in the repo never has to be bumped by hand. Other builds keep it.
+      - name: Set version from the release tag
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: node scripts/set-version.mjs "${{ github.ref_name }}"
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
@@ -281,15 +317,6 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@v4
-
-      - name: Verify tag matches package.json version
-        run: |
-          PKG_VERSION=$(node -p "require('./package.json').version")
-          TAG_VERSION="${GITHUB_REF_NAME#v}"
-          if [ "$PKG_VERSION" != "$TAG_VERSION" ]; then
-            echo "::error::Tag $GITHUB_REF_NAME does not match package.json version $PKG_VERSION"
-            exit 1
-          fi
 
       # Only our tcs-* artifacts: docker/build-push-action also uploads a build record
       # (<repo>~<id>.dockerbuild), which isn't a release asset.
