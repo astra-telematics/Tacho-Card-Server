@@ -10,6 +10,24 @@
                         :color="serverStatus >= 0 ? 'green' : undefined"
                     />
                     <span class="q-ml-xs">{{ serverStatus }}</span>
+                    <!-- Downloads in progress: details on hover, per device on the Devices page. -->
+                    <q-chip
+                        v-if="activeDownloads.length > 0"
+                        dense
+                        clickable
+                        color="white"
+                        text-color="primary"
+                        class="q-ml-md"
+                        @click="router.push('/devices')"
+                    >
+                        <q-spinner-dots size="1em" class="q-mr-xs" />
+                        {{ activeDownloads.length }} downloading
+                        <q-tooltip>
+                            <div v-for="download in activeDownloads" :key="download.imei">
+                                {{ download.imei }}: {{ formatBytes(download.bytes) }}
+                            </div>
+                        </q-tooltip>
+                    </q-chip>
                 </q-toolbar-title>
 
                 <q-tabs inline-label no-caps shrink>
@@ -93,6 +111,8 @@ import { Notify } from 'quasar'
 import { ref, onMounted, onUnmounted } from 'vue'
 import { currentUser, invoke, isDesktop, listen, logout, type UnlistenFn } from 'src/backend'
 import 'animate.css'
+import { useRouter } from 'vue-router'
+import { activeDownloads, formatBytes, trackActiveDownloads } from 'src/activeDownloads'
 import ChangePasswordDialog from 'src/components/ChangePasswordDialog.vue'
 import ServerConfigDialog from 'src/components/ServerConfigDialog.vue'
 import { applyTheme, THEME_OPTIONS } from 'src/utils'
@@ -101,6 +121,7 @@ defineOptions({
     name: 'MainLayout',
 })
 
+const router = useRouter()
 const configOpen = ref(false)
 const passwordOpen = ref(false)
 const serverStatus = ref(-1)
@@ -141,6 +162,12 @@ onMounted(async () => {
         applyTheme(theme.value)
     } catch (error) {
         console.error('Error loading theme:', error)
+    }
+
+    try {
+        unlistenFns.push(await trackActiveDownloads())
+    } catch (error) {
+        console.error('Error following active downloads:', error)
     }
 
     try {

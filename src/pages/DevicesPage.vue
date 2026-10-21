@@ -151,7 +151,14 @@
                                 </template>
                                 <span v-else class="text-grey">—</span>
                             </td>
-                            <td :class="{ 'text-grey': !device.last_download_at }">
+                            <td v-if="downloading(device.imei)" class="text-primary">
+                                <q-spinner-dots size="1.2em" class="q-mr-xs" />
+                                Downloading… {{ formatBytes(downloading(device.imei)!.bytes) }}
+                                <q-tooltip>
+                                    Started {{ formatTime(downloading(device.imei)!.started_at) }}
+                                </q-tooltip>
+                            </td>
+                            <td v-else :class="{ 'text-grey': !device.last_download_at }">
                                 {{ device.last_download_at ? formatTime(device.last_download_at) : '—' }}
                             </td>
                             <td style="min-width: 180px">
@@ -186,7 +193,8 @@
 </template>
 
 <script setup lang="ts">
-import { computed, onActivated, onMounted, ref } from 'vue'
+import { computed, onActivated, onMounted, ref, watch } from 'vue'
+import { activeDownloads, formatBytes } from 'src/activeDownloads'
 import { Notify } from 'quasar'
 import { invoke } from 'src/backend'
 import type { CompaniesView, DevicesView } from 'src/components/models'
@@ -222,6 +230,16 @@ const load = async () => {
 // Reload whenever the page is shown: it's kept alive between visits.
 onMounted(load)
 onActivated(load)
+
+// The device's download in progress, if any.
+const downloading = (imei: string) => activeDownloads.value.find((d) => d.imei === imei)
+// When one finishes, reload for its new "Last download" time.
+watch(
+    () => activeDownloads.value.length,
+    (count, previous) => {
+        if (count < previous) void load()
+    },
+)
 
 const companyName = (id: string) => companies.value.find((c) => c.id === id)?.name ?? id
 const soleCompanyName = computed(() =>

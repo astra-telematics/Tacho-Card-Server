@@ -157,6 +157,7 @@ pub fn run() {
             config::assign_card,           // move a card to a company, or unassign it
             config::assign_device,         // register a device (IMEI) to a company, or unregister it
             config::get_devices,           // registered and unknown devices
+            crate::download_activity::get_active_downloads, // downloads in progress
             config::remove_card,           // remove card from config
             users::get_users,              // user accounts, for the Users page
             users::add_user,               // create a user

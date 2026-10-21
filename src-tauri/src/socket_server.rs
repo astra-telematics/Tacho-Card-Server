@@ -722,6 +722,12 @@ async fn handle_connection(mut stream: TcpStream, peer_addr: SocketAddr, over_so
                                 "[TCP] peer={} action=download_start generation={} data_types={:#04x}",
                                 peer_addr, download_start_message.generation, download_start_message.data_types
                             );
+                            crate::download_activity::started(
+                                &peer_addr.to_string(),
+                                imei.as_deref().unwrap_or_default(),
+                                company.as_deref().unwrap_or(DEFAULT_COMPANY_ID),
+                                download_start_message.generation,
+                            );
                         }
                     },
                     Message::DownloadChunk(download_chunk_message) => {
@@ -734,6 +740,7 @@ async fn handle_connection(mut stream: TcpStream, peer_addr: SocketAddr, over_so
                         } else {
                             log::debug!("[TCP] peer={} action=download_chunk len={} total={}", peer_addr, download_chunk_message.data.len(), download_buffer.len() + download_chunk_message.data.len());
                             download_buffer.extend_from_slice(&download_chunk_message.data);
+                            crate::download_activity::progress(&peer_addr.to_string(), download_buffer.len());
                         }
                     },
                     Message::DownloadComplete(download_complete_message) => {
@@ -742,6 +749,7 @@ async fn handle_connection(mut stream: TcpStream, peer_addr: SocketAddr, over_so
                             log::warn!("[TCP] peer={} message=DownloadComplete action=abort reason=no_download_started", peer_addr);
                         } else {
                             let (generation, data_types) = download_meta.unwrap();
+                            crate::download_activity::finished(&peer_addr.to_string());
                             let actual_crc32 = crate::vu_download::compute_crc32(&download_buffer);
                             let matches = actual_crc32 == download_complete_message.crc32;
                             log::info!(
@@ -893,6 +901,9 @@ async fn handle_connection(mut stream: TcpStream, peer_addr: SocketAddr, over_so
             }
         }
     }
+
+    // No longer downloading, however the connection ended.
+    crate::download_activity::finished(&peer_addr.to_string());
 
     // A download that was in progress but never reached DownloadComplete (e.g. the
     // device disconnected mid-transfer, as seen in testing) would otherwise just

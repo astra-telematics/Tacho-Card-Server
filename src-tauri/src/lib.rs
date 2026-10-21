@@ -8,6 +8,7 @@ mod socket_server;      // TCP listen server (replacement for the outbound MQTT 
 mod device_protocol;    // Device protocol message definitions and parsing.
 mod card_pool;          // Bounded pool of physical cards shared across authenticating devices.
 mod vu_download;        // VU data download: CRC verification, VRN extraction, storage.
+mod download_activity;  // Downloads in progress, for the UI.
 mod database;           // SQLite: download history (download interval) and card session lengths.
 mod users;              // User accounts (database) and the built-in admin, whose password is in config.yaml.
 mod company_directory;  // Which company a device belongs to (IMEI registry today; tracking platform later).
@@ -69,6 +70,7 @@ pub(crate) fn emit_settings() {
 pub(crate) fn resend_state() {
     config::emit_card_configs();
     emit_settings();
+    download_activity::emit_active_downloads();
     rt::spawn(async {
         if let Err(e) = smart_card::manual_sync_cards(String::new(), false).await {
             log::error!("Failed to resync readers: {}", e);
