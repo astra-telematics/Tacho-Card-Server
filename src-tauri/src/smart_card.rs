@@ -745,6 +745,8 @@ impl ManagedCard {
 
         let card = Arc::clone(&self.inner);
         let reader_name = self.reader_name.to_string_lossy().into_owned();
+        // See `collect_waiting_data`.
+        let fetch_waiting_data = self.protocol() == Protocols::T0 && has_le_after_data(&apdu);
 
         debug!(
             "Cloned card for blocking transmission. Sending to spawn_blocking..."
@@ -758,11 +760,10 @@ impl ManagedCard {
             let mut locked = card.blocking_lock();
             debug!("Lock acquired. Transmitting...");
 
-            match catch_pcsc_panic(|| locked.transmit(&apdu, &mut rapdu_buf)) {
+            let first = match catch_pcsc_panic(|| locked.transmit(&apdu, &mut rapdu_buf)) {
                 Ok(Ok(response)) => {
-                    let encoded = hex::encode(response);
-                    debug!("APDU transmit success. Encoded response: {}", encoded);
-                    Ok(encoded)
+                    debug!("APDU transmit success. Encoded response: {}", hex::encode(response));
+                    Ok(response.to_vec())
                 }
                 // The card can be reset by something entirely outside our control —
                 // on Windows, most commonly the OS's own Smart Card Plug and Play
@@ -776,9 +777,8 @@ impl ManagedCard {
                     match catch_pcsc_panic(|| locked.reconnect(ShareMode::Shared, Protocols::ANY, Disposition::LeaveCard)) {
                         Ok(Ok(())) => match catch_pcsc_panic(|| locked.transmit(&apdu, &mut rapdu_buf)) {
                             Ok(Ok(response)) => {
-                                let encoded = hex::encode(response);
-                                debug!("APDU transmit succeeded after reset-recovery. Encoded response: {}", encoded);
-                                Ok(encoded)
+                                debug!("APDU transmit succeeded after reset-recovery. Encoded response: {}", hex::encode(response));
+                                Ok(response.to_vec())
                             }
                             Ok(Err(err)) => {
                                 error!("APDU transmit failed again after reset-recovery: {}", err);
@@ -807,7 +807,25 @@ impl ManagedCard {
                     error!("APDU transmit panicked: {}", panic_err);
                     Err(format!("Transmit panicked: {}", panic_err))
                 }
+            };
+
+            let response = first?;
+            if !fetch_waiting_data || waiting_bytes(&response).is_none() {
+                return Ok::<_, String>(hex::encode(response));
             }
+            debug!("Card has data waiting ({}); fetching it with GET RESPONSE", hex::encode(&response));
+            let response = collect_waiting_data(response, |command| {
+                let mut buf = [0u8; MAX_BUFFER_SIZE];
+                match catch_pcsc_panic(|| locked.transmit(command, &mut buf)) {
+                    Ok(Ok(response)) => {
+                        debug!("GET RESPONSE {} -> {}", hex::encode(command), hex::encode(response));
+                        Ok(response.to_vec())
+                    }
+                    Ok(Err(err)) => Err(format!("GET RESPONSE failed: {}", err)),
+                    Err(panic_err) => Err(format!("GET RESPONSE panicked: {}", panic_err)),
+                }
+            })?;
+            Ok(hex::encode(response))
         })
         .await??;
 
@@ -931,6 +949,105 @@ impl ManagedCard {
         Ok(iccid)
     }
 
+}
+
+/// Whether a short command APDU ends with Le after its data (case 4: data both ways).
+/// A VU talking T=1 sends those whole. On T=0 the Le of a case 4 command isn't sent,
+/// so a VU talking T=0 leaves it off.
+fn has_le_after_data(apdu: &[u8]) -> bool {
+    apdu.len() > 5 && apdu[4] != 0 && apdu.len() == 5 + apdu[4] as usize + 1
+}
+
+/// `Some(xx)` if the response is `61 xx`, the T=0 "xx bytes waiting" status
+/// (`xx` = 00 means 256).
+fn waiting_bytes(response: &[u8]) -> Option<u8> {
+    match response {
+        [.., 0x61, available] => Some(*available),
+        _ => None,
+    }
+}
+
+/// The most GET RESPONSEs to send for one command. At up to 256 bytes each, that's far
+/// more than any tachograph card response.
+const MAX_GET_RESPONSES: usize = 16;
+
+/// Under T=0 a card can't return a case 4 command's data with its status: it answers
+/// `61 xx` and the terminal fetches the data with GET RESPONSE (ISO/IEC 7816-4). That's
+/// part of how T=0 carries an APDU, so a VU talking T=1 never expects it: a T=1 card
+/// answers with the data and `90 00` in one go, and the VU fails the authentication if
+/// it gets `61 xx` (seen on a real truck, on Gen2 chip authentication's GENERAL
+/// AUTHENTICATE).
+///
+/// So when the card is on T=0 and the VU sent a case 4 command the T=1 way (with Le),
+/// the waiting data is fetched here and the VU gets the whole response, as a T=1 card
+/// would send it. A VU talking T=0 sends case 4 commands without Le and handles `61 xx`
+/// itself, so its commands pass through untouched. `transmit` sends one APDU to the card.
+fn collect_waiting_data(
+    first: Vec<u8>,
+    mut transmit: impl FnMut(&[u8]) -> Result<Vec<u8>, String>,
+) -> Result<Vec<u8>, String> {
+    let mut data = Vec::new();
+    let mut response = first;
+    for _ in 0..MAX_GET_RESPONSES {
+        let Some(available) = waiting_bytes(&response) else {
+            data.extend_from_slice(&response);
+            return Ok(data);
+        };
+        // Any data before `61 xx` is part of the response too.
+        data.extend_from_slice(&response[..response.len() - 2]);
+        response = transmit(&[0x00, 0xC0, 0x00, 0x00, available])?;
+    }
+    Err(format!("card still had data waiting after {} GET RESPONSEs", MAX_GET_RESPONSES))
+}
+
+#[cfg(test)]
+mod get_response_tests {
+    use super::*;
+
+    #[test]
+    fn le_after_data_is_only_on_case_4_commands_sent_whole() {
+        // GENERAL AUTHENTICATE from the truck: 5-byte header, 0x45 bytes of data, Le.
+        let mut general_authenticate = vec![0x00, 0x86, 0x00, 0x00, 0x45];
+        general_authenticate.extend(std::iter::repeat(0xAA).take(0x45));
+        assert!(!has_le_after_data(&general_authenticate)); // as a T=0 VU sends it
+        general_authenticate.push(0x00);
+        assert!(has_le_after_data(&general_authenticate)); // as a T=1 VU sends it
+
+        assert!(!has_le_after_data(&hex::decode("00a4020c020002").unwrap())); // SELECT: case 3
+        assert!(!has_le_after_data(&hex::decode("00b0000012").unwrap())); // READ BINARY: case 2
+        assert!(!has_le_after_data(&hex::decode("0084000008").unwrap())); // GET CHALLENGE: case 2
+    }
+
+    #[test]
+    fn waiting_data_is_fetched_and_joined() {
+        let waiting: Vec<u8> = (0..0x16).collect();
+        let mut sent = Vec::new();
+        let response = collect_waiting_data(vec![0x61, 0x16], |command| {
+            sent.push(command.to_vec());
+            Ok([waiting.as_slice(), &[0x90, 0x00]].concat())
+        })
+        .unwrap();
+        assert_eq!(sent, vec![vec![0x00, 0xC0, 0x00, 0x00, 0x16]]);
+        assert_eq!(response, [waiting.as_slice(), &[0x90, 0x00]].concat());
+    }
+
+    #[test]
+    fn data_waiting_in_several_parts_is_fetched_until_the_end() {
+        let mut replies = vec![vec![0x01, 0x02, 0x61, 0x01], vec![0x03, 0x90, 0x00]].into_iter();
+        let response = collect_waiting_data(vec![0x61, 0x02], |_| Ok(replies.next().unwrap())).unwrap();
+        assert_eq!(response, vec![0x01, 0x02, 0x03, 0x90, 0x00]);
+    }
+
+    #[test]
+    fn a_final_response_is_returned_as_is() {
+        let response = collect_waiting_data(vec![0x69, 0x82], |_| panic!("nothing to fetch")).unwrap();
+        assert_eq!(response, vec![0x69, 0x82]);
+    }
+
+    #[test]
+    fn a_card_that_never_finishes_is_an_error() {
+        assert!(collect_waiting_data(vec![0x61, 0x01], |_| Ok(vec![0x00, 0x61, 0x01])).is_err());
+    }
 }
 
 #[cfg(test)]
