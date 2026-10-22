@@ -47,8 +47,9 @@ fn list(active: &HashMap<String, Entry>) -> Vec<ActiveDownload> {
     downloads
 }
 
-/// A connection has started a download (`DownloadStart`). Replaces any it had.
-pub fn started(connection: &str, imei: &str, company: &str, generation: u8) {
+/// A connection has started a download (`DownloadStart`), or resumed one with `bytes`
+/// already received (a resumed one, see `partial_downloads`). Replaces any it had.
+pub fn started(connection: &str, imei: &str, company: &str, generation: u8, bytes: usize) {
     let downloads = {
         let mut active = active();
         active.insert(
@@ -58,7 +59,7 @@ pub fn started(connection: &str, imei: &str, company: &str, generation: u8) {
                     imei: imei.to_string(),
                     company: company.to_string(),
                     started_at: chrono::Utc::now().timestamp(),
-                    bytes: 0,
+                    bytes,
                     generation,
                 },
                 last_emitted: Instant::now(),
@@ -119,7 +120,7 @@ mod tests {
     #[test]
     fn a_download_is_listed_from_start_to_finish() {
         let connection = "192.0.2.10:5000";
-        started(connection, "356938035643809", "acme", 2);
+        started(connection, "356938035643809", "acme", 2, 0);
         assert_eq!(for_connection(connection).map(|d| (d.bytes, d.company)), Some((0, "acme".to_string())));
         assert!(get_active_downloads().iter().any(|d| d.imei == "356938035643809"));
 

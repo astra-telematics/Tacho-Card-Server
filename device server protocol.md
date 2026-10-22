@@ -73,3 +73,23 @@ Raw payload? More info?
 ### 7: Abort
 
 Reason?
+
+## Resuming a download
+
+If the connection drops while the device is handing over a download, the server keeps
+what it received for 15 minutes. The device keeps its VU session, reconnects and sends
+Connection Announce with one extra byte after the firmware version: 1 = resuming a
+download (absent or 0 = not).
+
+- **Accepted (1):** no Ready follows and no card is involved. The device carries on
+  sending Download Chunks, which the server adds to what it already has, then
+  Download Complete with the CRC32 of the whole file as usual. A chunk lost in the
+  drop shows up as a CRC mismatch, and the Download Ack tells the device to download
+  again.
+- **Try again later (2):** there's nothing to resume (the server restarted, more than
+  15 minutes passed, or the download was already finished or replaced). The device
+  gives up the resume and starts over after the retry time.
+- **Reject (0):** the IMEI isn't registered, as for any announce.
+
+A partial download that isn't resumed, or that the device replaces with a new Download
+Start, is recorded as incomplete.

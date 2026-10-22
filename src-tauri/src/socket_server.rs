@@ -37,6 +37,10 @@ use crate::global_app_handle::server_emit_event;
 /// worth (~30 s in testing): sooner than that, nothing will have changed.
 const MIN_CONNECTION_LIMIT_RETRY: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// When a device asking to resume a download is told to try again: there was nothing to
+/// resume, so it gives up the resume and starts over, which needs a card again.
+const NOTHING_TO_RESUME_RETRY: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// How long a freshly-accepted connection has to send `ConnAnnounce` before it's
 /// dropped.
 const CONN_ANNOUNCE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
@@ -114,6 +118,17 @@ impl CompanySlot {
         }
         *count += 1;
         Some(Self { company: company.to_string() })
+    }
+}
+
+impl CompanySlot {
+    /// Claims a slot even if `company` is at its limit: for a device resuming a
+    /// download, which holds no card and whose VU session would be lost if it were
+    /// turned away.
+    fn claim(company: &str) -> Self {
+        let mut connections = COMPANY_CONNECTIONS.lock().unwrap_or_else(|p| p.into_inner());
+        *connections.entry(company.to_string()).or_insert(0) += 1;
+        Self { company: company.to_string() }
     }
 }
 
@@ -205,6 +220,7 @@ pub async fn run(listen_port: u16, connection_limit: u16) {
 
     let active_connections = Arc::new(AtomicUsize::new(0));
     let updater = tokio::spawn(server_status_updater(Arc::clone(&active_connections)));
+    let sweeper = tokio::spawn(partial_download_sweeper());
     let mut listener = bind(current.listen_port, current.connection_limit).await;
 
     loop {
@@ -280,6 +296,7 @@ pub async fn run(listen_port: u16, connection_limit: u16) {
         });
     }
     updater.abort();
+    sweeper.abort();
 }
 
 /// Sends a `ConnResponse`; `retry_after` is only meaningful with `TryAgainLater`.
@@ -297,6 +314,66 @@ async fn send_conn_response(
     .into();
     let _ = stream.write_all(&reply_bytes).await;
     retry_after_seconds
+}
+
+/// Records, as incomplete, the partial downloads that weren't resumed in time.
+async fn partial_download_sweeper() {
+    loop {
+        tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+        for partial in crate::partial_downloads::take_expired() {
+            let context = format!("IMEI={} reason=not_resumed", partial.imei);
+            record_incomplete_download(&context, partial).await;
+        }
+    }
+}
+
+/// Records a download that never reached `DownloadComplete` and won't be resumed: not
+/// resumed in time, or replaced by a new `DownloadStart`. Saved, clearly tagged as
+/// incomplete/unverified (no CRC was ever provided to check it against), only if
+/// `retain_failed_downloads` is on, for debugging; always recorded in the database,
+/// where it doesn't count towards the download interval. `context` starts the log lines.
+async fn record_incomplete_download(context: &str, partial: crate::partial_downloads::PartialDownload) {
+    let crate::partial_downloads::PartialDownload { company, imei, generation, data_types, bytes, .. } = partial;
+    if bytes.is_empty() {
+        return;
+    }
+    let vrn = crate::vu_download::extract_vrn(generation, &bytes);
+    // Structural offset (if any) is genuinely useful here even though the
+    // transfer was already known-incomplete — it shows exactly how far the
+    // well-formed data went before truncation, rather than just "somewhere".
+    let tag = if generation == 2 {
+        match crate::vu_download::validate_gen2_structure(&bytes) {
+            Ok(_) => "incomplete".to_string(),
+            Err(offset) => format!("incomplete_unparsed_at_{}", offset),
+        }
+    } else {
+        "incomplete".to_string()
+    };
+    let saved_path = if !retain_failed_downloads() {
+        log::warn!("[TCP] {} action=download_discarded reason={} bytes={} note=retain_failed_downloads_off", context, tag, bytes.len());
+        None
+    } else {
+        match crate::vu_download::save_download(&company, vrn.as_deref(), &imei, &bytes, Some(&tag)) {
+            Ok(path) => {
+                log::warn!("[TCP] {} action=download_saved_incomplete path={:?} bytes={}", context, path, bytes.len());
+                Some(path)
+            }
+            Err(e) => {
+                log::error!("[TCP] {} action=download_save_failed err={}", context, e);
+                None
+            }
+        }
+    };
+    crate::database::record_download(crate::database::DownloadRecord {
+        company,
+        imei,
+        vrn,
+        verified: false,
+        generation: Some(generation),
+        data_types: Some(data_types),
+        bytes: bytes.len(),
+        file_path: saved_path,
+    }).await;
 }
 
 async fn send_abort_message(stream: &mut WriteHalf<'_>, reason: AbortReason) {
@@ -492,6 +569,59 @@ async fn handle_connection(mut stream: TcpStream, peer_addr: SocketAddr, over_so
                     },
                     Message::Pong(_) => {
                         log::debug!("[TCP] peer={} message=Pong", peer_addr);
+                    },
+                    Message::ConnAnnounce(conn_announce_message) if conn_announce_message.resuming_download && !announced => {
+                        // From a device whose connection dropped while it was handing over a
+                        // download. It's still reading the download from the VU, so it needs
+                        // no card and doesn't queue: accepted, it goes straight back to
+                        // sending DownloadChunks, added to what arrived before (see
+                        // partial_downloads.rs). With nothing to resume it's told to try
+                        // again, and starts over.
+                        let device_imei = conn_announce_message.imei.clone();
+                        let firmware_version = conn_announce_message.firmware_version.clone();
+                        let company_id = crate::company_directory::directory()
+                            .company_for_imei(&device_imei)
+                            .filter(|id| crate::config::get_company(id).is_some());
+                        let Some(company_id) = company_id else {
+                            send_conn_response(&mut write_half, ConnResponseStatus::Rejected, None).await;
+                            crate::database::record_unknown_device(&device_imei, &firmware_version).await;
+                            log::warn!(
+                                "[TCP] peer={} IMEI={} firmware_version={} message=ConnAnnounce resuming_download=true action=reply status=Rejected reason=unregistered_imei",
+                                peer_addr, device_imei, firmware_version
+                            );
+                            break;
+                        };
+
+                        let partial = match crate::partial_downloads::take(&device_imei) {
+                            Some(partial) if partial.company == company_id && crate::partial_downloads::resumable(&partial) => partial,
+                            other => {
+                                if let Some(partial) = other {
+                                    record_incomplete_download(&format!("peer={} reason=not_resumable", peer_addr), partial).await;
+                                }
+                                let retry_after_seconds = send_conn_response(&mut write_half, ConnResponseStatus::TryAgainLater, Some(NOTHING_TO_RESUME_RETRY)).await;
+                                log::info!(
+                                    "[TCP] peer={} company={} IMEI={} firmware_version={} message=ConnAnnounce resuming_download=true action=reply status=TryAgainLater reason=nothing_to_resume retry_after_seconds={:?}",
+                                    peer_addr, company_id, device_imei, firmware_version, retry_after_seconds
+                                );
+                                break;
+                            }
+                        };
+
+                        download_meta = Some((partial.generation, partial.data_types));
+                        download_buffer = partial.bytes;
+                        announced = true;
+                        imei = Some(device_imei.clone());
+                        device_firmware_version = Some(firmware_version.clone());
+                        company = Some(company_id.clone());
+                        _company_slot = Some(CompanySlot::claim(&company_id));
+                        send_conn_response(&mut write_half, ConnResponseStatus::Accepted, None).await;
+                        log::info!(
+                            "[TCP] peer={} company={} IMEI={} firmware_version={} message=ConnAnnounce resuming_download=true action=reply status=Accepted bytes_so_far={}",
+                            peer_addr, company_id, device_imei, firmware_version, download_buffer.len()
+                        );
+                        if let Some((generation, _)) = download_meta {
+                            crate::download_activity::started(&peer_addr.to_string(), &device_imei, &company_id, generation, download_buffer.len());
+                        }
                     },
                     Message::ConnAnnounce(conn_announce_message) => {
                         if announced {
@@ -718,6 +848,10 @@ async fn handle_connection(mut stream: TcpStream, peer_addr: SocketAddr, over_so
                         } else {
                             download_buffer.clear();
                             download_meta = Some((download_start_message.generation, download_start_message.data_types));
+                            // Starting afresh: a download the device left part-way won't be resumed.
+                            if let Some(abandoned) = imei.as_deref().and_then(crate::partial_downloads::take) {
+                                record_incomplete_download(&format!("peer={} reason=restarted", peer_addr), abandoned).await;
+                            }
                             log::info!(
                                 "[TCP] peer={} action=download_start generation={} data_types={:#04x}",
                                 peer_addr, download_start_message.generation, download_start_message.data_types
@@ -727,6 +861,7 @@ async fn handle_connection(mut stream: TcpStream, peer_addr: SocketAddr, over_so
                                 imei.as_deref().unwrap_or_default(),
                                 company.as_deref().unwrap_or(DEFAULT_COMPANY_ID),
                                 download_start_message.generation,
+                                0,
                             );
                         }
                     },
@@ -906,52 +1041,23 @@ async fn handle_connection(mut stream: TcpStream, peer_addr: SocketAddr, over_so
     crate::download_activity::finished(&peer_addr.to_string());
 
     // A download that was in progress but never reached DownloadComplete (e.g. the
-    // device disconnected mid-transfer, as seen in testing) would otherwise just
-    // vanish with the rest of this function's local state. Best-effort save it
-    // anyway, clearly tagged as incomplete/unverified (no CRC was ever provided to
-    // check it against) — for debugging visibility into what actually arrived
-    // rather than losing it silently.
-    if !download_buffer.is_empty() {
-        let generation = download_meta.map(|(generation, _)| generation).unwrap_or(0);
-        let vrn = crate::vu_download::extract_vrn(generation, &download_buffer);
-        let imei_value = imei.clone().unwrap_or_default();
-        // Structural offset (if any) is genuinely useful here even though the
-        // transfer was already known-incomplete — it shows exactly how far the
-        // well-formed data went before truncation, rather than just "somewhere".
-        let tag = if generation == 2 {
-            match crate::vu_download::validate_gen2_structure(&download_buffer) {
-                Ok(_) => "incomplete".to_string(),
-                Err(offset) => format!("incomplete_unparsed_at_{}", offset),
-            }
-        } else {
-            "incomplete".to_string()
-        };
-        let saved_path = if !retain_failed_downloads() {
-            log::warn!("[TCP] peer={} action=download_discarded reason={} bytes={} note=retain_failed_downloads_off", peer_addr, tag, download_buffer.len());
-            None
-        } else {
-            match crate::vu_download::save_download(company.as_deref().unwrap_or(DEFAULT_COMPANY_ID), vrn.as_deref(), &imei_value, &download_buffer, Some(&tag)) {
-                Ok(path) => {
-                    log::warn!("[TCP] peer={} action=download_saved_incomplete path={:?} bytes={}", peer_addr, path, download_buffer.len());
-                    Some(path)
-                }
-                Err(e) => {
-                    log::error!("[TCP] peer={} action=download_save_failed err={}", peer_addr, e);
-                    None
-                }
-            }
-        };
-        // Recorded for visibility only — never verified, so it doesn't count
-        // towards the once-a-day limit.
-        crate::database::record_download(crate::database::DownloadRecord {
-            company: company.clone().unwrap_or_else(|| DEFAULT_COMPANY_ID.to_string()),
-            imei: imei_value,
-            vrn,
-            verified: false,
-            generation: download_meta.map(|(generation, _)| generation),
-            data_types: download_meta.map(|(_, data_types)| data_types),
-            bytes: download_buffer.len(),
-            file_path: saved_path,
-        }).await;
+    // device's connection dropped mid-transfer): keep it for the device to resume. If
+    // it isn't resumed in time, it's recorded as incomplete then.
+    if let (Some((generation, data_types)), Some(imei)) = (download_meta, imei) {
+        let bytes = std::mem::take(&mut download_buffer);
+        log::info!(
+            "[TCP] peer={} IMEI={} action=download_kept_for_resume bytes={} resume_window_seconds={}",
+            peer_addr, imei, bytes.len(), crate::partial_downloads::RESUME_WINDOW.as_secs()
+        );
+        let partial = crate::partial_downloads::PartialDownload::new(
+            company.unwrap_or_else(|| DEFAULT_COMPANY_ID.to_string()),
+            imei,
+            generation,
+            data_types,
+            bytes,
+        );
+        if let Some(replaced) = crate::partial_downloads::keep(partial) {
+            record_incomplete_download(&format!("peer={} reason=replaced", peer_addr), replaced).await;
+        }
     }
 }
