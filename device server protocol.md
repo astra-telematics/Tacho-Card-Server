@@ -72,7 +72,25 @@ Raw payload? More info?
 
 ### 7: Abort
 
-Reason?
+1 byte reason:
+
+- 0: Unknown
+- 1: Protocol violation
+- 2: Card removed
+- 3: Card protocol mismatch
+- 4: Download too large
+
+From the server that's the whole payload. From a device on firmware G7.0.82 or later two
+more bytes follow:
+
+- Stage, the VU exchange in progress: 0 none (not a VU failure, e.g. a malformed
+  message from the server), 1 session open, 2 card ready, 3 card authentication,
+  4 download request, 5 upload request, 6 transfer data, 7 activities.
+- UDS status that exchange got: 0 OK, 1 timeout, 2 unexpected response, 3 busy,
+  4 response pending, 5 session lost, 6 rejected.
+
+The device resets after aborting, so a download it was handing over isn't kept to
+resume: the server records it as incomplete.
 
 ## Resuming a download
 

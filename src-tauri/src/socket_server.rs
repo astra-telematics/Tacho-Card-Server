@@ -316,6 +316,21 @@ async fn send_conn_response(
     retry_after_seconds
 }
 
+/// The features of the firmware a device announced. A version that can't be parsed is
+/// taken to have none, as the oldest firmware.
+fn features_for_firmware(peer_addr: std::net::SocketAddr, imei: &str, firmware_version: &str) -> crate::firmware::Features {
+    match crate::firmware::FirmwareVersion::parse(firmware_version) {
+        Some(version) => crate::firmware::Features::for_version(&version),
+        None => {
+            log::warn!(
+                "[TCP] peer={} IMEI={} firmware_version={} action=assume_no_firmware_features reason=unparsed_firmware_version",
+                peer_addr, imei, firmware_version
+            );
+            crate::firmware::Features::default()
+        }
+    }
+}
+
 /// Records, as incomplete, the partial downloads that weren't resumed in time.
 async fn partial_download_sweeper() {
     loop {
@@ -377,7 +392,7 @@ async fn record_incomplete_download(context: &str, partial: crate::partial_downl
 }
 
 async fn send_abort_message(stream: &mut WriteHalf<'_>, reason: AbortReason) {
-    let abort_message = AbortMessage { reason };
+    let abort_message = AbortMessage { reason, vu_failure: None };
     let abort_bytes: Vec<u8> = Message::Abort(abort_message).into();
     if let Err(e) = stream.write_all(&abort_bytes).await {
         log::warn!(
@@ -473,11 +488,10 @@ async fn handle_connection(mut stream: TcpStream, peer_addr: SocketAddr, over_so
     // Retained (not just logged inline) so the `AuthOutcome` handler can pass
     // it on to the telemetry log once the device reports how the session went.
     let mut imei: Option<String> = None;
-    // Retained for future version-specific handling — not used for anything
-    // yet beyond logging, and deliberately kept out of telemetry.rs (a
-    // firmware version can narrow down a specific client, defeating that
-    // data's anonymization).
-    let mut device_firmware_version: Option<String> = None;
+    // What the device's firmware supports, from the version it announces (see
+    // firmware.rs). The version itself is deliberately kept out of telemetry.rs (it
+    // can narrow down a specific client, defeating that data's anonymization).
+    let mut firmware_features = crate::firmware::Features::default();
     // Set at admission: the device's company, the card pool it queues in, and the
     // connection slot it holds in that company (freed when this function returns).
     let mut company: Option<String> = None;
@@ -611,7 +625,7 @@ async fn handle_connection(mut stream: TcpStream, peer_addr: SocketAddr, over_so
                         download_buffer = partial.bytes;
                         announced = true;
                         imei = Some(device_imei.clone());
-                        device_firmware_version = Some(firmware_version.clone());
+                        firmware_features = features_for_firmware(peer_addr, &device_imei, &firmware_version);
                         company = Some(company_id.clone());
                         _company_slot = Some(CompanySlot::claim(&company_id));
                         send_conn_response(&mut write_half, ConnResponseStatus::Accepted, None).await;
@@ -691,7 +705,7 @@ async fn handle_connection(mut stream: TcpStream, peer_addr: SocketAddr, over_so
                             announced = true;
                             awaiting_first_card = true;
                             imei = Some(device_imei.clone());
-                            device_firmware_version = Some(firmware_version.clone());
+                            firmware_features = features_for_firmware(peer_addr, &device_imei, &firmware_version);
                             company = Some(company_id.clone());
                             company_pool = Some(pool);
                             _company_slot = Some(slot);
@@ -809,7 +823,31 @@ async fn handle_connection(mut stream: TcpStream, peer_addr: SocketAddr, over_so
                         self::send_abort_message(&mut write_half, AbortReason::ProtocolViolation).await;
                     },
                     Message::Abort(abort_message) => {
-                        log::info!("[TCP] peer={} message=Abort action=close reason={}", peer_addr, abort_message.reason.to_string());
+                        match &abort_message.vu_failure {
+                            Some(failure) => log::info!(
+                                "[TCP] peer={} message=Abort action=close reason={} stage={} uds_status={}",
+                                peer_addr, abort_message.reason.to_string(), failure.stage_name(), failure.uds_status_name()
+                            ),
+                            None => log::info!("[TCP] peer={} message=Abort action=close reason={}", peer_addr, abort_message.reason.to_string()),
+                        }
+                        if abort_message.vu_failure.is_some() != firmware_features.abort_vu_failure {
+                            log::warn!(
+                                "[TCP] peer={} message=Abort note=format_unexpected_for_firmware vu_failure={} firmware_features={:?}",
+                                peer_addr, abort_message.vu_failure.is_some(), firmware_features
+                            );
+                        }
+                        // The device resets after aborting rather than resuming, so a download
+                        // it was handing over is recorded as incomplete now, not kept.
+                        if let (Some((generation, data_types)), Some(device_imei)) = (download_meta.take(), imei.clone()) {
+                            let partial = crate::partial_downloads::PartialDownload::new(
+                                company.clone().unwrap_or_else(|| DEFAULT_COMPANY_ID.to_string()),
+                                device_imei,
+                                generation,
+                                data_types,
+                                std::mem::take(&mut download_buffer),
+                            );
+                            record_incomplete_download(&format!("peer={} reason=device_abort", peer_addr), partial).await;
+                        }
                         break;
                     },
                     Message::AuthOutcome(auth_outcome_message) => {

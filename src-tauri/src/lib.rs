@@ -9,6 +9,7 @@ mod device_protocol;    // Device protocol message definitions and parsing.
 mod card_pool;          // Bounded pool of physical cards shared across authenticating devices.
 mod vu_download;        // VU data download: CRC verification, VRN extraction, storage.
 mod download_activity;  // Downloads in progress, for the UI.
+mod firmware;
 mod partial_downloads;  // Downloads whose connection dropped, kept for the device to resume.
 mod database;           // SQLite: download history (download interval) and card session lengths.
 mod users;              // User accounts (database) and the built-in admin, whose password is in config.yaml.

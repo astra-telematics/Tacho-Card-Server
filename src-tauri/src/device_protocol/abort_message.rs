@@ -11,6 +11,47 @@ pub enum AbortReason {
 
 pub struct AbortMessage {
     pub reason: AbortReason,
+    /// From the device only: which VU exchange failed, and how. The server's own
+    /// aborts carry just the reason.
+    pub vu_failure: Option<VuFailure>,
+}
+
+/// The VU exchange a device was in when it aborted, and the UDS status it got. Kept
+/// as the raw bytes so a value newer firmware adds still reaches the log.
+pub struct VuFailure {
+    pub stage: u8,
+    pub uds_status: u8,
+}
+
+impl VuFailure {
+    /// The firmware's `abort_stage_t`.
+    pub fn stage_name(&self) -> &'static str {
+        match self.stage {
+            0 => "None",
+            1 => "SessionOpen",
+            2 => "CardReady",
+            3 => "CardAuth",
+            4 => "DownloadRequest",
+            5 => "UploadRequest",
+            6 => "TransferData",
+            7 => "Activities",
+            _ => "Unrecognised",
+        }
+    }
+
+    /// The firmware's `tacho_uds_status_t`.
+    pub fn uds_status_name(&self) -> &'static str {
+        match self.uds_status {
+            0 => "Ok",
+            1 => "Timeout",
+            2 => "UnexpectedResponse",
+            3 => "Busy",
+            4 => "Pending",
+            5 => "SessionLost",
+            6 => "Rejected",
+            _ => "Unrecognised",
+        }
+    }
 }
 
 impl ToString for AbortReason {
@@ -30,17 +71,23 @@ impl TryFrom<Vec<u8>> for AbortMessage {
 
     fn try_from(value: Vec<u8>) -> Result<Self> {
         let raw_reason_byte = value.get(0).copied().ok_or(ProtocolError { message: "Missing abort reason".to_string() })?;
-        match AbortReason::try_from(raw_reason_byte) {
-            Ok(reason) => Ok(AbortMessage { reason }),
-            Err(e) => Err(e),
-        }
+        let reason = AbortReason::try_from(raw_reason_byte)?;
+        let vu_failure = match value.len() {
+            1 => None,
+            3 => Some(VuFailure { stage: value[1], uds_status: value[2] }),
+            _ => return Err(ProtocolError { message: format!("Invalid abort length {}", value.len()) }),
+        };
+        Ok(AbortMessage { reason, vu_failure })
     }
 }
 
 impl Into<Vec<u8>> for AbortMessage {
     fn into(self) -> Vec<u8> {
-        let reason_byte: u8 = self.reason.into();
-        vec![reason_byte]
+        let mut bytes = vec![self.reason.into()];
+        if let Some(failure) = self.vu_failure {
+            bytes.extend([failure.stage, failure.uds_status]);
+        }
+        bytes
     }
 }
 
@@ -69,5 +116,38 @@ impl Into<u8> for AbortReason {
             AbortReason::CardProtocolMismatch => 0x03,
             AbortReason::DownloadTooLarge => 0x04,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(bytes: &[u8]) -> AbortMessage {
+        AbortMessage::try_from(bytes.to_vec()).unwrap_or_else(|e| panic!("{}", e.message))
+    }
+
+    #[test]
+    fn a_device_abort_carries_the_stage_and_uds_status() {
+        let abort = parse(&[0x00, 6, 1]);
+        let failure = abort.vu_failure.expect("stage and status");
+        assert_eq!((failure.stage_name(), failure.uds_status_name()), ("TransferData", "Timeout"));
+    }
+
+    #[test]
+    fn a_reason_alone_has_no_vu_failure() {
+        assert!(parse(&[0x01]).vu_failure.is_none());
+    }
+
+    #[test]
+    fn values_newer_firmware_adds_still_parse() {
+        let failure = parse(&[0x00, 42, 99]).vu_failure.expect("stage and status");
+        assert_eq!((failure.stage, failure.uds_status), (42, 99));
+        assert_eq!(failure.stage_name(), "Unrecognised");
+    }
+
+    #[test]
+    fn a_truncated_vu_failure_is_rejected() {
+        assert!(AbortMessage::try_from(vec![0x00, 6]).is_err());
     }
 }
