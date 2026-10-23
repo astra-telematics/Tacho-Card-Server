@@ -89,6 +89,9 @@ more bytes follow:
 - UDS status that exchange got: 0 OK, 1 timeout, 2 unexpected response, 3 busy,
   4 response pending, 5 session lost, 6 rejected.
 
+From firmware H7.0.82 a fourth byte follows: the VU's raw negative response code
+(ISO 14229, e.g. 0x24 requestSequenceError, 0x73 wrongBlockSequenceCounter).
+
 The device resets after aborting, so a download it was handing over isn't kept to
 resume: the server records it as incomplete.
 

@@ -825,15 +825,23 @@ async fn handle_connection(mut stream: TcpStream, peer_addr: SocketAddr, over_so
                     Message::Abort(abort_message) => {
                         match &abort_message.vu_failure {
                             Some(failure) => log::info!(
-                                "[TCP] peer={} message=Abort action=close reason={} stage={} uds_status={}",
-                                peer_addr, abort_message.reason.to_string(), failure.stage_name(), failure.uds_status_name()
+                                "[TCP] peer={} message=Abort action=close reason={} stage={} uds_status={}{}",
+                                peer_addr, abort_message.reason.to_string(), failure.stage_name(), failure.uds_status_name(),
+                                failure.nrc.map(|nrc| format!(" nrc={:#04x} ({})", nrc, crate::device_protocol::VuFailure::nrc_name(nrc))).unwrap_or_default()
                             ),
                             None => log::info!("[TCP] peer={} message=Abort action=close reason={}", peer_addr, abort_message.reason.to_string()),
                         }
-                        if abort_message.vu_failure.is_some() != firmware_features.abort_vu_failure {
+                        let format_expected = match &abort_message.vu_failure {
+                            None => !firmware_features.abort_vu_failure,
+                            Some(failure) => firmware_features.abort_vu_failure && failure.nrc.is_some() == firmware_features.abort_nrc,
+                        };
+                        if !format_expected {
                             log::warn!(
-                                "[TCP] peer={} message=Abort note=format_unexpected_for_firmware vu_failure={} firmware_features={:?}",
-                                peer_addr, abort_message.vu_failure.is_some(), firmware_features
+                                "[TCP] peer={} message=Abort note=format_unexpected_for_firmware vu_failure={} nrc={} firmware_features={:?}",
+                                peer_addr,
+                                abort_message.vu_failure.is_some(),
+                                abort_message.vu_failure.as_ref().is_some_and(|f| f.nrc.is_some()),
+                                firmware_features
                             );
                         }
                         // The device resets after aborting rather than resuming, so a download

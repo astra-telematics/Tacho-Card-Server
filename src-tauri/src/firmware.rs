@@ -75,12 +75,15 @@ impl PartialOrd for FirmwareVersion {
 pub struct Features {
     /// Its `Abort`s carry the VU stage and UDS status after the reason.
     pub abort_vu_failure: bool,
+    /// ...followed by the VU's raw negative response code.
+    pub abort_nrc: bool,
 }
 
 impl Features {
     pub fn for_version(version: &FirmwareVersion) -> Self {
         Self {
             abort_vu_failure: *version >= FirmwareVersion::beta('G', 7, 0, 82),
+            abort_nrc: *version >= FirmwareVersion::beta('H', 7, 0, 82),
         }
     }
 }
@@ -122,5 +125,13 @@ mod tests {
         assert!(has_it("G7.0.82"));
         assert!(has_it("7.0.82.3"));
         assert!(has_it("A7.0.83"));
+    }
+
+    #[test]
+    fn abort_nrc_is_on_from_h7_0_82() {
+        let has_it = |text| Features::for_version(&version(text)).abort_nrc;
+        assert!(!has_it("G7.0.82.3"));
+        assert!(has_it("H7.0.82"));
+        assert!(has_it("7.0.82"));
     }
 }

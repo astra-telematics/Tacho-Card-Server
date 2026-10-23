@@ -51,19 +51,22 @@ pub fn sniff(client_id: &str, command_hex: &str, response_hex: &str) {
         Err(_) => return,
     };
 
-    // Track SELECTed EF (ignore SELECT AID / SELECT MF)
-    if let Some(fid) = select_ef_fid(&cmd) {
-        if let Ok(mut state) = STATE.lock() {
-            state
-                .entry(client_id.to_string())
-                .or_insert(SniffState { last_selected_ef: None })
-                .last_selected_ef = Some(fid);
-        }
+    // Track the SELECTed EF. Any other SELECT (AID, MF, by path, or a form we
+    // don't recognise) still changes what's selected, so the EF is forgotten
+    // rather than the next READ BINARY being taken as from the old one.
+    if is_select(&cmd) {
+        set_selected_ef(client_id, select_ef_fid(&cmd));
         return;
     }
 
     // READ BINARY — check if we have a known EF context and plaintext data to parse
     if !is_read_binary(&cmd) {
+        return;
+    }
+    // By short EF identifier (P1 bit 8): reads, and selects, a file named in
+    // the command rather than the one SELECTed.
+    if cmd.len() >= 3 && cmd[2] & 0x80 != 0 {
+        set_selected_ef(client_id, None);
         return;
     }
 
@@ -82,6 +85,19 @@ pub fn sniff(client_id: &str, command_hex: &str, response_hex: &str) {
         0x0501 => parse_ef_application_identification(client_id, &data),
         _ => {}
     }
+}
+
+fn set_selected_ef(client_id: &str, fid: Option<u16>) {
+    if let Ok(mut state) = STATE.lock() {
+        state
+            .entry(client_id.to_string())
+            .or_insert(SniffState { last_selected_ef: None })
+            .last_selected_ef = fid;
+    }
+}
+
+fn is_select(cmd: &[u8]) -> bool {
+    cmd.len() >= 2 && cmd[1] == 0xA4
 }
 
 /// Returns the FID if `cmd` is a SELECT EF under current DF.
@@ -248,12 +264,24 @@ fn parse_ef_identification(client_id: &str, data: &[u8]) {
 /// Parses EF_Application_Identification for Company Card.
 /// Layout: typeOfTachographCardId (1) + cardStructureVersion (2) + noOfCompanyActivityRecords (2).
 /// Persists card_type and structure_version into the card's config if changed.
+/// Data that isn't shaped like this file (5 bytes, a card's equipment type) is
+/// logged and ignored: it's another file's, read while we lost track of which EF
+/// was selected, and saving it would overwrite the card's details with garbage.
 fn parse_ef_application_identification(client_id: &str, data: &[u8]) {
     log::debug!(
         "EF_Application_Identification (0501) plaintext ({} bytes): {}",
         data.len(),
         hex::encode(data)
     );
+    if !looks_like_application_identification(data) {
+        log::warn!(
+            "EF_Application_Identification for {} doesn't look like one ({} bytes, type 0x{:02X}) — ignored",
+            client_id,
+            data.len(),
+            data.first().copied().unwrap_or(0)
+        );
+        return;
+    }
 
     if !data.is_empty() {
         let t = data[0];
@@ -319,6 +347,12 @@ fn parse_ef_application_identification(client_id: &str, data: &[u8]) {
 }
 
 // ─────────── Helpers ───────────
+
+/// typeOfTachographCardId is an EquipmentType, 1–5 for cards (driver, workshop,
+/// control, company, manufacturing).
+fn looks_like_application_identification(data: &[u8]) -> bool {
+    data.len() == 5 && (1..=5).contains(&data[0])
+}
 
 fn slice(d: &[u8], start: usize, len: usize) -> Option<&[u8]> {
     if start + len <= d.len() {
@@ -404,6 +438,38 @@ mod tests {
     fn select_ef_fid_rejects_non_select() {
         let cmd = [0x00, 0xB0, 0x00, 0x00, 0x05];
         assert_eq!(select_ef_fid(&cmd), None);
+    }
+
+    fn selected_ef(client_id: &str) -> Option<u16> {
+        STATE.lock().unwrap().get(client_id).and_then(|s| s.last_selected_ef)
+    }
+
+    #[test]
+    fn an_unrecognised_select_forgets_the_selected_ef() {
+        let client = "sniffer-test-unrecognised-select";
+        sniff(client, "00a4020c020501", "9000");
+        assert_eq!(selected_ef(client), Some(0x0501));
+        // SELECT by path from the MF: 00 A4 08 0C 04 0500 0520
+        sniff(client, "00a4080c0405000520", "9000");
+        assert_eq!(selected_ef(client), None);
+        forget(client);
+    }
+
+    #[test]
+    fn a_read_by_short_ef_identifier_forgets_the_selected_ef() {
+        let client = "sniffer-test-sfi-read";
+        sniff(client, "00a4020c020501", "9000");
+        sniff(client, "00b0820000", "15423030303030303031313834353430");
+        assert_eq!(selected_ef(client), None);
+        forget(client);
+    }
+
+    #[test]
+    fn only_application_identification_shaped_data_is_taken_as_one() {
+        assert!(looks_like_application_identification(&[0x04, 0x00, 0x01, 0x00, 0xFF]));
+        // The start of EF_Identification: nation 0x15, then the card number "B0...".
+        assert!(!looks_like_application_identification(&[0x15, 0x42, 0x30, 0x30, 0x30]));
+        assert!(!looks_like_application_identification(&[0x04, 0x00, 0x01, 0x00, 0xFF, 0x00]));
     }
 
     #[test]

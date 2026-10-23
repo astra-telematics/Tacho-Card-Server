@@ -20,7 +20,7 @@ pub use common::{ProtocolError, Result};
 pub use conn_response_message::ConnResponseMessage;
 pub use conn_response_message::ConnResponseStatus;
 pub use conn_announce_message::ConnAnnounceMessage;
-pub use abort_message::{AbortMessage, AbortReason};
+pub use abort_message::{AbortMessage, AbortReason, VuFailure};
 pub use ping_message::PingMessage;
 pub use pong_message::PongMessage;
 pub use ready_message::ReadyMessage;

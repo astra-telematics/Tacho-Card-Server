@@ -68,16 +68,18 @@ fn skip_trep_separator(data: &[u8], offset: usize) -> usize {
     }
 }
 
+const VRN_LENGTH: usize = 13;
+
 /// Overview block field order: MemberStateCertificateRecordArray,
 /// VuCertificateRecordArray, VehicleIdentificationNumberRecordArray,
 /// VehicleRegistrationNumberRecordArray (the one we want) — walk/skip the
 /// first three generically using their own declared sizes, then read the
 /// fourth using its own declared record size.
 ///
-/// This generation's VehicleRegistrationNumber record is `nation(1) +
-/// vehicleRegNumber(13)` — 14 bytes, with no separate codePage byte (unlike
-/// the Gen1-era data dictionary's version of this type) — confirmed against
-/// the same real capture.
+/// The VehicleRegistrationNumber record is `nation(1) + vehicleRegNumber(13)`,
+/// 14 bytes, in Gen2 downloads, but `nation(1) + codePage(1) +
+/// vehicleRegNumber(13)`, 15 bytes, in Gen2V2 ones — both confirmed against real
+/// captures. Either way the registration is the record's last 13 bytes.
 fn extract_vrn_gen2(data: &[u8]) -> Option<String> {
     let mut offset = skip_trep_separator(data, 0);
 
@@ -92,12 +94,11 @@ fn extract_vrn_gen2(data: &[u8]) -> Option<String> {
     // declared record_size rather than hardcoding 14).
     let header = read_record_array_header(data, offset)?;
     let record_start = offset + 5;
-    if header.no_of_records == 0 || header.record_size < 1 {
+    if header.no_of_records == 0 || (header.record_size as usize) < 1 + VRN_LENGTH {
         return None;
     }
     let record = data.get(record_start..record_start + header.record_size as usize)?;
-    let vrn_bytes = record.get(1..)?; // skip nation(1)
-    Some(decode_vrn_bytes(vrn_bytes))
+    Some(decode_vrn_bytes(&record[record.len() - VRN_LENGTH..]))
 }
 
 struct RecordArrayHeader {
@@ -273,6 +274,18 @@ mod tests {
     fn extract_vrn_gen2_matches_real_captured_download() {
         let data = hex::decode(GEN2_OVERVIEW_PREFIX_HEX).expect("valid hex fixture");
         assert_eq!(extract_vrn(2, &data), Some("LD21STR".to_string()));
+    }
+
+    // Real bytes from a Gen2V2 VU download (Overview block, through the
+    // VehicleRegistrationNumberRecordArray), whose record has a codePage byte
+    // between nation and the registration.
+    const GEN2V2_OVERVIEW_PREFIX_HEX: &str = "76310400cd00017f2181c97f4e81825f2901004208fd45432001ffff015f4c07ff534d5244540e7f494e06092b240303020801010786410482a15e1797f162a0974009da1018b43f3f5884a1a9e43180be938ccad741cecca18d6311727603e17d5b5acb55ff4f2fe6ef416ae9fa776516b59b652d37eeb45f20080d4420200d5655015f2504642e0b805f240484a107005f3740a8abff821f20b329f44b05fddbde1aabc12fe32dc1b807146850f3740f28a073a744232a0a9336e9c14defee9db3251aa2ccac135a0c210eaf7793b8bb89ba260f00cd00017f2181c97f4e81825f29010042080d4420200d5655015f4c07ff534d524454137f494e06092b240303020801010786410427b662f9ac97053379ee894b5abccb574289c7447baa4af847dfcfe0d91b24e38d01d3cdcf7c7303c7d22ad566568462c9ff621de9e07516c1f581a3616c35a65f20080274bbb11223ffa15f2504657aaeb35f24048228a0335f3740245d9a30d2cce55770bf0dd7b0f81b24f98fdd9a1ea07e7207f23ccb5cab24f59a9f01ff716031b28f387b0333e5bb99ec7235c7117dff3aac452d2fba404dd00a00110001574442393633303230324c37323932323524000f00011501534a31334b5848202020202020";
+
+    #[test]
+    fn extract_vrn_gen2v2_skips_the_code_page() {
+        let data = hex::decode(GEN2V2_OVERVIEW_PREFIX_HEX).expect("valid hex fixture");
+        assert_eq!(extract_vrn(2, &data), Some("SJ13KXH".to_string()));
+        assert_eq!(validate_gen2_structure(&data), Ok(4));
     }
 
     #[test]
