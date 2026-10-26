@@ -8,6 +8,20 @@ export const isIntInRange = (value: number | string, min: number, max: number) =
 export const inRange = (min: number, max: number) => (value: number | string) =>
   isIntInRange(value, min, max) || `Enter a whole number from ${min} to ${max}`
 
+// Dates are shown in the viewer's own format. A browser's default locale is its UI
+// language, often en-US wherever the viewer is; `navigator.languages` is the languages
+// they've chosen in its settings (e.g. en-GB), so it's used instead.
+const viewerLocales = [...navigator.languages]
+
+// Date and time, in the viewer's time zone.
+export const formatDateTime = (unixSeconds: number) =>
+  new Date(unixSeconds * 1000).toLocaleString(viewerLocales)
+
+// Date only. `utc` for a date stored as midnight UTC (a card's expiry), which would
+// otherwise show as the previous day west of Greenwich.
+export const formatDate = (unixSeconds: number, utc = false) =>
+  new Date(unixSeconds * 1000).toLocaleDateString(viewerLocales, utc ? { timeZone: 'UTC' } : {})
+
 // Settings as sent by the backend: the `get_config` command, and the `global-config-*`
 // events (each with its own subset). All values are strings (see config.rs::get_from_cache).
 export interface AppConfig {

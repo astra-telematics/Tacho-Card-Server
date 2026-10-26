@@ -44,8 +44,8 @@
                             <td>{{ device.imei }}</td>
                             <td :class="{ 'text-grey': !device.vrn }">{{ device.vrn || '—' }}</td>
                             <td>{{ device.firmware_version || '—' }}</td>
-                            <td>{{ formatTime(device.first_seen) }}</td>
-                            <td>{{ formatTime(device.last_seen) }}</td>
+                            <td>{{ formatDateTime(device.first_seen) }}</td>
+                            <td>{{ formatDateTime(device.last_seen) }}</td>
                             <td class="text-right">{{ device.attempts }}</td>
                             <td style="min-width: 180px">
                                 <q-select
@@ -147,7 +147,7 @@
                                             {{ device.last_auth_succeeded ? 'Succeeded' : 'Failed' }}
                                         </q-tooltip>
                                     </q-icon>
-                                    {{ formatTime(device.last_auth_at) }}
+                                    {{ formatDateTime(device.last_auth_at) }}
                                 </template>
                                 <span v-else class="text-grey">—</span>
                             </td>
@@ -155,11 +155,11 @@
                                 <q-spinner-dots size="1.2em" class="q-mr-xs" />
                                 Downloading… {{ formatBytes(downloading(device.imei)!.bytes) }}
                                 <q-tooltip>
-                                    Started {{ formatTime(downloading(device.imei)!.started_at) }}
+                                    Started {{ formatDateTime(downloading(device.imei)!.started_at) }}
                                 </q-tooltip>
                             </td>
                             <td v-else :class="{ 'text-grey': !device.last_download_at }">
-                                {{ device.last_download_at ? formatTime(device.last_download_at) : '—' }}
+                                {{ device.last_download_at ? formatDateTime(device.last_download_at) : '—' }}
                             </td>
                             <td style="min-width: 180px">
                                 <q-select
@@ -197,6 +197,7 @@ import { computed, onActivated, onMounted, ref, watch } from 'vue'
 import { activeDownloads, formatBytes } from 'src/activeDownloads'
 import { Notify } from 'quasar'
 import { invoke } from 'src/backend'
+import { formatDateTime } from 'src/utils'
 import type { CompaniesView, DevicesView } from 'src/components/models'
 
 defineOptions({ name: 'DevicesPage' })
@@ -247,7 +248,6 @@ const soleCompanyName = computed(() =>
 )
 const companyOptions = computed(() => companies.value.map((c) => ({ label: c.name, value: c.id })))
 
-const formatTime = (unixSeconds: number) => new Date(unixSeconds * 1000).toLocaleString()
 
 // Same check as the backend: 15 digits, Luhn check digit.
 const isImei = (value: string) => {

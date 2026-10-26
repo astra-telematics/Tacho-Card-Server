@@ -1,3 +1,5 @@
+import { formatDate, formatDateTime } from 'src/utils'
+
 // Display formatters for CardConfig fields populated by the APDU sniffer.
 // Used by SmartCardList.vue and TachoMainComponent.vue.
 
@@ -40,7 +42,7 @@ export function formatStructureVersion(v: [number, number] | null | undefined): 
 
 export function formatExpire(unixTs: number | null | undefined): string {
   if (!unixTs) return ''
-  return new Date(unixTs * 1000).toISOString().slice(0, 10)
+  return formatDate(unixTs, true)
 }
 
 export function isExpired(unixTs: number | null | undefined): boolean {
@@ -48,14 +50,9 @@ export function isExpired(unixTs: number | null | undefined): boolean {
   return unixTs * 1000 < Date.now()
 }
 
-/// Formats last_auth timestamp (stored as UTC unix seconds) in the user's local
-/// timezone as "YYYY-MM-DD HH:MM:SS". Storage stays UTC — only display is localised.
+/// Formats last_auth timestamp (stored as UTC unix seconds) in the viewer's time zone
+/// and date format. Storage stays UTC — only display is localised.
 export function formatAuthDate(unixTs: number | null | undefined): string {
   if (!unixTs) return ''
-  const d = new Date(unixTs * 1000)
-  const pad = (n: number) => String(n).padStart(2, '0')
-  return (
-    `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ` +
-    `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`
-  )
+  return formatDateTime(unixTs)
 }

@@ -48,8 +48,8 @@
                                     class="q-ml-sm"
                                 />
                             </td>
-                            <td>{{ formatTime(user.created_at) }}</td>
-                            <td>{{ formatTime(user.updated_at) }}</td>
+                            <td>{{ formatDateTime(user.created_at) }}</td>
+                            <td>{{ formatDateTime(user.updated_at) }}</td>
                             <td class="text-right">
                                 <template v-if="user.username !== ADMIN">
                                     <q-btn
@@ -136,6 +136,7 @@
 import { computed, onActivated, onMounted, reactive, ref } from 'vue'
 import { Notify, useQuasar } from 'quasar'
 import { currentUser, invoke } from 'src/backend'
+import { formatDateTime } from 'src/utils'
 import type { UserAccount } from 'src/components/models'
 
 defineOptions({ name: 'UsersPage' })
@@ -171,7 +172,6 @@ const load = async () => {
 onMounted(load)
 onActivated(load)
 
-const formatTime = (unixSeconds: number) => new Date(unixSeconds * 1000).toLocaleString()
 
 const isValidUsername = (name: string) =>
     /^[A-Za-z0-9._-]{1,32}$/.test(name.trim()) && name.trim().toLowerCase() !== ADMIN
