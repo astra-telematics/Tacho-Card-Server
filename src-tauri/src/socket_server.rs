@@ -348,16 +348,17 @@ async fn partial_download_sweeper() {
 /// `retain_failed_downloads` is on, for debugging; always recorded in the database,
 /// where it doesn't count towards the download interval. `context` starts the log lines.
 async fn record_incomplete_download(context: &str, partial: crate::partial_downloads::PartialDownload) {
-    let crate::partial_downloads::PartialDownload { company, imei, generation, data_types, bytes, .. } = partial;
-    if bytes.is_empty() {
+    let crate::partial_downloads::PartialDownload { company, imei, generation, data_types, data, .. } = partial;
+    if data.is_empty() {
         return;
     }
-    let vrn = crate::vu_download::extract_vrn(generation, &bytes);
+    let vu_data = &data.vu;
+    let vrn = crate::vu_download::extract_vrn(generation, vu_data);
     // Structural offset (if any) is genuinely useful here even though the
     // transfer was already known-incomplete — it shows exactly how far the
     // well-formed data went before truncation, rather than just "somewhere".
     let tag = if generation == 2 {
-        match crate::vu_download::validate_gen2_structure(&bytes) {
+        match crate::vu_download::validate_gen2_structure(vu_data) {
             Ok(_) => "incomplete".to_string(),
             Err(offset) => format!("incomplete_unparsed_at_{}", offset),
         }
@@ -365,12 +366,15 @@ async fn record_incomplete_download(context: &str, partial: crate::partial_downl
         "incomplete".to_string()
     };
     let saved_path = if !retain_failed_downloads() {
-        log::warn!("[TCP] {} action=download_discarded reason={} bytes={} note=retain_failed_downloads_off", context, tag, bytes.len());
+        log::warn!("[TCP] {} action=download_discarded reason={} bytes={} note=retain_failed_downloads_off", context, tag, data.len());
         None
     } else {
-        match crate::vu_download::save_download(&company, vrn.as_deref(), &imei, &bytes, Some(&tag)) {
+        if !data.driver_card.is_empty() {
+            save_card_section(context, &company, &imei, &data.driver_card, Some("incomplete"));
+        }
+        match crate::vu_download::save_download(&company, vrn.as_deref(), &imei, vu_data, Some(&tag)) {
             Ok(path) => {
-                log::warn!("[TCP] {} action=download_saved_incomplete path={:?} bytes={}", context, path, bytes.len());
+                log::warn!("[TCP] {} action=download_saved_incomplete path={:?} bytes={}", context, path, vu_data.len());
                 Some(path)
             }
             Err(e) => {
@@ -386,9 +390,37 @@ async fn record_incomplete_download(context: &str, partial: crate::partial_downl
         verified: false,
         generation: Some(generation),
         data_types: Some(data_types),
-        bytes: bytes.len(),
+        bytes: data.len(),
         file_path: saved_path,
     }).await;
+}
+
+/// Which section a `DownloadChunk`'s data belongs in, and the data: from the chunk's
+/// first byte if the device's firmware sends one, otherwise the VU's. `None` if that
+/// byte isn't a section the server knows (or the chunk is empty).
+fn chunk_section<'a>(features: &crate::firmware::Features, chunk: &'a [u8]) -> Option<(crate::vu_download::Section, &'a [u8])> {
+    if !features.download_chunk_section {
+        return Some((crate::vu_download::Section::Vu, chunk));
+    }
+    let (&byte, data) = chunk.split_first()?;
+    Some((crate::vu_download::Section::from_byte(byte)?, data))
+}
+
+/// Saves a download's driver card section in its own file, tagged with the VU file's
+/// `tag` and, if the card files' structure stopped making sense, where.
+fn save_card_section(context: &str, company: &str, imei: &str, section: &[u8], tag: Option<&str>) {
+    let card = crate::vu_download::card_files(section);
+    let card_number = crate::vu_download::extract_card_number(card);
+    let mut tag_parts: Vec<String> = tag.into_iter().map(str::to_string).collect();
+    if let Err(offset) = crate::vu_download::validate_card_structure(card) {
+        log::warn!("[TCP] {} action=card_download_unparsed offset={}", context, offset);
+        tag_parts.push(format!("unparsed_at_{}", offset));
+    }
+    let tag = if tag_parts.is_empty() { None } else { Some(tag_parts.join("_")) };
+    match crate::vu_download::save_card_download(company, card_number.as_deref(), imei, card, tag.as_deref()) {
+        Ok(path) => log::info!("[TCP] {} action=card_download_saved path={:?} card_number={:?} bytes={}", context, path, card_number, card.len()),
+        Err(e) => log::error!("[TCP] {} action=card_download_save_failed err={}", context, e),
+    }
 }
 
 async fn send_abort_message(stream: &mut WriteHalf<'_>, reason: AbortReason) {
@@ -518,7 +550,7 @@ async fn handle_connection(mut stream: TcpStream, peer_addr: SocketAddr, over_so
     // physical card — RequestUpload/TransferData/RequestTransferExit happen
     // entirely on the device's own CAN/UDS link with the VU, so this just
     // accumulates whatever the device hands over. Reset on every DownloadStart.
-    let mut download_buffer: Vec<u8> = Vec::new();
+    let mut download_buffer = crate::vu_download::DownloadData::default();
     let mut download_meta: Option<(u8, u8)> = None; // (generation, data_types bitmask)
     const MAX_DOWNLOAD_SIZE: usize = 16 * 1024 * 1024;
 
@@ -622,7 +654,7 @@ async fn handle_connection(mut stream: TcpStream, peer_addr: SocketAddr, over_so
                         };
 
                         download_meta = Some((partial.generation, partial.data_types));
-                        download_buffer = partial.bytes;
+                        download_buffer = partial.data;
                         announced = true;
                         imei = Some(device_imei.clone());
                         firmware_features = features_for_firmware(peer_addr, &device_imei, &firmware_version);
@@ -892,7 +924,7 @@ async fn handle_connection(mut stream: TcpStream, peer_addr: SocketAddr, over_so
                             self::send_abort_message(&mut write_half, AbortReason::ProtocolViolation).await;
                             log::warn!("[TCP] peer={} message=DownloadStart action=abort reason=not_announced", peer_addr);
                         } else {
-                            download_buffer.clear();
+                            download_buffer = Default::default();
                             download_meta = Some((download_start_message.generation, download_start_message.data_types));
                             // Starting afresh: a download the device left part-way won't be resumed.
                             if let Some(abandoned) = imei.as_deref().and_then(crate::partial_downloads::take) {
@@ -915,13 +947,25 @@ async fn handle_connection(mut stream: TcpStream, peer_addr: SocketAddr, over_so
                         if !announced || download_meta.is_none() {
                             self::send_abort_message(&mut write_half, AbortReason::ProtocolViolation).await;
                             log::warn!("[TCP] peer={} message=DownloadChunk action=abort reason=no_download_started", peer_addr);
-                        } else if download_buffer.len() + download_chunk_message.data.len() > MAX_DOWNLOAD_SIZE {
-                            self::send_abort_message(&mut write_half, AbortReason::DownloadTooLarge).await;
-                            log::warn!("[TCP] peer={} message=DownloadChunk action=abort reason=download_too_large", peer_addr);
                         } else {
-                            log::debug!("[TCP] peer={} action=download_chunk len={} total={}", peer_addr, download_chunk_message.data.len(), download_buffer.len() + download_chunk_message.data.len());
-                            download_buffer.extend_from_slice(&download_chunk_message.data);
-                            crate::download_activity::progress(&peer_addr.to_string(), download_buffer.len());
+                            match chunk_section(&firmware_features, &download_chunk_message.data) {
+                                None => {
+                                    self::send_abort_message(&mut write_half, AbortReason::ProtocolViolation).await;
+                                    log::warn!(
+                                        "[TCP] peer={} message=DownloadChunk action=abort reason=unrecognised_section section={:?}",
+                                        peer_addr, download_chunk_message.data.first()
+                                    );
+                                },
+                                Some((_, data)) if download_buffer.len() + data.len() > MAX_DOWNLOAD_SIZE => {
+                                    self::send_abort_message(&mut write_half, AbortReason::DownloadTooLarge).await;
+                                    log::warn!("[TCP] peer={} message=DownloadChunk action=abort reason=download_too_large", peer_addr);
+                                },
+                                Some((section, data)) => {
+                                    log::debug!("[TCP] peer={} action=download_chunk section={:?} len={} total={}", peer_addr, section, data.len(), download_buffer.len() + data.len());
+                                    download_buffer.add(section, data);
+                                    crate::download_activity::progress(&peer_addr.to_string(), download_buffer.len());
+                                },
+                            }
                         }
                     },
                     Message::DownloadComplete(download_complete_message) => {
@@ -931,7 +975,7 @@ async fn handle_connection(mut stream: TcpStream, peer_addr: SocketAddr, over_so
                         } else {
                             let (generation, data_types) = download_meta.unwrap();
                             crate::download_activity::finished(&peer_addr.to_string());
-                            let actual_crc32 = crate::vu_download::compute_crc32(&download_buffer);
+                            let actual_crc32 = download_buffer.crc32();
                             let matches = actual_crc32 == download_complete_message.crc32;
                             log::info!(
                                 "[TCP] peer={} action=download_complete bytes={} expected_crc32={:08x} actual_crc32={:08x} matches={}",
@@ -947,8 +991,9 @@ async fn handle_connection(mut stream: TcpStream, peer_addr: SocketAddr, over_so
                             // understand the file. Only meaningful for generation 2 —
                             // Gen1's fields are fixed-offset, not self-describing, so
                             // there's nothing in the byte stream to check sizes against.
+                            let vu_data = &download_buffer.vu;
                             let structure_issue = if generation == 2 {
-                                crate::vu_download::validate_gen2_structure(&download_buffer).err()
+                                crate::vu_download::validate_gen2_structure(vu_data).err()
                             } else {
                                 None
                             };
@@ -962,7 +1007,7 @@ async fn handle_connection(mut stream: TcpStream, peer_addr: SocketAddr, over_so
                             // the database. Only a fully clean result (CRC match and,
                             // where checkable, a structure this parser understands) gets
                             // the plain untagged filename.
-                            let vrn = crate::vu_download::extract_vrn(generation, &download_buffer);
+                            let vrn = crate::vu_download::extract_vrn(generation, vu_data);
                             let imei_value = imei.clone().unwrap_or_default();
                             let verified = matches;
                             let mut tag_parts: Vec<String> = Vec::new();
@@ -977,7 +1022,12 @@ async fn handle_connection(mut stream: TcpStream, peer_addr: SocketAddr, over_so
                                 log::warn!("[TCP] peer={} action=download_discarded reason=crc_mismatch bytes={} vrn={:?} note=retain_failed_downloads_off", peer_addr, download_buffer.len(), vrn);
                                 None
                             } else {
-                                match crate::vu_download::save_download(company.as_deref().unwrap_or(DEFAULT_COMPANY_ID), vrn.as_deref(), &imei_value, &download_buffer, tag.as_deref()) {
+                                let company_id = company.as_deref().unwrap_or(DEFAULT_COMPANY_ID);
+                                if !download_buffer.driver_card.is_empty() {
+                                    // The card's file shares the CRC with the VU's, so only its mismatch.
+                                    save_card_section(&format!("peer={}", peer_addr), company_id, &imei_value, &download_buffer.driver_card, (!matches).then_some("crc_mismatch"));
+                                }
+                                match crate::vu_download::save_download(company_id, vrn.as_deref(), &imei_value, vu_data, tag.as_deref()) {
                                     Ok(path) => {
                                         log::info!("[TCP] peer={} action=download_saved path={:?} vrn={:?} verified={}", peer_addr, path, vrn, verified);
                                         Some(path)
@@ -1006,7 +1056,7 @@ async fn handle_connection(mut stream: TcpStream, peer_addr: SocketAddr, over_so
                             let reply_bytes: Vec<u8> = reply.into();
                             let _ = write_half.write_all(&reply_bytes).await;
 
-                            download_buffer.clear();
+                            download_buffer = Default::default();
                             download_meta = None;
                         }
                     },
@@ -1090,17 +1140,17 @@ async fn handle_connection(mut stream: TcpStream, peer_addr: SocketAddr, over_so
     // device's connection dropped mid-transfer): keep it for the device to resume. If
     // it isn't resumed in time, it's recorded as incomplete then.
     if let (Some((generation, data_types)), Some(imei)) = (download_meta, imei) {
-        let bytes = std::mem::take(&mut download_buffer);
+        let data = std::mem::take(&mut download_buffer);
         log::info!(
             "[TCP] peer={} IMEI={} action=download_kept_for_resume bytes={} resume_window_seconds={}",
-            peer_addr, imei, bytes.len(), crate::partial_downloads::RESUME_WINDOW.as_secs()
+            peer_addr, imei, data.len(), crate::partial_downloads::RESUME_WINDOW.as_secs()
         );
         let partial = crate::partial_downloads::PartialDownload::new(
             company.unwrap_or_else(|| DEFAULT_COMPANY_ID.to_string()),
             imei,
             generation,
             data_types,
-            bytes,
+            data,
         );
         if let Some(replaced) = crate::partial_downloads::keep(partial) {
             record_incomplete_download(&format!("peer={} reason=replaced", peer_addr), replaced).await;

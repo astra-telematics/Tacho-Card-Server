@@ -11,6 +11,9 @@ pub mod data_types {
     pub const EVENTS_AND_FAULTS: u8 = 0x04;
     pub const DETAILED_SPEED: u8 = 0x08;
     pub const TECHNICAL_DATA: u8 = 0x10;
+    /// The driver slot's card, downloaded through the VU (from firmware D7.0.83),
+    /// in its own `DownloadChunk` section (see `vu_download::Section`).
+    pub const DRIVER_CARD: u8 = 0x20;
 }
 
 /// Sent by the device to begin handing over a completed VU download. The

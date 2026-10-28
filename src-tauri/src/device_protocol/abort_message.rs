@@ -37,6 +37,8 @@ impl VuFailure {
             5 => "UploadRequest",
             6 => "TransferData",
             7 => "Activities",
+            8 => "TransferExit",
+            9 => "CardDownload",
             _ => "Unrecognised",
         }
     }

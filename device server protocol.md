@@ -85,7 +85,8 @@ more bytes follow:
 
 - Stage, the VU exchange in progress: 0 none (not a VU failure, e.g. a malformed
   message from the server), 1 session open, 2 card ready, 3 card authentication,
-  4 download request, 5 upload request, 6 transfer data, 7 activities.
+  4 download request, 5 upload request, 6 transfer data, 7 activities, 8 transfer
+  exit, 9 driver card download.
 - UDS status that exchange got: 0 OK, 1 timeout, 2 unexpected response, 3 busy,
   4 response pending, 5 session lost, 6 rejected.
 
@@ -94,6 +95,20 @@ From firmware H7.0.82 a fourth byte follows: the VU's raw negative response code
 
 The device resets after aborting, so a download it was handing over isn't kept to
 resume: the server records it as incomplete.
+
+## Driver card download
+
+From firmware D7.0.83 the device also downloads the card in the VU's driver slot,
+through the VU, after the VU's own data. Download Start's data types then have bit
+0x20 set.
+
+Every Download Chunk from D7.0.83 starts with a section byte saying whose data it
+carries: 0 the VU's, 1 the driver card's (2, the co-driver card's, is reserved). The
+section bytes aren't part of the Download Complete CRC32, which covers the data in the
+order it was sent. The card's data is in the card download storage format (Annex 1C
+Appendix 7), after a single `76 06` separator, and is left out if the slot is empty.
+The server saves it in its own file, `DRIVER_<card number>_<IMEI>_<timestamp>.ddd`,
+beside the VU's.
 
 ## Resuming a download
 

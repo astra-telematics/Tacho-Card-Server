@@ -77,6 +77,9 @@ pub struct Features {
     pub abort_vu_failure: bool,
     /// ...followed by the VU's raw negative response code.
     pub abort_nrc: bool,
+    /// Its `DownloadChunk`s start with the section their data belongs in
+    /// (`vu_download::Section`).
+    pub download_chunk_section: bool,
 }
 
 impl Features {
@@ -84,6 +87,7 @@ impl Features {
         Self {
             abort_vu_failure: *version >= FirmwareVersion::beta('G', 7, 0, 82),
             abort_nrc: *version >= FirmwareVersion::beta('H', 7, 0, 82),
+            download_chunk_section: *version >= FirmwareVersion::beta('D', 7, 0, 83),
         }
     }
 }
@@ -133,5 +137,14 @@ mod tests {
         assert!(!has_it("G7.0.82.3"));
         assert!(has_it("H7.0.82"));
         assert!(has_it("7.0.82"));
+    }
+
+    #[test]
+    fn download_chunk_section_is_on_from_d7_0_83() {
+        let has_it = |text| Features::for_version(&version(text)).download_chunk_section;
+        assert!(!has_it("7.0.82.3"));
+        assert!(!has_it("C7.0.83"));
+        assert!(has_it("D7.0.83"));
+        assert!(has_it("7.0.83"));
     }
 }

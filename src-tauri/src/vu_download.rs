@@ -13,14 +13,6 @@ use std::path::PathBuf;
 
 use crate::config::{get_from_cache, CacheSection};
 
-/// `hex(SHA256(...))` this is not — just a plain CRC32 over the reassembled
-/// file, matching whatever the device computed, so a corrupted/incomplete
-/// transfer can be detected and the device told to redownload rather than
-/// silently persisting bad data.
-pub fn compute_crc32(data: &[u8]) -> u32 {
-    crc32fast::hash(data)
-}
-
 /// Gen1 `Overview` block layout (fixed offsets, verified against a real
 /// open-source tachograph parser and independently against documented Gen1
 /// certificate sizes — see the plan behind this module for sources):
@@ -35,7 +27,7 @@ pub fn compute_crc32(data: &[u8]) -> u32 {
 /// | VehicleRegistrationIdentification.vehicleRegNumber (VRN) | 407 | 13 |
 fn extract_vrn_gen1(data: &[u8]) -> Option<String> {
     let vrn_bytes = data.get(407..420)?;
-    Some(decode_vrn_bytes(vrn_bytes))
+    Some(decode_padded_text(vrn_bytes))
 }
 
 /// Gen2 downloads are a sequence of TREP blocks (Overview, EventsAndFaults,
@@ -98,7 +90,7 @@ fn extract_vrn_gen2(data: &[u8]) -> Option<String> {
         return None;
     }
     let record = data.get(record_start..record_start + header.record_size as usize)?;
-    Some(decode_vrn_bytes(&record[record.len() - VRN_LENGTH..]))
+    Some(decode_padded_text(&record[record.len() - VRN_LENGTH..]))
 }
 
 struct RecordArrayHeader {
@@ -176,21 +168,122 @@ pub fn validate_gen2_structure(data: &[u8]) -> Result<usize, usize> {
     }
 }
 
+/// Which file a `DownloadChunk`'s data belongs in. From firmware D7.0.83 every
+/// chunk starts with one of these bytes; before that it's all the VU's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Section {
+    Vu,
+    /// The driver slot's card, downloaded through the VU (`data_types::DRIVER_CARD`).
+    DriverCard,
+}
+
+impl Section {
+    /// `None` for anything else, including the co-driver slot's 0x02, which the
+    /// firmware reserves but doesn't send.
+    pub fn from_byte(byte: u8) -> Option<Self> {
+        match byte {
+            0x00 => Some(Self::Vu),
+            0x01 => Some(Self::DriverCard),
+            _ => None,
+        }
+    }
+}
+
+/// A download as it arrives: the VU's data and the driver card's, saved as
+/// separate files, and the CRC32 the device computes over all of it in the order
+/// it was sent (without the section bytes), so a corrupted or incomplete transfer
+/// can be detected and the device told to download again.
+#[derive(Debug, Default)]
+pub struct DownloadData {
+    pub vu: Vec<u8>,
+    pub driver_card: Vec<u8>,
+    crc: crc32fast::Hasher,
+}
+
+impl DownloadData {
+    pub fn add(&mut self, section: Section, data: &[u8]) {
+        self.crc.update(data);
+        match section {
+            Section::Vu => self.vu.extend_from_slice(data),
+            Section::DriverCard => self.driver_card.extend_from_slice(data),
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.vu.len() + self.driver_card.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    pub fn crc32(&self) -> u32 {
+        self.crc.clone().finalize()
+    }
+}
+
+/// The card's files in a driver card section. The device relays the section as
+/// a TREP section like the VU's, so it starts with the `76 06` separator (once, not
+/// per block), which isn't part of the card download storage format.
+pub fn card_files(section: &[u8]) -> &[u8] {
+    section.strip_prefix(&[0x76, 0x06]).unwrap_or(section)
+}
+
+/// One of a driver card section's files: `fileId(2) + type(1) + length(2, u16
+/// BE)` and then `length` bytes, the card download storage format of Annex 1C
+/// Appendix 7. The type's low bit is set for a signature rather than the file's
+/// data. Returns the header and data, or `None` if they don't fit in `data`.
+fn read_card_file(data: &[u8], offset: usize) -> Option<(&[u8], &[u8])> {
+    let header = data.get(offset..offset + 5)?;
+    let length = u16::from_be_bytes([header[3], header[4]]) as usize;
+    Some((header, data.get(offset + 5..offset + 5 + length)?))
+}
+
+/// `validate_gen2_structure` for a driver card section: walks it as card files
+/// (see `read_card_file`), `Ok(files)` if that lands exactly on the end, or
+/// `Err(offset)` where it stopped making sense. Diagnostic only, likewise.
+pub fn validate_card_structure(data: &[u8]) -> Result<usize, usize> {
+    let mut offset = 0;
+    let mut count = 0usize;
+    while offset < data.len() {
+        let (_, value) = read_card_file(data, offset).ok_or(offset)?;
+        offset += 5 + value.len();
+        count += 1;
+    }
+    Ok(count)
+}
+
+/// The card number from a driver card section's `EF_Identification` (file
+/// 0x0520), whose data starts `cardIssuingMemberState(1) + cardNumber(16)`.
+/// Best-effort, like `extract_vrn`.
+pub fn extract_card_number(data: &[u8]) -> Option<String> {
+    let mut offset = 0;
+    while let Some((header, value)) = read_card_file(data, offset) {
+        if header[..2] == [0x05, 0x20] && header[2] & 0x01 == 0 {
+            let number = decode_padded_text(value.get(1..17)?);
+            return (!number.is_empty()).then_some(number);
+        }
+        offset += 5 + value.len();
+    }
+    None
+}
+
 /// `vehicleRegNumber` is code-page-encoded text. Decoding as ISO-8859-1 (byte
 /// value == Unicode code point) for any codePage value is a known
 /// simplification — covers the common case without implementing every code
 /// page table from the data dictionary. Trims trailing NUL/space padding.
-fn decode_vrn_bytes(bytes: &[u8]) -> String {
+fn decode_padded_text(bytes: &[u8]) -> String {
     let text: String = bytes.iter().map(|&b| b as char).collect();
     text.trim_end_matches(['\0', ' ']).to_string()
 }
 
 /// Strips characters that are invalid in filenames on common filesystems
-/// (notably Windows, which this project targets first). VRNs are arbitrary
-/// per-country strings, so this is defensive rather than expected to trigger
-/// often.
+/// (notably Windows, which this project targets first, and Windows clients of a
+/// NAS's file share, which show a name with a control character in it only as a
+/// mangled short name like `_4VKR0~G.DDD`). VRNs are arbitrary per-country
+/// strings, so this is defensive rather than expected to trigger often.
 fn sanitize_for_filename(s: &str) -> String {
-    s.chars().filter(|c| !"/\\:*?\"<>|".contains(*c)).collect()
+    s.chars().filter(|c| !c.is_control() && !"/\\:*?\"<>|".contains(*c)).collect()
 }
 
 /// Best-effort — returns `None` on any parse failure (short buffer,
@@ -242,15 +335,27 @@ fn downloads_dir(company: &str) -> std::io::Result<PathBuf> {
 /// Appendix 7, requirement DDP_034 — the only rule is one physical file per
 /// VU download session), so this naming is our own choice.
 pub fn save_download(company: &str, vrn: Option<&str>, imei: &str, data: &[u8], tag: Option<&str>) -> std::io::Result<PathBuf> {
-    let dir = downloads_dir(company)?;
-    let timestamp = chrono::Utc::now().format("%Y%m%d_%H%M%S");
-    let vrn_part = match vrn {
+    let name = match vrn {
         Some(v) => sanitize_for_filename(v),
         None => "UNKNOWN_VRN".to_string(),
     };
+    save_file(company, &name, imei, data, tag)
+}
+
+/// `save_download` for a driver card section (see `card_files`), in its
+/// own file beside the VU's: `DRIVER_<card number>_<IMEI>_<timestamp>[_<tag>].ddd`,
+/// or `DRIVER_UNKNOWN_...` when the card number wasn't extractable.
+pub fn save_card_download(company: &str, card_number: Option<&str>, imei: &str, data: &[u8], tag: Option<&str>) -> std::io::Result<PathBuf> {
+    let name = format!("DRIVER_{}", card_number.map(sanitize_for_filename).unwrap_or_else(|| "UNKNOWN".to_string()));
+    save_file(company, &name, imei, data, tag)
+}
+
+fn save_file(company: &str, name: &str, imei: &str, data: &[u8], tag: Option<&str>) -> std::io::Result<PathBuf> {
+    let dir = downloads_dir(company)?;
+    let timestamp = chrono::Utc::now().format("%Y%m%d_%H%M%S");
     let filename = match tag {
-        Some(tag) => format!("{}_{}_{}_{}.ddd", vrn_part, imei, timestamp, tag),
-        None => format!("{}_{}_{}.ddd", vrn_part, imei, timestamp),
+        Some(tag) => format!("{}_{}_{}_{}.ddd", name, imei, timestamp, tag),
+        None => format!("{}_{}_{}.ddd", name, imei, timestamp),
     };
     let path = dir.join(filename);
     std::fs::write(&path, data)?;
@@ -286,6 +391,48 @@ mod tests {
         let data = hex::decode(GEN2V2_OVERVIEW_PREFIX_HEX).expect("valid hex fixture");
         assert_eq!(extract_vrn(2, &data), Some("SJ13KXH".to_string()));
         assert_eq!(validate_gen2_structure(&data), Ok(4));
+    }
+
+    /// A made-up driver card section: EF_Identification's data (member state, then
+    /// the 16-character card number) and its signature.
+    fn card_section() -> Vec<u8> {
+        let mut card = vec![0x05, 0x20, 0x00, 0x00, 0x11, 0x0d];
+        card.extend_from_slice(b"DB12345678901200");
+        card.extend_from_slice(&[0x05, 0x20, 0x01, 0x00, 0x02, 0xaa, 0xbb]);
+        card
+    }
+
+    #[test]
+    fn sections_are_kept_apart_and_the_crc_covers_them_in_order() {
+        let mut download = DownloadData::default();
+        download.add(Section::Vu, &[1, 2]);
+        download.add(Section::DriverCard, &[3]);
+        download.add(Section::Vu, &[4]);
+        assert_eq!((download.vu.as_slice(), download.driver_card.as_slice()), (&[1, 2, 4][..], &[3][..]));
+        assert_eq!(download.len(), 4);
+        assert_eq!(download.crc32(), crc32fast::hash(&[1, 2, 3, 4]));
+    }
+
+    #[test]
+    fn card_files_are_read_with_or_without_the_trep_separator() {
+        let mut section = vec![0x76, 0x06];
+        section.extend_from_slice(&card_section());
+        for section in [&section[..], &card_section()[..]] {
+            let card = card_files(section);
+            assert_eq!(validate_card_structure(card), Ok(2));
+            assert_eq!(extract_card_number(card), Some("DB12345678901200".to_string()));
+        }
+    }
+
+    #[test]
+    fn validate_card_structure_reports_offset_of_a_truncated_file() {
+        let card = card_section();
+        assert_eq!(validate_card_structure(&card[..card.len() - 1]), Err(22));
+    }
+
+    #[test]
+    fn control_characters_are_kept_out_of_filenames() {
+        assert_eq!(sanitize_for_filename("\u{1}SJ13KXH\t"), "SJ13KXH");
     }
 
     #[test]

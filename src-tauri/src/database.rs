@@ -530,19 +530,22 @@ fn imeis_with_downloads(conn: &Connection, company: &str) -> rusqlite::Result<Ve
     rows.collect()
 }
 
-/// Each IMEI's vehicle registration from its latest verified download that had one.
+/// Each IMEI's vehicle registration from its latest download that had one, verified
+/// or not: the VRN is in the first block, so a download that failed later still has
+/// it, and extraction follows each preceding record's declared size, so corrupted
+/// bytes there give no VRN rather than a wrong one.
 fn latest_vrns(conn: &Connection) -> rusqlite::Result<std::collections::HashMap<String, String>> {
     // SQLite takes the bare `vrn` from the row that has the MAX(id).
     let mut stmt = conn.prepare(
         "SELECT imei, vrn, MAX(id) FROM downloads
-         WHERE verified = 1 AND vrn IS NOT NULL AND vrn <> ''
+         WHERE vrn IS NOT NULL AND vrn <> ''
          GROUP BY imei",
     )?;
     let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
     rows.collect()
 }
 
-/// IMEI → vehicle registration from its latest verified download. Blocking.
+/// IMEI → vehicle registration from its latest download that had one. Blocking.
 pub fn latest_vrns_blocking() -> std::collections::HashMap<String, String> {
     with_db(Default::default(), latest_vrns)
 }
@@ -717,7 +720,7 @@ mod tests {
     }
 
     #[test]
-    fn latest_vrn_is_from_the_newest_verified_download_with_one() {
+    fn latest_vrn_is_from_the_newest_download_with_one_verified_or_not() {
         let conn = test_db();
         let with_vrn = |vrn: Option<&str>, verified: bool| DownloadRecord {
             vrn: vrn.map(str::to_string),
@@ -726,9 +729,11 @@ mod tests {
         insert_download(&conn, &with_vrn(Some("OLD1"), true), local(2026, 9, 20, 10, 0)).unwrap();
         insert_download(&conn, &with_vrn(Some("NEW1"), true), local(2026, 9, 21, 10, 0)).unwrap();
         insert_download(&conn, &with_vrn(None, true), local(2026, 9, 22, 10, 0)).unwrap();
-        insert_download(&conn, &with_vrn(Some("BAD1"), false), local(2026, 9, 23, 10, 0)).unwrap();
         let vrns = latest_vrns(&conn).unwrap();
         assert_eq!(vrns.get(IMEI).map(String::as_str), Some("NEW1"));
+        insert_download(&conn, &with_vrn(Some("PART1"), false), local(2026, 9, 23, 10, 0)).unwrap();
+        let vrns = latest_vrns(&conn).unwrap();
+        assert_eq!(vrns.get(IMEI).map(String::as_str), Some("PART1"));
         assert_eq!(vrns.len(), 1);
     }
 

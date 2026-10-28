@@ -18,6 +18,8 @@ use std::time::{Duration, Instant};
 
 use once_cell::sync::Lazy;
 
+use crate::vu_download::DownloadData;
+
 /// How long a partial download is kept for the device to resume. Longer than the
 /// device could plausibly keep its VU session open while reconnecting.
 pub const RESUME_WINDOW: Duration = Duration::from_secs(15 * 60);
@@ -28,13 +30,13 @@ pub struct PartialDownload {
     pub imei: String,
     pub generation: u8,
     pub data_types: u8,
-    pub bytes: Vec<u8>,
+    pub data: DownloadData,
     kept_at: Instant,
 }
 
 impl PartialDownload {
-    pub fn new(company: String, imei: String, generation: u8, data_types: u8, bytes: Vec<u8>) -> Self {
-        Self { company, imei, generation, data_types, bytes, kept_at: Instant::now() }
+    pub fn new(company: String, imei: String, generation: u8, data_types: u8, data: DownloadData) -> Self {
+        Self { company, imei, generation, data_types, data, kept_at: Instant::now() }
     }
 
     fn expired(&self, now: Instant) -> bool {
@@ -80,9 +82,16 @@ fn take_expired_at(now: Instant) -> Vec<PartialDownload> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::vu_download::Section;
+
+    fn partial_with(imei: &str, bytes: &[u8]) -> PartialDownload {
+        let mut data = DownloadData::default();
+        data.add(Section::Vu, bytes);
+        PartialDownload::new("acme".to_string(), imei.to_string(), 2, 0x03, data)
+    }
 
     fn partial(imei: &str) -> PartialDownload {
-        PartialDownload::new("acme".to_string(), imei.to_string(), 2, 0x03, vec![1, 2, 3])
+        partial_with(imei, &[1, 2, 3])
     }
 
     #[test]
@@ -91,7 +100,7 @@ mod tests {
         assert!(keep(partial(imei)).is_none());
         let taken = take(imei).expect("kept");
         assert!(resumable(&taken));
-        assert_eq!(taken.bytes, vec![1, 2, 3]);
+        assert_eq!(taken.data.vu, vec![1, 2, 3]);
         assert!(take(imei).is_none());
     }
 
@@ -99,9 +108,9 @@ mod tests {
     fn keeping_a_second_download_returns_the_first() {
         let imei = "356938035643825";
         keep(partial(imei));
-        let replaced = keep(PartialDownload::new("acme".to_string(), imei.to_string(), 2, 0x03, vec![9]));
-        assert_eq!(replaced.map(|p| p.bytes), Some(vec![1, 2, 3]));
-        assert_eq!(take(imei).map(|p| p.bytes), Some(vec![9]));
+        let replaced = keep(partial_with(imei, &[9]));
+        assert_eq!(replaced.map(|p| p.data.vu), Some(vec![1, 2, 3]));
+        assert_eq!(take(imei).map(|p| p.data.vu), Some(vec![9]));
     }
 
     #[test]
