@@ -17,7 +17,7 @@ pub struct ConnAnnounceMessage {
     /// When resuming, how many bytes of the download the device knows it sent up to
     /// the end of its last complete section: the server keeps that many and the device
     /// carries on from there. 4 bytes (u32 BE) after the resume flag, from firmware
-    /// E7.0.83; absent before. Meaningless when not resuming.
+    /// D7.0.83; absent before. Meaningless when not resuming.
     pub confirmed_bytes: Option<u32>,
 }
 

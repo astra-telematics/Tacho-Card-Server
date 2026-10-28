@@ -119,7 +119,7 @@ what it received for 15 minutes. The device keeps its VU session, reconnects and
 Connection Announce with one extra byte after the firmware version: 1 = resuming a
 download (absent or 0 = not).
 
-From firmware E7.0.83 four more bytes follow (u32, big-endian): how many bytes of the
+From firmware D7.0.83 four more bytes follow (u32, big-endian): how many bytes of the
 download the device sent up to the end of its last complete section. When resuming,
 the server keeps exactly that many, dropping anything after them, and the device
 carries on from there. If the server kept fewer, it can't resume and replies Try again

@@ -655,7 +655,7 @@ async fn handle_connection(mut stream: TcpStream, peer_addr: SocketAddr, over_so
                         };
 
                         // The device carries on from the end of its last complete section
-                        // (firmware E7.0.83 or later says where that is), so anything kept
+                        // (firmware D7.0.83 or later says where that is), so anything kept
                         // after it is dropped. If less than that was kept, it can't resume.
                         let confirmed_bytes = conn_announce_message.confirmed_bytes.map(|count| count as usize);
                         let partial = match crate::partial_downloads::take(&device_imei) {
