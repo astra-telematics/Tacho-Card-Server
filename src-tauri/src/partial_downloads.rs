@@ -84,6 +84,14 @@ mod tests {
     use super::*;
     use crate::vu_download::Section;
 
+    /// The kept downloads are global, and the sweep takes every expired one, so the
+    /// tests take turns.
+    static SERIAL: Mutex<()> = Mutex::new(());
+
+    fn serial() -> std::sync::MutexGuard<'static, ()> {
+        SERIAL.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     fn partial_with(imei: &str, bytes: &[u8]) -> PartialDownload {
         let mut data = DownloadData::default();
         data.add(Section::Vu, bytes);
@@ -96,6 +104,7 @@ mod tests {
 
     #[test]
     fn a_kept_download_is_resumable_once() {
+        let _serial = serial();
         let imei = "356938035643817";
         assert!(keep(partial(imei)).is_none());
         let taken = take(imei).expect("kept");
@@ -106,6 +115,7 @@ mod tests {
 
     #[test]
     fn keeping_a_second_download_returns_the_first() {
+        let _serial = serial();
         let imei = "356938035643825";
         keep(partial(imei));
         let replaced = keep(partial_with(imei, &[9]));
@@ -115,6 +125,7 @@ mod tests {
 
     #[test]
     fn only_expired_downloads_are_swept() {
+        let _serial = serial();
         let imei = "356938035643833";
         keep(partial(imei));
         assert!(!take_expired_at(Instant::now()).iter().any(|p| p.imei == imei));

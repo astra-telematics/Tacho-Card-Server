@@ -113,6 +113,7 @@ import { currentUser, invoke, isDesktop, listen, logout, type UnlistenFn } from 
 import 'animate.css'
 import { useRouter } from 'vue-router'
 import { activeDownloads, formatBytes, trackActiveDownloads } from 'src/activeDownloads'
+import { trackAuthenticatingDevices } from 'src/authenticatingDevices'
 import ChangePasswordDialog from 'src/components/ChangePasswordDialog.vue'
 import ServerConfigDialog from 'src/components/ServerConfigDialog.vue'
 import { applyTheme, THEME_OPTIONS } from 'src/utils'
@@ -168,6 +169,12 @@ onMounted(async () => {
         unlistenFns.push(await trackActiveDownloads())
     } catch (error) {
         console.error('Error following active downloads:', error)
+    }
+
+    try {
+        unlistenFns.push(await trackAuthenticatingDevices())
+    } catch (error) {
+        console.error('Error following authenticating devices:', error)
     }
 
     try {

@@ -52,6 +52,8 @@ VIN?
   - Used when the IMEI is to be ignored for whatever reason. Device should use an exponential backoff
 - 1: Accept, added to the queue
 - 2: Try again later
+  - The device should close the connection. The server leaves it open for up to 10
+    seconds for the device to read the reply and close it, then closes it itself.
 
 2 byte retry time (optional)
 
@@ -116,6 +118,12 @@ If the connection drops while the device is handing over a download, the server 
 what it received for 15 minutes. The device keeps its VU session, reconnects and sends
 Connection Announce with one extra byte after the firmware version: 1 = resuming a
 download (absent or 0 = not).
+
+From firmware E7.0.83 four more bytes follow (u32, big-endian): how many bytes of the
+download the device sent up to the end of its last complete section. When resuming,
+the server keeps exactly that many, dropping anything after them, and the device
+carries on from there. If the server kept fewer, it can't resume and replies Try again
+later. The section bytes of Download Chunks aren't counted.
 
 - **Accepted (1):** no Ready follows and no card is involved. The device carries on
   sending Download Chunks, which the server adds to what it already has, then

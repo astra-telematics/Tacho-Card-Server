@@ -14,6 +14,11 @@ pub struct ConnAnnounceMessage {
     /// the server got to, without a card (see `partial_downloads.rs`). One trailing
     /// byte after the firmware version, nonzero = set; absent = not set.
     pub resuming_download: bool,
+    /// When resuming, how many bytes of the download the device knows it sent up to
+    /// the end of its last complete section: the server keeps that many and the device
+    /// carries on from there. 4 bytes (u32 BE) after the resume flag, from firmware
+    /// E7.0.83; absent before. Meaningless when not resuming.
+    pub confirmed_bytes: Option<u32>,
 }
 
 
@@ -34,18 +39,22 @@ impl TryFrom<Vec<u8>> for ConnAnnounceMessage {
         }
 
         let fw_len = bytes[8] as usize;
-        if bytes.len() != 9 + fw_len && bytes.len() != 10 + fw_len {
+        if ![9, 10, 14].contains(&(bytes.len().wrapping_sub(fw_len))) {
             return Err(ProtocolError { message: "ConnAnnounce firmware_version length mismatch".to_string() });
         }
         let firmware_version = String::from_utf8(bytes[9..9 + fw_len].to_vec())
             .map_err(|_| ProtocolError { message: "Invalid UTF-8 in firmware_version".to_string() })?;
 
         let resuming_download = bytes.get(9 + fw_len).is_some_and(|&flag| flag != 0);
+        let confirmed_bytes = bytes
+            .get(10 + fw_len..14 + fw_len)
+            .map(|field| u32::from_be_bytes(field.try_into().unwrap()));
 
         Ok(ConnAnnounceMessage {
             imei,
             firmware_version,
             resuming_download,
+            confirmed_bytes,
         })
     }
 }
@@ -54,11 +63,14 @@ impl Into<Vec<u8>> for ConnAnnounceMessage {
     fn into(self) -> Vec<u8> {
         let imei_int: u64 = self.imei.parse().unwrap_or(0);
         let fw_bytes = self.firmware_version.into_bytes();
-        let mut bytes = Vec::with_capacity(10 + fw_bytes.len());
+        let mut bytes = Vec::with_capacity(14 + fw_bytes.len());
         bytes.extend_from_slice(&imei_int.to_be_bytes());
         bytes.push(fw_bytes.len() as u8);
         bytes.extend_from_slice(&fw_bytes);
         bytes.push(self.resuming_download as u8);
+        if let Some(confirmed_bytes) = self.confirmed_bytes {
+            bytes.extend_from_slice(&confirmed_bytes.to_be_bytes());
+        }
         bytes
     }
 }
@@ -87,5 +99,14 @@ mod tests {
         assert!(resuming.resuming_download);
         assert_eq!(resuming.firmware_version, "1.2");
         assert!(ConnAnnounceMessage::try_from(announce(&[1, 0])).is_err());
+    }
+
+    #[test]
+    fn the_confirmed_bytes_follow_the_resume_flag() {
+        assert_eq!(parse(announce(&[1])).confirmed_bytes, None);
+        let resuming = parse(announce(&[1, 0x00, 0x01, 0x02, 0x03]));
+        assert!(resuming.resuming_download);
+        assert_eq!(resuming.confirmed_bytes, Some(0x0001_0203));
+        assert!(ConnAnnounceMessage::try_from(announce(&[1, 0, 0])).is_err());
     }
 }

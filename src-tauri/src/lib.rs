@@ -9,6 +9,7 @@ mod device_protocol;    // Device protocol message definitions and parsing.
 mod card_pool;          // Bounded pool of physical cards shared across authenticating devices.
 mod vu_download;        // VU data download: CRC verification, VRN extraction, storage.
 mod download_activity;  // Downloads in progress, for the UI.
+mod auth_activity;      // Devices authenticating, for the UI.
 mod firmware;
 mod partial_downloads;  // Downloads whose connection dropped, kept for the device to resume.
 mod database;           // SQLite: download history (download interval) and card session lengths.
@@ -73,6 +74,7 @@ pub(crate) fn resend_state() {
     config::emit_card_configs();
     emit_settings();
     download_activity::emit_active_downloads();
+    auth_activity::emit_authenticating_devices();
     rt::spawn(async {
         if let Err(e) = smart_card::manual_sync_cards(String::new(), false).await {
             log::error!("Failed to resync readers: {}", e);

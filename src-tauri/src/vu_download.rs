@@ -190,22 +190,33 @@ impl Section {
 }
 
 /// A download as it arrives: the VU's data and the driver card's, saved as
-/// separate files, and the CRC32 the device computes over all of it in the order
-/// it was sent (without the section bytes), so a corrupted or incomplete transfer
-/// can be detected and the device told to download again.
+/// separate files, and the order it arrived in, for the CRC32 the device computes
+/// over all of it in the order it was sent (without the section bytes) and for
+/// cutting it back to where a resumed download carries on from.
 #[derive(Debug, Default)]
 pub struct DownloadData {
     pub vu: Vec<u8>,
     pub driver_card: Vec<u8>,
-    crc: crc32fast::Hasher,
+    /// Runs of consecutive bytes for one section, in the order they arrived.
+    runs: Vec<(Section, usize)>,
 }
 
 impl DownloadData {
-    pub fn add(&mut self, section: Section, data: &[u8]) {
-        self.crc.update(data);
+    fn section_mut(&mut self, section: Section) -> &mut Vec<u8> {
         match section {
-            Section::Vu => self.vu.extend_from_slice(data),
-            Section::DriverCard => self.driver_card.extend_from_slice(data),
+            Section::Vu => &mut self.vu,
+            Section::DriverCard => &mut self.driver_card,
+        }
+    }
+
+    pub fn add(&mut self, section: Section, data: &[u8]) {
+        if data.is_empty() {
+            return;
+        }
+        self.section_mut(section).extend_from_slice(data);
+        match self.runs.last_mut() {
+            Some((last, length)) if *last == section => *length += data.len(),
+            _ => self.runs.push((section, data.len())),
         }
     }
 
@@ -217,8 +228,44 @@ impl DownloadData {
         self.len() == 0
     }
 
+    /// Keeps only the first `length` bytes, in the order they arrived. Does nothing
+    /// if there are no more than that.
+    pub fn truncate(&mut self, length: usize) {
+        let mut kept = 0;
+        let mut kept_runs = 0;
+        let (mut vu, mut driver_card) = (0, 0);
+        for (section, run) in self.runs.iter_mut() {
+            if kept == length {
+                break;
+            }
+            *run = (*run).min(length - kept);
+            kept += *run;
+            kept_runs += 1;
+            match section {
+                Section::Vu => vu += *run,
+                Section::DriverCard => driver_card += *run,
+            }
+        }
+        if kept < length {
+            return; // There were no more than `length` bytes; nothing was cut.
+        }
+        self.runs.truncate(kept_runs);
+        self.vu.truncate(vu);
+        self.driver_card.truncate(driver_card);
+    }
+
     pub fn crc32(&self) -> u32 {
-        self.crc.clone().finalize()
+        let mut crc = crc32fast::Hasher::new();
+        let (mut vu, mut driver_card) = (0, 0);
+        for &(section, run) in &self.runs {
+            let (data, offset) = match section {
+                Section::Vu => (&self.vu, &mut vu),
+                Section::DriverCard => (&self.driver_card, &mut driver_card),
+            };
+            crc.update(&data[*offset..*offset + run]);
+            *offset += run;
+        }
+        crc.finalize()
     }
 }
 
@@ -411,6 +458,28 @@ mod tests {
         assert_eq!((download.vu.as_slice(), download.driver_card.as_slice()), (&[1, 2, 4][..], &[3][..]));
         assert_eq!(download.len(), 4);
         assert_eq!(download.crc32(), crc32fast::hash(&[1, 2, 3, 4]));
+    }
+
+    #[test]
+    fn truncating_keeps_the_first_bytes_in_the_order_they_arrived() {
+        let mut download = DownloadData::default();
+        download.add(Section::Vu, &[1, 2]);
+        download.add(Section::DriverCard, &[3, 4]);
+        download.add(Section::Vu, &[5]);
+
+        download.truncate(3);
+        assert_eq!((download.vu.as_slice(), download.driver_card.as_slice()), (&[1, 2][..], &[3][..]));
+        assert_eq!(download.crc32(), crc32fast::hash(&[1, 2, 3]));
+
+        // Carrying on after the cut.
+        download.add(Section::DriverCard, &[6]);
+        assert_eq!(download.crc32(), crc32fast::hash(&[1, 2, 3, 6]));
+
+        download.truncate(10); // more than there is: unchanged
+        assert_eq!(download.len(), 4);
+        download.truncate(0);
+        assert!(download.is_empty());
+        assert_eq!(download.crc32(), crc32fast::hash(&[]));
     }
 
     #[test]

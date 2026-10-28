@@ -13,7 +13,7 @@ use std::net::SocketAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::tcp::WriteHalf;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::watch;
@@ -54,6 +54,10 @@ const IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 /// send its next message before it's dropped — keeps a device that goes silent
 /// mid-authentication from sitting on a card forever.
 const AUTHENTICATING_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+/// How long the card has to answer an APDU relayed from the device. A card normally
+/// answers in milliseconds, and its slowest (signature) operations in well under a
+/// second, so this only catches a reader that's stopped answering altogether.
+const CARD_TRANSMIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// The read timeout for the connection's *current* phase. Any fully-received
 /// message (Ping, Pong, or anything else) implicitly resets the clock: the caller
@@ -423,6 +427,15 @@ fn save_card_section(context: &str, company: &str, imei: &str, section: &[u8], t
     }
 }
 
+/// Reports, for the UI, that the device has been sent `Ready` with a card.
+fn auth_started(peer_addr: SocketAddr, imei: &Option<String>, company: &Option<String>) {
+    crate::auth_activity::started(
+        &peer_addr.to_string(),
+        imei.as_deref().unwrap_or_default(),
+        company.as_deref().unwrap_or(DEFAULT_COMPANY_ID),
+    );
+}
+
 async fn send_abort_message(stream: &mut WriteHalf<'_>, reason: AbortReason) {
     let abort_message = AbortMessage { reason, vu_failure: None };
     let abort_bytes: Vec<u8> = Message::Abort(abort_message).into();
@@ -510,6 +523,7 @@ async fn handle_connection(mut stream: TcpStream, peer_addr: SocketAddr, over_so
         });
         let reply_bytes: Vec<u8> = reply.into();
         let _ = stream.write_all(&reply_bytes).await;
+        wait_for_device_to_close(&mut stream, peer_addr).await;
         return;
     }
 
@@ -553,6 +567,8 @@ async fn handle_connection(mut stream: TcpStream, peer_addr: SocketAddr, over_so
     let mut download_buffer = crate::vu_download::DownloadData::default();
     let mut download_meta: Option<(u8, u8)> = None; // (generation, data_types bitmask)
     const MAX_DOWNLOAD_SIZE: usize = 16 * 1024 * 1024;
+    // Set when the connection ends because the device was told to try again later.
+    let mut try_again_later = false;
 
     loop {
         // (Re)arm `pending` if nothing is currently in flight for the connection's
@@ -638,10 +654,31 @@ async fn handle_connection(mut stream: TcpStream, peer_addr: SocketAddr, over_so
                             break;
                         };
 
+                        // The device carries on from the end of its last complete section
+                        // (firmware E7.0.83 or later says where that is), so anything kept
+                        // after it is dropped. If less than that was kept, it can't resume.
+                        let confirmed_bytes = conn_announce_message.confirmed_bytes.map(|count| count as usize);
                         let partial = match crate::partial_downloads::take(&device_imei) {
-                            Some(partial) if partial.company == company_id && crate::partial_downloads::resumable(&partial) => partial,
+                            Some(mut partial)
+                                if partial.company == company_id
+                                    && crate::partial_downloads::resumable(&partial)
+                                    && confirmed_bytes.is_none_or(|count| count <= partial.data.len()) =>
+                            {
+                                if let Some(count) = confirmed_bytes {
+                                    log::info!(
+                                        "[TCP] peer={} IMEI={} action=resume_from_confirmed kept_bytes={} confirmed_bytes={} dropped_bytes={}",
+                                        peer_addr, device_imei, partial.data.len(), count, partial.data.len() - count
+                                    );
+                                    partial.data.truncate(count);
+                                }
+                                partial
+                            }
                             other => {
                                 if let Some(partial) = other {
+                                    log::warn!(
+                                        "[TCP] peer={} IMEI={} action=resume_refused kept_bytes={} confirmed_bytes={:?}",
+                                        peer_addr, device_imei, partial.data.len(), confirmed_bytes
+                                    );
                                     record_incomplete_download(&format!("peer={} reason=not_resumable", peer_addr), partial).await;
                                 }
                                 let retry_after_seconds = send_conn_response(&mut write_half, ConnResponseStatus::TryAgainLater, Some(NOTHING_TO_RESUME_RETRY)).await;
@@ -649,6 +686,7 @@ async fn handle_connection(mut stream: TcpStream, peer_addr: SocketAddr, over_so
                                     "[TCP] peer={} company={} IMEI={} firmware_version={} message=ConnAnnounce resuming_download=true action=reply status=TryAgainLater reason=nothing_to_resume retry_after_seconds={:?}",
                                     peer_addr, company_id, device_imei, firmware_version, retry_after_seconds
                                 );
+                                try_again_later = true;
                                 break;
                             }
                         };
@@ -711,6 +749,7 @@ async fn handle_connection(mut stream: TcpStream, peer_addr: SocketAddr, over_so
                                     "[TCP] peer={} company={} IMEI={} firmware_version={} message=ConnAnnounce action=reply status=TryAgainLater reason=download_interval_not_elapsed retry_after_seconds={:?}",
                                     peer_addr, company_id, device_imei, firmware_version, retry_after_seconds
                                 );
+                                try_again_later = true;
                                 break;
                             }
 
@@ -721,6 +760,7 @@ async fn handle_connection(mut stream: TcpStream, peer_addr: SocketAddr, over_so
                                     "[TCP] peer={} company={} IMEI={} firmware_version={} message=ConnAnnounce action=reply status=TryAgainLater reason=no_cards retry_after_seconds={:?}",
                                     peer_addr, company_id, device_imei, firmware_version, retry_after_seconds
                                 );
+                                try_again_later = true;
                                 break;
                             }
 
@@ -731,6 +771,7 @@ async fn handle_connection(mut stream: TcpStream, peer_addr: SocketAddr, over_so
                                     "[TCP] peer={} company={} IMEI={} firmware_version={} message=ConnAnnounce action=reply status=TryAgainLater reason=company_connection_limit limit={} retry_after_seconds={:?}",
                                     peer_addr, company_id, device_imei, firmware_version, company_config.connection_limit, retry_after_seconds
                                 );
+                                try_again_later = true;
                                 break;
                             };
 
@@ -809,8 +850,26 @@ async fn handle_connection(mut stream: TcpStream, peer_addr: SocketAddr, over_so
 
                             let apdu_hex = hex::encode(&tacho_to_card_message.data);
                             log::debug!("[TCP] peer={} action=tacho_to_card apdu_hex={}", peer_addr, apdu_hex);
-                            match guard.apdu_transmit(&apdu_hex).await {
-                                Ok(response_hex) => {
+                            match tokio::time::timeout(CARD_TRANSMIT_TIMEOUT, guard.apdu_transmit(&apdu_hex)).await {
+                                Err(_) => {
+                                    // The reader's stopped answering. PC/SC's transmit has no
+                                    // timeout of its own, so its blocked thread may never come
+                                    // back, holding the card's lock. Treat it as a pulled card:
+                                    // the device is told and waits for a replacement, and this
+                                    // card isn't handed to another device.
+                                    log::error!(
+                                        "[TCP] peer={} action=tacho_to_card status=transmit_timeout timeout={:?} reader={:?}",
+                                        peer_addr, CARD_TRANSMIT_TIMEOUT, guard.reader_name()
+                                    );
+                                    if let Some(guard) = card.as_mut() {
+                                        guard.discard_dead_card();
+                                    }
+                                    // Re-armed at the top of the loop as a wait for a replacement.
+                                    pending = None;
+                                    self::send_abort_message(&mut write_half, AbortReason::CardRemoved).await;
+                                    crate::auth_activity::finished(&peer_addr.to_string());
+                                }
+                                Ok(Ok(response_hex)) => {
                                     log::debug!("[TCP] peer={} action=card_to_tacho apdu_hex={}", peer_addr, response_hex);
                                     // Passive sniffer: extract useful plaintext EF data as it
                                     // flows through (see apdu_sniffer.rs). We stay transparent —
@@ -841,7 +900,7 @@ async fn handle_connection(mut stream: TcpStream, peer_addr: SocketAddr, over_so
                                         }
                                     }
                                 }
-                                Err(e) => {
+                                Ok(Err(e)) => {
                                     // Not necessarily a removed card (could be a bad APDU) —
                                     // card removal is handled separately via the pending
                                     // Revoked wait. Just log for now; there's no defined
@@ -917,6 +976,7 @@ async fn handle_connection(mut stream: TcpStream, peer_addr: SocketAddr, over_so
                             // `pending`-arming logic naturally arms nothing further (no
                             // card-wait), and `has_card` reads false from here on.
                             card = None;
+                            crate::auth_activity::finished(&peer_addr.to_string());
                         }
                     },
                     Message::DownloadStart(download_start_message) => {
@@ -1095,6 +1155,7 @@ async fn handle_connection(mut stream: TcpStream, peer_addr: SocketAddr, over_so
                         if write_half.write_all(&reply_bytes).await.is_ok() {
                             log::info!("[TCP] peer={} action=card_assigned status=ready_sent payload_hex={}", peer_addr, hex::encode(&reply_bytes));
                         }
+                        auth_started(peer_addr, &imei, &company);
                     }
                     CardEvent::Replaced(new_card) => {
                         if let Some(guard) = card.as_mut() {
@@ -1106,6 +1167,7 @@ async fn handle_connection(mut stream: TcpStream, peer_addr: SocketAddr, over_so
                         if write_half.write_all(&reply_bytes).await.is_ok() {
                             log::info!("[TCP] peer={} action=card_reassigned status=ready_sent payload_hex={}", peer_addr, hex::encode(&reply_bytes));
                         }
+                        auth_started(peer_addr, &imei, &company);
                     }
                     CardEvent::Revoked => {
                         // Tell the device (it resets to "connected" and waits for the
@@ -1117,6 +1179,7 @@ async fn handle_connection(mut stream: TcpStream, peer_addr: SocketAddr, over_so
                         }
                         self::send_abort_message(&mut write_half, AbortReason::CardRemoved).await;
                         log::warn!("[TCP] peer={} action=card_removed status=notified", peer_addr);
+                        crate::auth_activity::finished(&peer_addr.to_string());
                     }
                     CardEvent::NoCards => {
                         // The company's last card has gone: nothing to wait for. Tell the
@@ -1126,6 +1189,7 @@ async fn handle_connection(mut stream: TcpStream, peer_addr: SocketAddr, over_so
                             "[TCP] peer={} company={:?} action=reply status=TryAgainLater reason=no_cards_left retry_after_seconds={:?}",
                             peer_addr, company, retry_after_seconds
                         );
+                        try_again_later = true;
                         break;
                     }
                 }
@@ -1133,7 +1197,8 @@ async fn handle_connection(mut stream: TcpStream, peer_addr: SocketAddr, over_so
         }
     }
 
-    // No longer downloading, however the connection ended.
+    // No longer authenticating or downloading, however the connection ended.
+    crate::auth_activity::finished(&peer_addr.to_string());
     crate::download_activity::finished(&peer_addr.to_string());
 
     // A download that was in progress but never reached DownloadComplete (e.g. the
@@ -1156,4 +1221,29 @@ async fn handle_connection(mut stream: TcpStream, peer_addr: SocketAddr, over_so
             record_incomplete_download(&format!("peer={} reason=replaced", peer_addr), replaced).await;
         }
     }
+
+    if try_again_later {
+        // Free the card and company slot first: nothing should wait on a device that's
+        // only being given time to close.
+        drop((card, pending, _company_slot, message_reader, write_half));
+        wait_for_device_to_close(&mut stream, peer_addr).await;
+    }
+}
+
+/// How long the server leaves a connection open after telling the device to try again
+/// later, so the device can read the reply and close the connection itself.
+const TRY_AGAIN_LATER_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Waits up to `TRY_AGAIN_LATER_GRACE` for the device to close the connection,
+/// discarding anything it sends meanwhile.
+async fn wait_for_device_to_close(stream: &mut TcpStream, peer_addr: SocketAddr) {
+    let drain = async {
+        let mut buffer = [0u8; 256];
+        while matches!(stream.read(&mut buffer).await, Ok(read) if read > 0) {}
+    };
+    let closed_by = match tokio::time::timeout(TRY_AGAIN_LATER_GRACE, drain).await {
+        Ok(()) => "device",
+        Err(_) => "server",
+    };
+    log::info!("[TCP] peer={} action=try_again_later_close closed_by={}", peer_addr, closed_by);
 }

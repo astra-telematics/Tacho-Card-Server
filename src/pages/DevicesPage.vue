@@ -136,7 +136,14 @@
                         <tr v-for="device in filteredRegistered" :key="device.imei">
                             <td>{{ device.imei }}</td>
                             <td :class="{ 'text-grey': !device.vrn }">{{ device.vrn || '—' }}</td>
-                            <td>
+                            <td v-if="authenticating(device.imei)" class="text-primary">
+                                <q-spinner-dots size="1.2em" class="q-mr-xs" />
+                                Authenticating…
+                                <q-tooltip>
+                                    Started {{ formatDateTime(authenticating(device.imei)!.started_at) }}
+                                </q-tooltip>
+                            </td>
+                            <td v-else>
                                 <template v-if="device.last_auth_at">
                                     <q-icon
                                         :name="device.last_auth_succeeded ? 'mdi-check-circle' : 'mdi-close-circle'"
@@ -195,6 +202,7 @@
 <script setup lang="ts">
 import { computed, onActivated, onMounted, ref, watch } from 'vue'
 import { activeDownloads, formatBytes } from 'src/activeDownloads'
+import { authenticatingDevices } from 'src/authenticatingDevices'
 import { Notify } from 'quasar'
 import { invoke } from 'src/backend'
 import { formatDateTime } from 'src/utils'
@@ -237,6 +245,16 @@ const downloading = (imei: string) => activeDownloads.value.find((d) => d.imei =
 // When one finishes, reload for its new "Last download" time.
 watch(
     () => activeDownloads.value.length,
+    (count, previous) => {
+        if (count < previous) void load()
+    },
+)
+
+// The device's authentication in progress, if any.
+const authenticating = (imei: string) => authenticatingDevices.value.find((d) => d.imei === imei)
+// When one finishes, reload for its new "Last auth".
+watch(
+    () => authenticatingDevices.value.length,
     (count, previous) => {
         if (count < previous) void load()
     },
