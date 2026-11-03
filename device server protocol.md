@@ -129,6 +129,11 @@ The device may reconnect before the server has noticed the old connection drop. 
 server then ends the old connection itself and resumes on the new one, which can take
 up to 5 seconds before the Connection Response.
 
+The device can also resume without reconnecting, by sending Connection Announce with
+the resume flag again on the same connection. The server handles it the same way:
+keeps the confirmed count and replies Accepted, or replies Try again later if it kept
+fewer bytes or no download is in progress on that connection.
+
 - **Accepted (1):** no Ready follows and no card is involved. The device carries on
   sending Download Chunks, which the server adds to what it already has, then
   Download Complete with the CRC32 of the whole file as usual. A chunk lost in the

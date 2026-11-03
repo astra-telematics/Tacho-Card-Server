@@ -37,12 +37,14 @@ pub struct PartialDownload {
     pub generation: u8,
     pub data_types: u8,
     pub data: DownloadData,
+    /// When the device started the download, in Unix seconds, kept for the UI.
+    pub started_at: i64,
     kept_at: Instant,
 }
 
 impl PartialDownload {
-    pub fn new(company: String, imei: String, generation: u8, data_types: u8, data: DownloadData) -> Self {
-        Self { company, imei, generation, data_types, data, kept_at: Instant::now() }
+    pub fn new(company: String, imei: String, generation: u8, data_types: u8, data: DownloadData, started_at: i64) -> Self {
+        Self { company, imei, generation, data_types, data, started_at, kept_at: Instant::now() }
     }
 
     fn expired(&self, now: Instant) -> bool {
@@ -162,7 +164,7 @@ mod tests {
     fn partial_with(imei: &str, bytes: &[u8]) -> PartialDownload {
         let mut data = DownloadData::default();
         data.add(Section::Vu, bytes);
-        PartialDownload::new("acme".to_string(), imei.to_string(), 2, 0x03, data)
+        PartialDownload::new("acme".to_string(), imei.to_string(), 2, 0x03, data, 0)
     }
 
     fn partial(imei: &str) -> PartialDownload {

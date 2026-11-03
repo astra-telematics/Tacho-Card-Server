@@ -575,6 +575,8 @@ async fn handle_connection(mut stream: TcpStream, peer_addr: SocketAddr, over_so
     // accumulates whatever the device hands over. Reset on every DownloadStart.
     let mut download_buffer = crate::vu_download::DownloadData::default();
     let mut download_meta: Option<(u8, u8)> = None; // (generation, data_types bitmask)
+    // When the download was first started (Unix seconds), carried across a resume.
+    let mut download_started_at: i64 = 0;
     // Held while a download is in progress, so a resume on a new connection can take it
     // over if the device reconnects before this one is seen to drop.
     let mut live_download: Option<crate::partial_downloads::LiveDownload> = None;
@@ -704,6 +706,7 @@ async fn handle_connection(mut stream: TcpStream, peer_addr: SocketAddr, over_so
                         };
 
                         download_meta = Some((partial.generation, partial.data_types));
+                        download_started_at = partial.started_at;
                         download_buffer = partial.data;
                         live_download = Some(crate::partial_downloads::LiveDownload::start(&device_imei));
                         announced = true;
@@ -717,7 +720,70 @@ async fn handle_connection(mut stream: TcpStream, peer_addr: SocketAddr, over_so
                             peer_addr, company_id, device_imei, firmware_version, download_buffer.len()
                         );
                         if let Some((generation, _)) = download_meta {
-                            crate::download_activity::started(&peer_addr.to_string(), &device_imei, &company_id, generation, download_buffer.len());
+                            crate::download_activity::started(&peer_addr.to_string(), &device_imei, &company_id, generation, download_buffer.len(), download_started_at);
+                        }
+                    },
+                    Message::ConnAnnounce(conn_announce_message) if conn_announce_message.resuming_download => {
+                        // From a device that's already announced on this connection: it lost
+                        // its place in the download without the connection dropping, and
+                        // carries on from the end of its last complete section, as after a
+                        // reconnect.
+                        let confirmed_bytes = conn_announce_message.confirmed_bytes.map(|count| count as usize);
+                        let same_device = imei.as_deref() == Some(conn_announce_message.imei.as_str());
+                        if !same_device || download_meta.is_none() {
+                            let retry_after_seconds = send_conn_response(&mut write_half, ConnResponseStatus::TryAgainLater, Some(NOTHING_TO_RESUME_RETRY)).await;
+                            log::info!(
+                                "[TCP] peer={} IMEI={} message=ConnAnnounce resuming_download=true note=same_connection action=reply status=TryAgainLater reason=nothing_to_resume retry_after_seconds={:?}",
+                                peer_addr, conn_announce_message.imei, retry_after_seconds
+                            );
+                            try_again_later = true;
+                            break;
+                        }
+                        if confirmed_bytes.is_some_and(|count| count > download_buffer.len()) {
+                            log::warn!(
+                                "[TCP] peer={} IMEI={} note=same_connection action=resume_refused kept_bytes={} confirmed_bytes={:?}",
+                                peer_addr, conn_announce_message.imei, download_buffer.len(), confirmed_bytes
+                            );
+                            if let Some((generation, data_types)) = download_meta.take() {
+                                let partial = crate::partial_downloads::PartialDownload::new(
+                                    company.clone().unwrap_or_else(|| DEFAULT_COMPANY_ID.to_string()),
+                                    conn_announce_message.imei.clone(),
+                                    generation,
+                                    data_types,
+                                    std::mem::take(&mut download_buffer),
+                                    download_started_at,
+                                );
+                                record_incomplete_download(&format!("peer={} reason=not_resumable", peer_addr), partial).await;
+                            }
+                            let retry_after_seconds = send_conn_response(&mut write_half, ConnResponseStatus::TryAgainLater, Some(NOTHING_TO_RESUME_RETRY)).await;
+                            log::info!(
+                                "[TCP] peer={} IMEI={} message=ConnAnnounce resuming_download=true note=same_connection action=reply status=TryAgainLater reason=not_resumable retry_after_seconds={:?}",
+                                peer_addr, conn_announce_message.imei, retry_after_seconds
+                            );
+                            try_again_later = true;
+                            break;
+                        }
+                        if let Some(count) = confirmed_bytes {
+                            log::info!(
+                                "[TCP] peer={} IMEI={} note=same_connection action=resume_from_confirmed kept_bytes={} confirmed_bytes={} dropped_bytes={}",
+                                peer_addr, conn_announce_message.imei, download_buffer.len(), count, download_buffer.len() - count
+                            );
+                            download_buffer.truncate(count);
+                        }
+                        send_conn_response(&mut write_half, ConnResponseStatus::Accepted, None).await;
+                        log::info!(
+                            "[TCP] peer={} IMEI={} message=ConnAnnounce resuming_download=true note=same_connection action=reply status=Accepted bytes_so_far={}",
+                            peer_addr, conn_announce_message.imei, download_buffer.len()
+                        );
+                        if let Some((generation, _)) = download_meta {
+                            crate::download_activity::started(
+                                &peer_addr.to_string(),
+                                &conn_announce_message.imei,
+                                company.as_deref().unwrap_or(DEFAULT_COMPANY_ID),
+                                generation,
+                                download_buffer.len(),
+                                download_started_at,
+                            );
                         }
                     },
                     Message::ConnAnnounce(conn_announce_message) => {
@@ -957,6 +1023,7 @@ async fn handle_connection(mut stream: TcpStream, peer_addr: SocketAddr, over_so
                                 generation,
                                 data_types,
                                 std::mem::take(&mut download_buffer),
+                                download_started_at,
                             );
                             record_incomplete_download(&format!("peer={} reason=device_abort", peer_addr), partial).await;
                         }
@@ -999,6 +1066,7 @@ async fn handle_connection(mut stream: TcpStream, peer_addr: SocketAddr, over_so
                         } else {
                             download_buffer = Default::default();
                             download_meta = Some((download_start_message.generation, download_start_message.data_types));
+                            download_started_at = chrono::Utc::now().timestamp();
                             live_download = imei.as_deref().map(crate::partial_downloads::LiveDownload::start);
                             // Starting afresh: a download the device left part-way won't be resumed.
                             if let Some(abandoned) = imei.as_deref().and_then(crate::partial_downloads::take) {
@@ -1014,6 +1082,7 @@ async fn handle_connection(mut stream: TcpStream, peer_addr: SocketAddr, over_so
                                 company.as_deref().unwrap_or(DEFAULT_COMPANY_ID),
                                 download_start_message.generation,
                                 0,
+                                download_started_at,
                             );
                         }
                     },
@@ -1235,6 +1304,7 @@ async fn handle_connection(mut stream: TcpStream, peer_addr: SocketAddr, over_so
             generation,
             data_types,
             data,
+            download_started_at,
         );
         let replaced = crate::partial_downloads::keep(partial);
         // Kept: a resume waiting for it can take it now.
