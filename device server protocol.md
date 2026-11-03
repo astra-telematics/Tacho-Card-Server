@@ -125,6 +125,10 @@ the server keeps exactly that many, dropping anything after them, and the device
 carries on from there. If the server kept fewer, it can't resume and replies Try again
 later. The section bytes of Download Chunks aren't counted.
 
+The device may reconnect before the server has noticed the old connection drop. The
+server then ends the old connection itself and resumes on the new one, which can take
+up to 5 seconds before the Connection Response.
+
 - **Accepted (1):** no Ready follows and no card is involved. The device carries on
   sending Download Chunks, which the server adds to what it already has, then
   Download Complete with the CRC32 of the whole file as usual. A chunk lost in the

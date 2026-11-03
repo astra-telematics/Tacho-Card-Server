@@ -480,6 +480,15 @@ async fn poll_pending(pending: &mut Option<PendingCardEvent>) -> CardEvent {
     }
 }
 
+/// Resolves when a resume on another connection wants the download this one is
+/// carrying; never, if it isn't carrying one.
+async fn handover_requested(live_download: &Option<crate::partial_downloads::LiveDownload>) {
+    match live_download {
+        Some(live_download) => live_download.handover_requested().await,
+        None => std::future::pending().await,
+    }
+}
+
 /// Whether downloads that failed (CRC mismatch) or never finished are still written to
 /// disk, tagged, for debugging (`download.retain_failed_downloads` in config.yaml). Off
 /// by default: such a download is then only logged and recorded in the database. Read
@@ -566,6 +575,9 @@ async fn handle_connection(mut stream: TcpStream, peer_addr: SocketAddr, over_so
     // accumulates whatever the device hands over. Reset on every DownloadStart.
     let mut download_buffer = crate::vu_download::DownloadData::default();
     let mut download_meta: Option<(u8, u8)> = None; // (generation, data_types bitmask)
+    // Held while a download is in progress, so a resume on a new connection can take it
+    // over if the device reconnects before this one is seen to drop.
+    let mut live_download: Option<crate::partial_downloads::LiveDownload> = None;
     const MAX_DOWNLOAD_SIZE: usize = 16 * 1024 * 1024;
     // Set when the connection ends because the device was told to try again later.
     let mut try_again_later = false;
@@ -658,7 +670,7 @@ async fn handle_connection(mut stream: TcpStream, peer_addr: SocketAddr, over_so
                         // (firmware D7.0.83 or later says where that is), so anything kept
                         // after it is dropped. If less than that was kept, it can't resume.
                         let confirmed_bytes = conn_announce_message.confirmed_bytes.map(|count| count as usize);
-                        let partial = match crate::partial_downloads::take(&device_imei) {
+                        let partial = match crate::partial_downloads::take_for_resume(&device_imei).await {
                             Some(mut partial)
                                 if partial.company == company_id
                                     && crate::partial_downloads::resumable(&partial)
@@ -693,6 +705,7 @@ async fn handle_connection(mut stream: TcpStream, peer_addr: SocketAddr, over_so
 
                         download_meta = Some((partial.generation, partial.data_types));
                         download_buffer = partial.data;
+                        live_download = Some(crate::partial_downloads::LiveDownload::start(&device_imei));
                         announced = true;
                         imei = Some(device_imei.clone());
                         firmware_features = features_for_firmware(peer_addr, &device_imei, &firmware_version);
@@ -986,6 +999,7 @@ async fn handle_connection(mut stream: TcpStream, peer_addr: SocketAddr, over_so
                         } else {
                             download_buffer = Default::default();
                             download_meta = Some((download_start_message.generation, download_start_message.data_types));
+                            live_download = imei.as_deref().map(crate::partial_downloads::LiveDownload::start);
                             // Starting afresh: a download the device left part-way won't be resumed.
                             if let Some(abandoned) = imei.as_deref().and_then(crate::partial_downloads::take) {
                                 record_incomplete_download(&format!("peer={} reason=restarted", peer_addr), abandoned).await;
@@ -1118,6 +1132,7 @@ async fn handle_connection(mut stream: TcpStream, peer_addr: SocketAddr, over_so
 
                             download_buffer = Default::default();
                             download_meta = None;
+                            live_download = None;
                         }
                     },
                     Message::DownloadAck(_download_ack_message) => {
@@ -1143,6 +1158,10 @@ async fn handle_connection(mut stream: TcpStream, peer_addr: SocketAddr, over_so
                 break;
             }
             },
+            _ = handover_requested(&live_download) => {
+                log::info!("[TCP] peer={} IMEI={:?} action=download_handed_over reason=device_reconnected", peer_addr, imei);
+                break;
+            }
             event = poll_pending(&mut pending) => {
                 pending = None; // consumed; re-armed for the new state at the top of the next iteration
                 match event {
@@ -1217,7 +1236,10 @@ async fn handle_connection(mut stream: TcpStream, peer_addr: SocketAddr, over_so
             data_types,
             data,
         );
-        if let Some(replaced) = crate::partial_downloads::keep(partial) {
+        let replaced = crate::partial_downloads::keep(partial);
+        // Kept: a resume waiting for it can take it now.
+        drop(live_download);
+        if let Some(replaced) = replaced {
             record_incomplete_download(&format!("peer={} reason=replaced", peer_addr), replaced).await;
         }
     }

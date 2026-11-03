@@ -8,15 +8,21 @@
 //! Kept in memory only, one per device: a server restart loses them, and the device
 //! is told there's nothing to resume and starts again.
 //!
+//! The device can notice its connection has dropped before the server does, and
+//! reconnect while the server still has the download on the old connection. That
+//! connection is then asked to hand it over (see `LiveDownload`), so it's kept in time
+//! for the resume.
+//!
 //! A partial download that isn't resumed within `RESUME_WINDOW`, or that the device
 //! replaces with a new `DownloadStart`, is recorded as incomplete (see
 //! `socket_server::record_incomplete_download`), as it was before resuming existed.
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use once_cell::sync::Lazy;
+use tokio::sync::Notify;
 
 use crate::vu_download::DownloadData;
 
@@ -55,6 +61,67 @@ fn partials() -> std::sync::MutexGuard<'static, HashMap<String, PartialDownload>
 /// device already had one (it should have resumed or restarted that one instead).
 pub fn keep(partial: PartialDownload) -> Option<PartialDownload> {
     partials().insert(partial.imei.clone(), partial)
+}
+
+/// How long a resume waits for the connection still carrying the download to hand it
+/// over. It only has to stop reading and keep what it has.
+const HANDOVER_TIMEOUT: Duration = Duration::from_secs(5);
+
+#[derive(Default)]
+struct Handover {
+    /// Set when a resume wants the download.
+    requested: Notify,
+    /// Set once the connection has stopped carrying it (and kept it, if unfinished).
+    released: Notify,
+}
+
+/// By IMEI: the connections currently carrying a download.
+static LIVE: Lazy<Mutex<HashMap<String, Arc<Handover>>>> = Lazy::new(|| Mutex::new(HashMap::new()));
+
+fn live() -> std::sync::MutexGuard<'static, HashMap<String, Arc<Handover>>> {
+    LIVE.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Held by the connection carrying a device's download, from `DownloadStart` (or an
+/// accepted resume) until the download is finished or kept. Drop it after `keep`.
+pub struct LiveDownload {
+    imei: String,
+    handover: Arc<Handover>,
+}
+
+impl LiveDownload {
+    pub fn start(imei: &str) -> Self {
+        let handover = Arc::new(Handover::default());
+        live().insert(imei.to_string(), Arc::clone(&handover));
+        Self { imei: imei.to_string(), handover }
+    }
+
+    /// Resolves when a resume on another connection wants this download: the connection
+    /// should end, keeping it.
+    pub async fn handover_requested(&self) {
+        self.handover.requested.notified().await
+    }
+}
+
+impl Drop for LiveDownload {
+    fn drop(&mut self) {
+        let mut live = live();
+        if live.get(&self.imei).is_some_and(|handover| Arc::ptr_eq(handover, &self.handover)) {
+            live.remove(&self.imei);
+        }
+        self.handover.released.notify_one();
+    }
+}
+
+/// As `take`, but if another connection is still carrying the device's download (it
+/// hasn't noticed its connection drop yet), asks it to hand the download over first.
+pub async fn take_for_resume(imei: &str) -> Option<PartialDownload> {
+    let handover = live().get(imei).cloned();
+    if let Some(handover) = handover {
+        handover.requested.notify_one();
+        let _ = tokio::time::timeout(HANDOVER_TIMEOUT, handover.released.notified()).await;
+    }
+    take(imei)
 }
 
 /// Takes the device's partial download, whether or not it's the one being resumed or
@@ -121,6 +188,21 @@ mod tests {
         let replaced = keep(partial_with(imei, &[9]));
         assert_eq!(replaced.map(|p| p.data.vu), Some(vec![1, 2, 3]));
         assert_eq!(take(imei).map(|p| p.data.vu), Some(vec![9]));
+    }
+
+    #[tokio::test]
+    async fn a_download_still_on_another_connection_is_handed_over_for_resume() {
+        let _serial = serial();
+        let imei = "356938035643841";
+        let live = LiveDownload::start(imei);
+        let old_connection = tokio::spawn(async move {
+            live.handover_requested().await;
+            keep(partial_with(imei, &[4, 5, 6]));
+            drop(live);
+        });
+        let taken = take_for_resume(imei).await.map(|p| p.data.vu);
+        old_connection.await.unwrap();
+        assert_eq!(taken, Some(vec![4, 5, 6]));
     }
 
     #[test]
