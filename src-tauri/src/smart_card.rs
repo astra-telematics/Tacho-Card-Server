@@ -643,33 +643,6 @@ impl ManagedCard {
         }
     }
 
-    /// Force the card connection onto a specific protocol, rather than letting
-    /// PCSC auto-negotiate — used once the far-end VU reveals which protocol it
-    /// actually wants to talk (inferred from the length of its first APDU),
-    /// which can differ from whatever `Protocols::ANY` settled on at connect
-    /// time for a card that declares both T=0 and T=1 in its ATR.
-    pub async fn reconnect_to_protocol(&self, protocol: Protocols) -> DynResult<()> {
-        let mut card = self.inner.lock().await;
-        // `ResetCard` (not `LeaveCard`) — a plain reconnect without a reset isn't
-        // guaranteed to make the reader actually renegotiate T=0/T=1 with the
-        // card; matches the disposition `reconnect()` already uses for the same
-        // reason when recovering a stale card.
-        match catch_pcsc_panic(move || {
-            card.reconnect(ShareMode::Shared, protocol, Disposition::ResetCard)
-        })? {
-            Ok(()) => {
-                self.protocol.store(protocol.bits() as u32, Ordering::Relaxed);
-                debug!(
-                    "Reconnected reader '{}' onto protocol {:?}",
-                    self.reader_name.to_string_lossy(),
-                    protocol
-                );
-                Ok(())
-            }
-            Err(pcsc_err) => Err(Box::<dyn StdError + Send + Sync>::from(pcsc_err)),
-        }
-    }
-
     pub async fn recreate(&self) -> DynResult<()> {
         let (new_card, protocol) = Self::create_card(&self.reader_name, &self.atr)?;
         let mut lock = self.inner.lock().await;

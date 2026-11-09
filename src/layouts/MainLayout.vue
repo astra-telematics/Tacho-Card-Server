@@ -51,6 +51,7 @@
                         round
                         :icon="isDesktop ? 'mdi-theme-light-dark' : 'mdi-account-circle'"
                     >
+                        <q-badge v-if="updateStatus?.update_available" floating rounded color="green" />
                         <q-menu>
                             <q-list style="min-width: 200px">
                                 <q-item-label v-if="!isDesktop" header>
@@ -85,6 +86,33 @@
                                         </q-item-section>
                                         <q-item-section>Log out</q-item-section>
                                     </q-item>
+                                    <template v-if="updateStatus">
+                                        <q-separator />
+                                        <q-item
+                                            v-if="updateStatus.update_available && updateStatus.can_update"
+                                            v-close-popup
+                                            clickable
+                                            @click="confirmUpdate"
+                                        >
+                                            <q-item-section avatar>
+                                                <q-icon name="mdi-update" color="green" />
+                                            </q-item-section>
+                                            <q-item-section>
+                                                <q-item-label>Update to {{ updateStatus.latest_version }}</q-item-label>
+                                                <q-item-label caption>Running v{{ updateStatus.current_version }}</q-item-label>
+                                            </q-item-section>
+                                        </q-item>
+                                        <q-item v-else>
+                                            <q-item-section>
+                                                <q-item-label caption>
+                                                    Version {{ updateStatus.current_version }}
+                                                    <template v-if="updateStatus.update_available">
+                                                        ({{ updateStatus.latest_version }} available)
+                                                    </template>
+                                                </q-item-label>
+                                            </q-item-section>
+                                        </q-item>
+                                    </template>
                                 </template>
                             </q-list>
                         </q-menu>
@@ -107,13 +135,13 @@
 </template>
 
 <script setup lang="ts">
-import { Notify } from 'quasar'
+import { Notify, useQuasar } from 'quasar'
 import { ref, onMounted, onUnmounted } from 'vue'
 import { currentUser, invoke, isDesktop, listen, logout, type UnlistenFn } from 'src/backend'
 import 'animate.css'
 import { useRouter } from 'vue-router'
 import { activeDownloads, formatBytes, trackActiveDownloads } from 'src/activeDownloads'
-import { trackAuthenticatingDevices } from 'src/authenticatingDevices'
+import { authenticatingDevices, trackAuthenticatingDevices } from 'src/authenticatingDevices'
 import ChangePasswordDialog from 'src/components/ChangePasswordDialog.vue'
 import ServerConfigDialog from 'src/components/ServerConfigDialog.vue'
 import { applyTheme, THEME_OPTIONS } from 'src/utils'
@@ -123,6 +151,7 @@ defineOptions({
 })
 
 const router = useRouter()
+const $q = useQuasar()
 const configOpen = ref(false)
 const passwordOpen = ref(false)
 const serverStatus = ref(-1)
@@ -147,6 +176,55 @@ const changeTheme = async (value: string) => {
     }
 }
 
+// The server build's version and whether it can update itself (updater.rs).
+interface UpdateStatus {
+    current_version: string
+    latest_version: string | null
+    update_available: boolean
+    can_update: boolean
+}
+const updateStatus = ref<UpdateStatus | null>(null)
+
+const confirmUpdate = () => {
+    const status = updateStatus.value
+    if (!status) return
+    const busy = [
+        activeDownloads.value.length > 0 ? `${activeDownloads.value.length} downloading` : '',
+        authenticatingDevices.value.length > 0
+            ? `${authenticatingDevices.value.length} authenticating`
+            : '',
+    ].filter(Boolean)
+    $q.dialog({
+        title: `Update to ${status.latest_version}?`,
+        message:
+            "The server restarts with the new version, which takes a minute or so, and you'll need to log in again." +
+            (busy.length > 0
+                ? ` Devices are using it right now (${busy.join(', ')}): they'll be cut off and try again later.`
+                : ''),
+        cancel: true,
+        ok: { label: 'Update', color: busy.length > 0 ? 'negative' : 'primary', unelevated: true },
+    }).onOk(() => {
+        void (async () => {
+            try {
+                await invoke('start_update')
+                Notify.create({
+                    message: `Updating to ${status.latest_version}. The server will be back shortly.`,
+                    color: 'green',
+                    position: 'bottom',
+                    timeout: 15000,
+                })
+            } catch (error) {
+                Notify.create({
+                    message: typeof error === 'string' ? `Couldn't update: ${error}` : "Couldn't update.",
+                    color: 'red',
+                    position: 'bottom',
+                    timeout: 8000,
+                })
+            }
+        })()
+    })
+}
+
 // Registered Tauri listeners. Stored so we can detach them on unmount —
 // otherwise stale handlers keep mutating dead reactive state and pile up
 // across hot reloads in dev.
@@ -163,6 +241,14 @@ onMounted(async () => {
         applyTheme(theme.value)
     } catch (error) {
         console.error('Error loading theme:', error)
+    }
+
+    if (!isDesktop) {
+        try {
+            updateStatus.value = await invoke<UpdateStatus>('get_update_status')
+        } catch (error) {
+            console.error('Error checking for updates:', error)
+        }
     }
 
     try {

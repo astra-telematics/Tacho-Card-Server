@@ -483,6 +483,11 @@ async fn dispatch(command: &str, args_value: Value, token: &str, username: &str)
             let a: CardNumberArg = args(args_value)?;
             json(config::remove_card(a.cardnumber).await?)
         }
+        "get_update_status" => json(crate::updater::get_update_status().await),
+        "start_update" => {
+            crate::updater::start_update(username).await?;
+            Ok(Value::Null)
+        }
         "get_users" => json(users::get_users().await?),
         "add_user" => {
             let a: UserPasswordArgs = args(args_value)?;

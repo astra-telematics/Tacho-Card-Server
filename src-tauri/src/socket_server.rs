@@ -562,12 +562,9 @@ async fn handle_connection(mut stream: TcpStream, peer_addr: SocketAddr, over_so
     // take its place.
     let mut card: Option<crate::card_pool::CardGuard> = None;
     let mut pending: Option<PendingCardEvent> = None;
-    // Whether we've already inspected the current card session's first TachoToCard
-    // frame to detect which protocol the VU actually wants (21-byte APDU = T=0,
-    // 22-byte = T=1, per the FMS-standard remote company card spec) and reconnected
-    // the physical card to match if PCSC's own auto-negotiation guessed differently.
-    // Reset on every fresh/replacement card, since each one gets its own Ready and
-    // the VU redoes this detection against its own first frame each time.
+    // Whether this card session has already seen which protocol the VU is talking
+    // (21-byte Internal Authenticate = T=0, 22-byte = T=1), so it's only logged once.
+    // Reset on every fresh/replacement card, since each one gets its own Ready.
     let mut protocol_confirmed = false;
     // VU download handoff state (see vu_download.rs). None of this touches the
     // physical card — RequestUpload/TransferData/RequestTransferExit happen
@@ -889,18 +886,17 @@ async fn handle_connection(mut stream: TcpStream, peer_addr: SocketAddr, over_so
                         } else {
                             let guard = card.as_ref().unwrap();
 
-                            // Gen1-only fallback: on the older 3DES scheme, the VU's
-                            // Internal Authenticate APDU length reveals its protocol choice
-                            // (21 bytes = T=0, 22 = T=1) independently of the ATR. Confirmed
-                            // on real hardware (see TACHOGRAPH_RDL_HANDOFF.md) that this
-                            // does NOT apply to Gen2 ECC-based auth — GENERAL AUTHENTICATE
-                            // never varies in length by protocol — so `wanted` will just
-                            // stay `None` forever on that card generation and this block is
-                            // a no-op; `ManagedCard::new`'s ATR-declared-default connect is
-                            // the real defense there. Left in for the Gen1 case, where this
-                            // is a genuinely faster, guess-free option. Keep sniffing every
-                            // frame's length (not just frame #1 — housekeeping commands like
-                            // SELECT commonly come first) until one actually matches.
+                            // Gen1's Internal Authenticate shows which protocol the VU is
+                            // talking: 21 bytes for T=0, 22 (with Le) for T=1. The card
+                            // isn't switched to match: that needs a reset, which would wipe
+                            // what the VU has just set up on the card (MSE SET's key always
+                            // comes just before), and the card then answers `6A88`. It
+                            // doesn't need to be either: on T=0, a command sent the T=1 way
+                            // has its response fetched here (`collect_waiting_data`), so the
+                            // VU gets what a T=1 card would send. A VU talking T=0 to a card
+                            // on T=1 isn't handled, so it's logged. Gen2's GENERAL
+                            // AUTHENTICATE doesn't vary in length by protocol, so this never
+                            // matches there.
                             if !protocol_confirmed {
                                 let len = tacho_to_card_message.data.len();
                                 let wanted = match len {
@@ -908,21 +904,21 @@ async fn handle_connection(mut stream: TcpStream, peer_addr: SocketAddr, over_so
                                     22 => Some(pcsc::Protocols::T1),
                                     _ => None,
                                 };
-                                log::debug!(
-                                    "[TCP] peer={} action=protocol_check apdu_len={} current_protocol={:?} inferred_protocol={:?}",
-                                    peer_addr, len, guard.protocol(), wanted
-                                );
                                 if let Some(wanted) = wanted {
                                     protocol_confirmed = true;
-                                    if guard.protocol() != wanted {
+                                    let current = guard.protocol();
+                                    if current == wanted {
+                                        log::debug!("[TCP] peer={} action=protocol_check protocol={:?} status=match", peer_addr, current);
+                                    } else if current == pcsc::Protocols::T0 {
                                         log::info!(
-                                            "[TCP] peer={} action=protocol_switch from={:?} to={:?}",
-                                            peer_addr, guard.protocol(), wanted
+                                            "[TCP] peer={} action=protocol_check vu_protocol={:?} card_protocol={:?} status=served_over_t0",
+                                            peer_addr, wanted, current
                                         );
-                                        match guard.reconnect_to_protocol(wanted).await {
-                                            Ok(()) => log::info!("[TCP] peer={} action=protocol_switch status=ok now={:?}", peer_addr, guard.protocol()),
-                                            Err(e) => log::error!("[TCP] peer={} action=protocol_switch status=failed err={}", peer_addr, e),
-                                        }
+                                    } else {
+                                        log::warn!(
+                                            "[TCP] peer={} action=protocol_check vu_protocol={:?} card_protocol={:?} status=mismatch",
+                                            peer_addr, wanted, current
+                                        );
                                     }
                                 }
                             }

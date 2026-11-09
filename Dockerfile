@@ -50,7 +50,9 @@ VOLUME /data /downloads
 # read-only in the UI: then the exposed ports always match what the server listens on,
 # and downloads always land in the volume. To use other ports, change the host side of
 # the port mappings (docker-compose.yml), not these.
+# TCS_DOCKER: running in this image, so the web UI can offer updates (updater.rs).
 ENV TZ=UTC \
+    TCS_DOCKER=1 \
     TCS_LISTEN_PORT=7878 \
     TCS_WEB_PORT=8080 \
     TCS_DOWNLOAD_PATH=/downloads

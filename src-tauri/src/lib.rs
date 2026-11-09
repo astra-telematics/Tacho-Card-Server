@@ -11,6 +11,7 @@ mod vu_download;        // VU data download: CRC verification, VRN extraction, s
 mod download_activity;  // Downloads in progress, for the UI.
 mod auth_activity;      // Devices authenticating, for the UI.
 mod firmware;
+mod updater;            // Updating the server build's container from the web UI (Watchtower).
 mod partial_downloads;  // Downloads whose connection dropped, kept for the device to resume.
 mod database;           // SQLite: download history (download interval) and card session lengths.
 mod users;              // User accounts (database) and the built-in admin, whose password is in config.yaml.

@@ -134,6 +134,14 @@ UI is plain HTTP: keep it on the LAN or behind a TLS reverse proxy.
 `./data`, downloads in `./downloads` (bind any folder there), and the admin password is
 in `./data/config.yaml` after the first start.
 
+Updates from the web UI: the compose file also runs an updater (Watchtower), which
+installs a new release when you choose **Update** in the account menu. It needs a
+shared token in `.env` beside the compose file, made once with
+`echo "UPDATER_TOKEN=$(openssl rand -hex 32)" > .env`. The menu only offers updates
+in the Docker image, with `TCS_UPDATER_TOKEN` set and the updater answering; otherwise
+it just shows the version. `TCS_UPDATER_URL` overrides the updater's address
+(`http://updater:8080`).
+
 Environment variables `TCS_LISTEN_PORT` (device port) and `TCS_DOWNLOAD_PATH` (download
 folder) override config.yaml and make those settings read-only in the UI. The Docker
 image sets both, so change ports with the host side of the compose port mappings.

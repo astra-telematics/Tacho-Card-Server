@@ -3,7 +3,6 @@ use std::path::PathBuf;
 
 use flexi_logger::{Age, Cleanup, Criterion, Duplicate, FileSpec, Logger, LoggerHandle, Naming};
 use once_cell::sync::OnceCell;
-use reqwest;
 use serde::Deserialize;
 
 use crate::global_app_handle::emit_notification_event;
@@ -136,59 +135,62 @@ fn log_system_info() {
     );
 }
 
-async fn check_latest_version() -> Result<(), reqwest::Error> {
-    let url = "https://api.github.com/repos/astra-telematics/Tacho-Card-Server/releases/latest";
-    let client = reqwest::Client::new();
-    let response = client
-        .get(url)
+const LATEST_RELEASE_URL: &str = "https://api.github.com/repos/astra-telematics/Tacho-Card-Server/releases/latest";
+
+/// The latest release's tag (e.g. `v0.0.12`), from GitHub.
+pub(crate) async fn latest_release_tag() -> Result<String, String> {
+    let response = reqwest::Client::new()
+        .get(LATEST_RELEASE_URL)
         .header("User-Agent", "reqwest")
         .send()
-        .await?;
+        .await
+        .map_err(|e| e.to_string())?;
+    if !response.status().is_success() {
+        return Err(format!("GitHub answered {}", response.status()));
+    }
+    let release: Release = response.json().await.map_err(|e| e.to_string())?;
+    Ok(release.tag_name)
+}
 
-    if response.status().is_success() {
-        let release: Release = response.json().await?;
-        // log::info!("Latest release info: {:?}", release);
+async fn check_latest_version() -> Result<(), String> {
+    let url = LATEST_RELEASE_URL;
+    let latest_version = latest_release_tag().await?;
+    let current_version = env!("CARGO_PKG_VERSION");
 
-        let latest_version = release.tag_name;
-        let current_version = env!("CARGO_PKG_VERSION");
+    let latest_version_num = version_to_number(&latest_version);
+    let current_version_num = version_to_number(current_version);
 
-        let latest_version_num = version_to_number(&latest_version);
-        let current_version_num = version_to_number(current_version);
+    if current_version_num > latest_version_num {
+        log::info!(
+            "Version (current: {}, latest: {})",
+            current_version,
+            latest_version
+        );
+    } else if current_version_num < latest_version_num {
+        log::info!(
+            "Version (current: {}, latest: {}). New one is available, use the link to download: {}",
+            current_version,
+            latest_version,
+            url
+        );
 
-        if current_version_num > latest_version_num {
-            log::info!(
-                "Version (current: {}, latest: {})",
-                current_version,
-                latest_version
-            );
-        } else if current_version_num < latest_version_num {
-            log::info!(
-                "Version (current: {}, latest: {}). New one is available, use the link to download: {}",
-                current_version,
-                latest_version,
-                url
-            );
-
-            let payload = NotificationPayload {
-                notification_type: "version".to_string(),
-                message: format!("New version {} is available, use the link to download: {}", latest_version, url).into(),
-            };
-            emit_notification_event("global-notification", payload);
-        } else {
-            log::info!(
-                "Version (current: {}, latest: {}). You are using the latest version.",
-                current_version,
-                latest_version
-            );
-        }
+        let payload = NotificationPayload {
+            notification_type: "version".to_string(),
+            message: format!("New version {} is available, use the link to download: {}", latest_version, url).into(),
+        };
+        emit_notification_event("global-notification", payload);
     } else {
-        log::warn!("Version. Failed to fetch the latest release info: {}", response.status());
+        log::info!(
+            "Version (current: {}, latest: {}). You are using the latest version.",
+            current_version,
+            latest_version
+        );
     }
 
     Ok(())
 }
 
-fn version_to_number(version: &str) -> u32 {
+pub(crate) fn version_to_number(version: &str) -> u32 {
     version
         .trim_start_matches('v')
         .split('.')
