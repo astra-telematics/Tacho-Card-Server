@@ -39,6 +39,11 @@
                     />
                     <q-route-tab to="/companies" icon="mdi-domain" label="Companies" />
                     <q-route-tab to="/devices" icon="mdi-truck-outline" label="Devices" />
+                    <q-route-tab
+                        to="/driver-cards"
+                        icon="mdi-card-account-details-star-outline"
+                        label="Driver cards"
+                    />
                     <q-route-tab to="/users" icon="mdi-account-multiple-outline" label="Users" />
                 </q-tabs>
 

@@ -1797,6 +1797,60 @@ pub fn get_devices() -> DevicesView {
     DevicesView { sole_company, registered, unknown }
 }
 
+/// Regulations require a driver card download at least this often.
+pub const DRIVER_CARD_LEGAL_INTERVAL_DAYS: u32 = 28;
+
+/// A driver card on the Driver cards page.
+#[derive(Serialize, Clone, Debug)]
+pub struct DriverCardRow {
+    #[serde(flatten)]
+    pub download: crate::database::DriverCardDownload,
+    /// Server-local date (YYYY-MM-DD) from which it's due again, by its company's
+    /// `card_download_interval_days`; `None` if that's 0 (no limit).
+    pub next_due_date: Option<String>,
+    /// Server-local date by which regulations need it downloaded again.
+    pub legal_due_date: String,
+}
+
+#[derive(Serialize, Clone, Debug)]
+pub struct DriverCardsView {
+    /// Server-local today (YYYY-MM-DD), to compare the dates with.
+    pub today: String,
+    pub cards: Vec<DriverCardRow>,
+}
+
+/// Every driver card downloaded so far, per company, with when it was last
+/// downloaded, in which vehicle and slot, and when it's next due.
+#[cfg_attr(feature = "desktop", tauri::command)]
+pub fn get_driver_cards() -> DriverCardsView {
+    let intervals: HashMap<String, u32> = CACHE
+        .lock()
+        .unwrap()
+        .companies
+        .iter()
+        .map(|(id, company)| (id.clone(), company.card_download_interval_days))
+        .collect();
+    let add_days = |date: &str, days: u32| {
+        chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d")
+            .ok()
+            .and_then(|date| date.checked_add_days(chrono::Days::new(days as u64)))
+            .map(|date| date.format("%Y-%m-%d").to_string())
+    };
+    let cards = crate::database::driver_card_downloads_blocking()
+        .into_iter()
+        .map(|download| {
+            let interval = intervals.get(&download.company).copied().unwrap_or(DEFAULT_CARD_DOWNLOAD_INTERVAL_DAYS);
+            DriverCardRow {
+                next_due_date: (interval > 0).then(|| add_days(&download.last_download_date, interval)).flatten(),
+                legal_due_date: add_days(&download.last_download_date, DRIVER_CARD_LEGAL_INTERVAL_DAYS)
+                    .unwrap_or_default(),
+                download,
+            }
+        })
+        .collect();
+    DriverCardsView { today: chrono::Local::now().format("%Y-%m-%d").to_string(), cards }
+}
+
 /// Re-sends every cached card config to the frontend, e.g. after a webview reload
 /// wiped its state. `init_config()` does the same from the file on first load.
 pub fn emit_card_configs() {

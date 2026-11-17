@@ -66,6 +66,29 @@ export interface DevicesView {
     unknown: UnknownDevice[]
 }
 
+// A driver card's latest verified download (config.rs, get_driver_cards). Dates are
+// server-local YYYY-MM-DD; last_download_at is Unix seconds.
+export interface DriverCard {
+    company: string
+    card_number: string
+    last_download_at: number
+    last_download_date: string
+    imei: string
+    vrn: string | null
+    // 1 = driver slot, 2 = co-driver slot.
+    slot: number
+    downloads: number
+    // When it's due again by the company's card download interval (null: no limit).
+    next_due_date: string | null
+    // When regulations need it downloaded again by.
+    legal_due_date: string
+}
+
+export interface DriverCardsView {
+    today: string
+    cards: DriverCard[]
+}
+
 // A user account (users.rs, get_users). Times are Unix seconds.
 export interface UserAccount {
     username: string

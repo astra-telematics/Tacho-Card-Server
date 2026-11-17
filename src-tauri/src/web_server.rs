@@ -569,6 +569,7 @@ fn dispatch_blocking(command: &str, args_value: Value) -> Result<Value, Dispatch
             json(config::assign_device(a.imei, a.company)?)
         }
         "get_devices" => json(config::get_devices()),
+        "get_driver_cards" => json(config::get_driver_cards()),
         "get_active_downloads" => json(crate::download_activity::get_active_downloads()),
         "get_authenticating_devices" => json(crate::auth_activity::get_authenticating_devices()),
         _ => Err(Unknown),

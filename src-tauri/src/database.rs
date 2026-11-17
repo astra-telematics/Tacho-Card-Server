@@ -537,6 +537,64 @@ pub fn delete_user_blocking(username: &str) -> Result<bool, String> {
 }
 
 /// A device turned away because its company isn't known.
+/// A driver card's latest verified download, for the Driver cards page (see
+/// `config::get_driver_cards`).
+#[derive(serde::Serialize, Clone, Debug, PartialEq)]
+pub struct DriverCardDownload {
+    pub company: String,
+    /// As stored (`card_key`).
+    pub card_number: String,
+    /// Unix seconds (UTC) of the latest verified download that included it.
+    pub last_download_at: i64,
+    /// Server-local date of that download, which the card's interval counts from.
+    pub last_download_date: String,
+    /// The vehicle it was in then: device and, if known, registration.
+    pub imei: String,
+    pub vrn: Option<String>,
+    /// 1 = driver slot, 2 = co-driver slot.
+    pub slot: u8,
+    /// How many verified downloads have included it.
+    pub downloads: i64,
+}
+
+fn driver_card_downloads(conn: &Connection) -> rusqlite::Result<Vec<DriverCardDownload>> {
+    let mut stmt = conn.prepare(
+        "WITH cards AS (
+             SELECT company, card_number AS card, imei, vrn, downloaded_at, local_date, 1 AS slot
+               FROM downloads WHERE verified = 1 AND card_number IS NOT NULL
+             UNION ALL
+             SELECT company, co_driver_card_number, imei, vrn, downloaded_at, local_date, 2
+               FROM downloads WHERE verified = 1 AND co_driver_card_number IS NOT NULL
+         ),
+         latest AS (
+             SELECT company, card, MAX(downloaded_at) AS at, COUNT(*) AS n FROM cards GROUP BY company, card
+         )
+         SELECT c.company, c.card, c.downloaded_at, c.local_date, c.imei, c.vrn, c.slot, l.n
+           FROM cards c JOIN latest l ON c.company = l.company AND c.card = l.card AND c.downloaded_at = l.at
+          GROUP BY c.company, c.card
+          ORDER BY c.company, c.card",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok(DriverCardDownload {
+            company: row.get(0)?,
+            card_number: row.get(1)?,
+            last_download_at: row.get(2)?,
+            last_download_date: row.get(3)?,
+            imei: row.get(4)?,
+            vrn: row.get(5)?,
+            slot: row.get(6)?,
+            downloads: row.get(7)?,
+        })
+    })?;
+    rows.collect()
+}
+
+/// Every driver card with a verified download, per company, with its latest one.
+/// Blocking.
+pub fn driver_card_downloads_blocking() -> Vec<DriverCardDownload> {
+    with_db(Vec::new(), driver_card_downloads)
+}
+
 #[derive(serde::Serialize, Clone, Debug, PartialEq)]
 pub struct UnknownDevice {
     pub imei: String,
@@ -758,6 +816,29 @@ mod tests {
             last_verified_card_download_date(&conn, "acme", "DB12135162163822").unwrap(),
             NaiveDate::from_ymd_opt(2026, 9, 23)
         );
+    }
+
+    #[test]
+    fn each_driver_card_is_listed_with_its_latest_download() {
+        let conn = test_db();
+        let other_imei = "490154203237518";
+        insert_download(&conn, &with_card(record("acme", IMEI, true), "DB12135162163822"), local(2026, 9, 20, 10, 0)).unwrap();
+        let mut co_driver = record("acme", other_imei, true);
+        co_driver.vrn = Some("XY99ZZZ".to_string());
+        co_driver.co_driver_card_number = Some("DB12135162163822".to_string());
+        insert_download(&conn, &co_driver, local(2026, 9, 23, 10, 0)).unwrap();
+        // Unverified - not a download of the card.
+        insert_download(&conn, &with_card(record("acme", IMEI, false), "DB12135162163822"), local(2026, 9, 25, 10, 0)).unwrap();
+        insert_download(&conn, &with_card(record("other", IMEI, true), "DB99999999999901"), local(2026, 9, 21, 10, 0)).unwrap();
+
+        let cards = driver_card_downloads(&conn).unwrap();
+        assert_eq!(cards.len(), 2);
+        let acme = &cards[0];
+        assert_eq!((acme.company.as_str(), acme.card_number.as_str()), ("acme", "DB12135162163822"));
+        assert_eq!(acme.last_download_date, "2026-09-23");
+        assert_eq!((acme.imei.as_str(), acme.vrn.as_deref(), acme.slot), (other_imei, Some("XY99ZZZ"), 2));
+        assert_eq!(acme.downloads, 2);
+        assert_eq!((cards[1].company.as_str(), cards[1].downloads), ("other", 1));
     }
 
     #[test]
