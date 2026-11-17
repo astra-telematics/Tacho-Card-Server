@@ -32,6 +32,7 @@ export interface Company {
     name: string
     connection_limit: number
     download_interval_days: number
+    card_download_interval_days: number
     devices: string[]
     cards: CardEntry[]
 }

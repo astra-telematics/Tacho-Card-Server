@@ -421,7 +421,14 @@ struct SaveCompanyArgs {
     name: String,
     connection_limit: u16,
     download_interval_days: u32,
+    // Absent from a page served by an older version, which doesn't show it.
+    #[serde(default = "default_card_download_interval_days")]
+    card_download_interval_days: u32,
     create: bool,
+}
+
+fn default_card_download_interval_days() -> u32 {
+    config::DEFAULT_CARD_DOWNLOAD_INTERVAL_DAYS
 }
 
 #[derive(Deserialize)]
@@ -540,7 +547,14 @@ fn dispatch_blocking(command: &str, args_value: Value) -> Result<Value, Dispatch
         "get_companies" => json(config::get_companies()),
         "save_company" => {
             let a: SaveCompanyArgs = args(args_value)?;
-            json(config::save_company(a.id, a.name, a.connection_limit, a.download_interval_days, a.create)?)
+            json(config::save_company(
+                a.id,
+                a.name,
+                a.connection_limit,
+                a.download_interval_days,
+                a.card_download_interval_days,
+                a.create,
+            )?)
         }
         "delete_company" => {
             let a: IdArg = args(args_value)?;

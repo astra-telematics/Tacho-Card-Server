@@ -14,6 +14,11 @@ pub mod data_types {
     /// The driver slot's card, downloaded through the VU (from firmware D7.0.83),
     /// in its own `DownloadChunk` section (see `vu_download::Section`).
     pub const DRIVER_CARD: u8 = 0x20;
+    /// The co-driver slot's card, in its own `DownloadChunk` section, from firmware
+    /// that downloads it when FMS Driver Identification shows a card in that slot.
+    pub const CO_DRIVER_CARD: u8 = 0x40;
+    /// Everything that's the VU's own data, as opposed to a card's.
+    pub const VU: u8 = OVERVIEW | ACTIVITIES | EVENTS_AND_FAULTS | DETAILED_SPEED | TECHNICAL_DATA;
 }
 
 /// Sent by the device to begin handing over a completed VU download. The

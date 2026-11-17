@@ -26,6 +26,12 @@ pub const DEFAULT_DOWNLOAD_INTERVAL_DAYS: u32 = 7;
 /// Upper bound for `download_interval_days`. Regulations require a VU download at least
 /// every 90 days; 60 leaves a month of headroom for devices that miss their slot.
 pub const MAX_DOWNLOAD_INTERVAL_DAYS: u32 = 60;
+/// Default for `card_download_interval_days`. 0 disables the limit.
+pub const DEFAULT_CARD_DOWNLOAD_INTERVAL_DAYS: u32 = 7;
+/// Upper bound for `card_download_interval_days`. Regulations require a driver card
+/// download at least every 28 days; 21 leaves a week of headroom for a card that
+/// isn't in a vehicle with a device on the day it falls due.
+pub const MAX_CARD_DOWNLOAD_INTERVAL_DAYS: u32 = 21;
 /// Company created on first run, when config.yaml has no companies. Whatever its id,
 /// while there's only one company every device and card belongs to it, so a
 /// single-company install needs no setup. See `multi-company design.md`.
@@ -180,6 +186,12 @@ pub struct CompanyConfig {
     /// 0 = no limit, at most `MAX_DOWNLOAD_INTERVAL_DAYS`.
     #[serde(default = "default_download_interval_days")]
     pub download_interval_days: u32,
+    /// Minimum whole days between verified downloads of each driver card (whichever
+    /// vehicle or slot it's in), independently of the VU's `download_interval_days`:
+    /// a download goes ahead if either is due. 0 = no limit, at most
+    /// `MAX_CARD_DOWNLOAD_INTERVAL_DAYS`.
+    #[serde(default = "default_card_download_interval_days")]
+    pub card_download_interval_days: u32,
     /// IMEIs of this company's devices.
     #[serde(default)]
     pub devices: Vec<String>,
@@ -219,6 +231,10 @@ pub struct DownloadConfig {
 
 fn default_download_interval_days() -> u32 {
     DEFAULT_DOWNLOAD_INTERVAL_DAYS
+}
+
+fn default_card_download_interval_days() -> u32 {
+    DEFAULT_CARD_DOWNLOAD_INTERVAL_DAYS
 }
 
 /// `get_default_download_path()`, falling back to a relative "downloads" directory if
@@ -1140,6 +1156,7 @@ pub fn init_config() -> io::Result<()> {
                 name: DEFAULT_COMPANY_NAME.to_string(),
                 connection_limit,
                 download_interval_days: DEFAULT_DOWNLOAD_INTERVAL_DAYS,
+                card_download_interval_days: DEFAULT_CARD_DOWNLOAD_INTERVAL_DAYS,
                 devices: Vec::new(),
                 cards: BTreeMap::new(),
             },
@@ -1166,6 +1183,13 @@ pub fn init_config() -> io::Result<()> {
                 id, company.download_interval_days, MAX_DOWNLOAD_INTERVAL_DAYS, MAX_DOWNLOAD_INTERVAL_DAYS
             );
             company.download_interval_days = MAX_DOWNLOAD_INTERVAL_DAYS;
+        }
+        if company.card_download_interval_days > MAX_CARD_DOWNLOAD_INTERVAL_DAYS {
+            eprintln!(
+                "Company '{}': card_download_interval_days {} exceeds the maximum of {}; using {}.",
+                id, company.card_download_interval_days, MAX_CARD_DOWNLOAD_INTERVAL_DAYS, MAX_CARD_DOWNLOAD_INTERVAL_DAYS
+            );
+            company.card_download_interval_days = MAX_CARD_DOWNLOAD_INTERVAL_DAYS;
         }
     }
 
@@ -1267,6 +1291,7 @@ mod tests {
                 name: "Acme Logistics".to_string(),
                 connection_limit: 50,
                 download_interval_days: 7,
+                card_download_interval_days: 14,
                 devices: vec!["356938035643809".to_string()],
                 cards,
             },
@@ -1355,6 +1380,7 @@ mod tests {
                 name: "Default".to_string(),
                 connection_limit: 10,
                 download_interval_days: 1,
+                card_download_interval_days: DEFAULT_CARD_DOWNLOAD_INTERVAL_DAYS,
                 devices: Vec::new(),
                 cards: BTreeMap::new(),
             },
@@ -1465,6 +1491,7 @@ pub struct CompanyView {
     pub name: String,
     pub connection_limit: u16,
     pub download_interval_days: u32,
+    pub card_download_interval_days: u32,
     pub devices: Vec<String>,
     pub cards: Vec<CardEntry>,
 }
@@ -1517,6 +1544,7 @@ pub fn get_companies() -> CompaniesView {
             name: company.name.clone(),
             connection_limit: company.connection_limit,
             download_interval_days: company.download_interval_days,
+            card_download_interval_days: company.card_download_interval_days,
             devices: company.devices.clone(),
             cards: card_entries(cache.cards.iter().filter(|(_, card)| card.company.as_deref() == Some(id))),
         })
@@ -1545,6 +1573,7 @@ pub fn save_company(
     name: String,
     connection_limit: u16,
     download_interval_days: u32,
+    card_download_interval_days: u32,
     create: bool,
 ) -> Result<SaveCompanyResult, String> {
     let id = id.trim().to_string();
@@ -1560,6 +1589,9 @@ pub fn save_company(
     }
     if download_interval_days > MAX_DOWNLOAD_INTERVAL_DAYS {
         return Err(format!("The download interval can be at most {} days.", MAX_DOWNLOAD_INTERVAL_DAYS));
+    }
+    if card_download_interval_days > MAX_CARD_DOWNLOAD_INTERVAL_DAYS {
+        return Err(format!("The card download interval can be at most {} days.", MAX_CARD_DOWNLOAD_INTERVAL_DAYS));
     }
 
     let result = change_config(|config| {
@@ -1583,6 +1615,7 @@ pub fn save_company(
                     name: name.clone(),
                     connection_limit,
                     download_interval_days,
+                    card_download_interval_days,
                     devices: Vec::new(),
                     cards: BTreeMap::new(),
                 },
@@ -1595,16 +1628,18 @@ pub fn save_company(
             company.name = name.clone();
             company.connection_limit = connection_limit;
             company.download_interval_days = download_interval_days;
+            company.card_download_interval_days = card_download_interval_days;
         }
         Ok(SaveCompanyResult { auto_registered_devices })
     })?;
     log::info!(
-        "[CONFIG] company={} action={} name={:?} connection_limit={} download_interval_days={} auto_registered_devices={}",
+        "[CONFIG] company={} action={} name={:?} connection_limit={} download_interval_days={} card_download_interval_days={} auto_registered_devices={}",
         id,
         if create { "created" } else { "updated" },
         name,
         connection_limit,
         download_interval_days,
+        card_download_interval_days,
         result.auto_registered_devices
     );
     Ok(result)

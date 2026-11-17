@@ -285,6 +285,40 @@ pub fn over_company_limit_retry_delay(company: &str, min_retry: Duration) -> Dur
     state().stats(Some(company)).backlog.turn_away(&snapshot, Local::now(), min_retry)
 }
 
+/// When the next download may happen, given when the VU may next be downloaded
+/// (`database::next_download_allowed_at`) and when each card the device announced
+/// in its slots may (`database::next_card_download_allowed_at`): whichever comes
+/// first, `None` meaning now. With no cards announced it's just the VU's.
+pub fn earliest_download_allowed_at(
+    vu_allowed_at: Option<DateTime<Local>>,
+    cards_allowed_at: &[Option<DateTime<Local>>],
+) -> Option<DateTime<Local>> {
+    let mut earliest = vu_allowed_at?;
+    for card_allowed_at in cards_allowed_at {
+        earliest = earliest.min((*card_allowed_at)?);
+    }
+    Some(earliest)
+}
+
+/// What a device that announced its slots' cards is asked to download (the
+/// `data_types` in its Accepted `ConnResponse`): the VU's data if it's due, and
+/// each card only if there's one in that slot and it's due - so nothing that isn't
+/// needed uses the device's mobile data.
+pub fn requested_data_types(vu_due: bool, driver_card_due: bool, co_driver_card_due: bool) -> u8 {
+    use crate::device_protocol::data_types;
+    let mut requested = 0;
+    if vu_due {
+        requested |= data_types::VU;
+    }
+    if driver_card_due {
+        requested |= data_types::DRIVER_CARD;
+    }
+    if co_driver_card_due {
+        requested |= data_types::CO_DRIVER_CARD;
+    }
+    requested
+}
+
 /// If the device may not download yet (`download_allowed_at` from
 /// `database::next_download_allowed_at`), how long it should wait before retrying:
 /// until then, plus a random spread so devices don't all return at midnight together.
@@ -390,5 +424,35 @@ mod tests {
         assert_eq!(download_interval_delay(None, now, secs(90)), None);
         // Already allowed.
         assert_eq!(download_interval_delay(Some(now - chrono::Duration::hours(1)), now, secs(90)), None);
+    }
+
+    #[test]
+    fn a_download_is_allowed_when_either_the_vu_or_the_card_is_due() {
+        let soon = Some(at(12, 0, 0));
+        let later = Some(at(18, 0, 0));
+        // No card announced: the VU alone decides.
+        assert_eq!(earliest_download_allowed_at(None, &[]), None);
+        assert_eq!(earliest_download_allowed_at(later, &[]), later);
+        // Any one of them due now means now.
+        assert_eq!(earliest_download_allowed_at(None, &[later]), None);
+        assert_eq!(earliest_download_allowed_at(later, &[None]), None);
+        assert_eq!(earliest_download_allowed_at(later, &[later, None]), None);
+        // None due: whichever comes first.
+        assert_eq!(earliest_download_allowed_at(later, &[soon]), soon);
+        assert_eq!(earliest_download_allowed_at(soon, &[later]), soon);
+        assert_eq!(earliest_download_allowed_at(later, &[later, soon]), soon);
+    }
+
+    #[test]
+    fn only_what_is_due_is_requested() {
+        use crate::device_protocol::data_types;
+        assert_eq!(requested_data_types(true, false, false), data_types::VU);
+        assert_eq!(requested_data_types(false, true, false), data_types::DRIVER_CARD);
+        assert_eq!(requested_data_types(false, false, true), data_types::CO_DRIVER_CARD);
+        assert_eq!(
+            requested_data_types(true, true, true),
+            data_types::VU | data_types::DRIVER_CARD | data_types::CO_DRIVER_CARD
+        );
+        assert_eq!(data_types::VU, 0x1f);
     }
 }

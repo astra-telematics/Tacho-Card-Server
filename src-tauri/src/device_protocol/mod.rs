@@ -28,6 +28,7 @@ pub use tacho_to_card_message::TachoToCardMessage;
 pub use card_to_tacho_message::CardToTachoMessage;
 pub use auth_outcome_message::AuthOutcomeMessage;
 pub use download_start_message::DownloadStartMessage;
+pub use download_start_message::data_types;
 pub use download_chunk_message::DownloadChunkMessage;
 pub use download_complete_message::DownloadCompleteMessage;
 pub use download_ack_message::DownloadAckMessage;

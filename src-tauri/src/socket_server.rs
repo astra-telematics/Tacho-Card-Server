@@ -314,10 +314,23 @@ async fn send_conn_response(
     let reply_bytes: Vec<u8> = Message::ConnResponse(crate::device_protocol::ConnResponseMessage {
         status,
         retry_after_seconds,
+        data_types: None,
     })
     .into();
     let _ = stream.write_all(&reply_bytes).await;
     retry_after_seconds
+}
+
+/// Accepts a device's announce, telling it which data types to download if the
+/// server chose (see `admission::requested_data_types`).
+async fn send_accepted(stream: &mut WriteHalf<'_>, data_types: Option<u8>) {
+    let reply_bytes: Vec<u8> = Message::ConnResponse(crate::device_protocol::ConnResponseMessage {
+        status: ConnResponseStatus::Accepted,
+        retry_after_seconds: None,
+        data_types,
+    })
+    .into();
+    let _ = stream.write_all(&reply_bytes).await;
 }
 
 /// The features of the firmware a device announced. A version that can't be parsed is
@@ -357,7 +370,8 @@ async fn record_incomplete_download(context: &str, partial: crate::partial_downl
         return;
     }
     let vu_data = &data.vu;
-    let vrn = crate::vu_download::extract_vrn(generation, vu_data);
+    // Empty for a card-only download (no VU file, VRN or generation).
+    let vrn = if vu_data.is_empty() { None } else { crate::vu_download::extract_vrn(generation, vu_data) };
     // Structural offset (if any) is genuinely useful here even though the
     // transfer was already known-incomplete — it shows exactly how far the
     // well-formed data went before truncation, rather than just "somewhere".
@@ -369,21 +383,29 @@ async fn record_incomplete_download(context: &str, partial: crate::partial_downl
     } else {
         "incomplete".to_string()
     };
+    let (mut card_number, mut co_driver_card_number) = (None, None);
     let saved_path = if !retain_failed_downloads() {
         log::warn!("[TCP] {} action=download_discarded reason={} bytes={} note=retain_failed_downloads_off", context, tag, data.len());
         None
     } else {
         if !data.driver_card.is_empty() {
-            save_card_section(context, &company, &imei, &data.driver_card, Some("incomplete"));
+            card_number = save_card_section(context, &company, &imei, &data.driver_card, Some("incomplete")).ok().flatten();
         }
-        match crate::vu_download::save_download(&company, vrn.as_deref(), &imei, vu_data, Some(&tag)) {
-            Ok(path) => {
-                log::warn!("[TCP] {} action=download_saved_incomplete path={:?} bytes={}", context, path, vu_data.len());
-                Some(path)
-            }
-            Err(e) => {
-                log::error!("[TCP] {} action=download_save_failed err={}", context, e);
-                None
+        if !data.co_driver_card.is_empty() {
+            co_driver_card_number = save_card_section(context, &company, &imei, &data.co_driver_card, Some("incomplete")).ok().flatten();
+        }
+        if vu_data.is_empty() {
+            None
+        } else {
+            match crate::vu_download::save_download(&company, vrn.as_deref(), &imei, vu_data, Some(&tag)) {
+                Ok(path) => {
+                    log::warn!("[TCP] {} action=download_saved_incomplete path={:?} bytes={}", context, path, vu_data.len());
+                    Some(path)
+                }
+                Err(e) => {
+                    log::error!("[TCP] {} action=download_save_failed err={}", context, e);
+                    None
+                }
             }
         }
     };
@@ -396,6 +418,8 @@ async fn record_incomplete_download(context: &str, partial: crate::partial_downl
         data_types: Some(data_types),
         bytes: data.len(),
         file_path: saved_path,
+        card_number,
+        co_driver_card_number,
     }).await;
 }
 
@@ -411,8 +435,9 @@ fn chunk_section<'a>(features: &crate::firmware::Features, chunk: &'a [u8]) -> O
 }
 
 /// Saves a download's driver card section in its own file, tagged with the VU file's
-/// `tag` and, if the card files' structure stopped making sense, where.
-fn save_card_section(context: &str, company: &str, imei: &str, section: &[u8], tag: Option<&str>) {
+/// `tag` and, if the card files' structure stopped making sense, where. `Ok` with the
+/// card's number (if it could be read from the card) when the file was saved.
+fn save_card_section(context: &str, company: &str, imei: &str, section: &[u8], tag: Option<&str>) -> Result<Option<String>, ()> {
     let card = crate::vu_download::card_files(section);
     let card_number = crate::vu_download::extract_card_number(card);
     let mut tag_parts: Vec<String> = tag.into_iter().map(str::to_string).collect();
@@ -422,8 +447,14 @@ fn save_card_section(context: &str, company: &str, imei: &str, section: &[u8], t
     }
     let tag = if tag_parts.is_empty() { None } else { Some(tag_parts.join("_")) };
     match crate::vu_download::save_card_download(company, card_number.as_deref(), imei, card, tag.as_deref()) {
-        Ok(path) => log::info!("[TCP] {} action=card_download_saved path={:?} card_number={:?} bytes={}", context, path, card_number, card.len()),
-        Err(e) => log::error!("[TCP] {} action=card_download_save_failed err={}", context, e),
+        Ok(path) => {
+            log::info!("[TCP] {} action=card_download_saved path={:?} card_number={:?} bytes={}", context, path, card_number, card.len());
+            Ok(card_number)
+        }
+        Err(e) => {
+            log::error!("[TCP] {} action=card_download_save_failed err={}", context, e);
+            Err(())
+        }
     }
 }
 
@@ -529,6 +560,7 @@ async fn handle_connection(mut stream: TcpStream, peer_addr: SocketAddr, over_so
         let reply = Message::ConnResponse(crate::device_protocol::ConnResponseMessage {
             status: crate::device_protocol::ConnResponseStatus::TryAgainLater,
             retry_after_seconds: Some(retry_after_seconds),
+            data_types: None,
         });
         let reply_bytes: Vec<u8> = reply.into();
         let _ = stream.write_all(&reply_bytes).await;
@@ -580,6 +612,9 @@ async fn handle_connection(mut stream: TcpStream, peer_addr: SocketAddr, over_so
     const MAX_DOWNLOAD_SIZE: usize = 16 * 1024 * 1024;
     // Set when the connection ends because the device was told to try again later.
     let mut try_again_later = false;
+    // What the device was asked to download when it was admitted (see
+    // `admission::requested_data_types`), re-sent if it announces again.
+    let mut requested_data_types: Option<u8> = None;
 
     loop {
         // (Re)arm `pending` if nothing is currently in flight for the connection's
@@ -788,10 +823,12 @@ async fn handle_connection(mut stream: TcpStream, peer_addr: SocketAddr, over_so
                     },
                     Message::ConnAnnounce(conn_announce_message) => {
                         if announced {
-                            // Duplicate announce — just re-ack, don't reserve a second queue slot.
+                            // Duplicate announce — just re-ack (with the same data types), don't
+                            // reserve a second queue slot.
                             let reply = Message::ConnResponse(crate::device_protocol::ConnResponseMessage {
                                 status: crate::device_protocol::ConnResponseStatus::Accepted,
                                 retry_after_seconds: None,
+                                data_types: requested_data_types,
                             });
                             let reply_bytes: Vec<u8> = reply.into();
                             let _ = write_half.write_all(&reply_bytes).await;
@@ -817,20 +854,53 @@ async fn handle_connection(mut stream: TcpStream, peer_addr: SocketAddr, over_so
                                 break;
                             };
 
-                            let download_allowed_at = crate::database::next_download_allowed_at(
+                            // The VU (on download_interval_days) and the cards in its slots
+                            // (each on card_download_interval_days, if the device says
+                            // which) are due independently: a download goes ahead if any of
+                            // them is. The device announces as soon as a card goes in, so a
+                            // card that's due gets downloaded without waiting for the VU's
+                            // next date - and is told to download only what's due.
+                            let vu_allowed_at = crate::database::next_download_allowed_at(
                                 &company_id,
                                 &device_imei,
                                 company_config.download_interval_days,
                             ).await;
+                            // Per slot: the card (if it looks like one) and when it's next due.
+                            let mut slot_cards: [Option<(&str, Option<chrono::DateTime<chrono::Local>>)>; 2] = [None, None];
+                            for (slot, card) in [&conn_announce_message.driver_card, &conn_announce_message.co_driver_card].into_iter().enumerate() {
+                                if let Some(card) = card.as_deref().filter(|card| crate::database::card_key(card).is_some()) {
+                                    let allowed_at = crate::database::next_card_download_allowed_at(
+                                        &company_id,
+                                        card,
+                                        company_config.card_download_interval_days,
+                                    ).await;
+                                    slot_cards[slot] = Some((card, allowed_at));
+                                }
+                            }
+                            let cards: Vec<&str> = slot_cards.iter().flatten().map(|(card, _)| *card).collect();
+                            let cards_allowed_at: Vec<_> = slot_cards.iter().flatten().map(|(_, allowed_at)| *allowed_at).collect();
+                            let download_allowed_at = crate::admission::earliest_download_allowed_at(vu_allowed_at, &cards_allowed_at);
                             if let Some(retry_after) = crate::admission::download_interval_retry_delay(download_allowed_at) {
                                 let retry_after_seconds = send_conn_response(&mut write_half, ConnResponseStatus::TryAgainLater, Some(retry_after)).await;
                                 log::info!(
-                                    "[TCP] peer={} company={} IMEI={} firmware_version={} message=ConnAnnounce action=reply status=TryAgainLater reason=download_interval_not_elapsed retry_after_seconds={:?}",
-                                    peer_addr, company_id, device_imei, firmware_version, retry_after_seconds
+                                    "[TCP] peer={} company={} IMEI={} firmware_version={} cards={:?} message=ConnAnnounce action=reply status=TryAgainLater reason=download_interval_not_elapsed retry_after_seconds={:?}",
+                                    peer_addr, company_id, device_imei, firmware_version, cards, retry_after_seconds
                                 );
                                 try_again_later = true;
                                 break;
                             }
+                            // Only a device that announced its slots (newer firmware, with FMS
+                            // Driver Identification) is told what to download; anything else
+                            // downloads everything, as it always has.
+                            let card_due = |slot: usize| slot_cards[slot].is_some_and(|(_, allowed_at)| allowed_at.is_none());
+                            requested_data_types = conn_announce_message.driver_card.is_some().then(|| {
+                                crate::admission::requested_data_types(vu_allowed_at.is_none(), card_due(0), card_due(1))
+                            });
+                            log::info!(
+                                "[TCP] peer={} company={} IMEI={} cards={:?} vu_due={} driver_card_due={} co_driver_card_due={} requested_data_types={:?} action=download_allowed",
+                                peer_addr, company_id, device_imei, cards, vu_allowed_at.is_none(), card_due(0), card_due(1),
+                                requested_data_types.map(|types| format!("{:#04x}", types))
+                            );
 
                             let pool = crate::card_pool::CARD_POOLS.pool(&company_id);
                             if pool.card_count() == 0 {
@@ -862,7 +932,7 @@ async fn handle_connection(mut stream: TcpStream, peer_addr: SocketAddr, over_so
                             company_pool = Some(pool);
                             _company_slot = Some(slot);
                             pending = None; // arm as "Acquired" wait next loop
-                            send_conn_response(&mut write_half, ConnResponseStatus::Accepted, None).await;
+                            send_accepted(&mut write_half, requested_data_types).await;
                             let snapshot = crate::admission::snapshot(Some(&company_id));
                             log::info!(
                                 "[TCP] peer={} company={} IMEI={} firmware_version={} message=ConnAnnounce action=reply status=Accepted estimated_wait_seconds={:?} cards={} waiting={} average_session_ms={}",
@@ -1149,7 +1219,9 @@ async fn handle_connection(mut stream: TcpStream, peer_addr: SocketAddr, over_so
                             // the database. Only a fully clean result (CRC match and,
                             // where checkable, a structure this parser understands) gets
                             // the plain untagged filename.
-                            let vrn = crate::vu_download::extract_vrn(generation, vu_data);
+                            // A card-only download (the server asked for no VU data) has no
+                            // VU file, no VRN and no generation to read one with.
+                            let vrn = if vu_data.is_empty() { None } else { crate::vu_download::extract_vrn(generation, vu_data) };
                             let imei_value = imei.clone().unwrap_or_default();
                             let verified = matches;
                             let mut tag_parts: Vec<String> = Vec::new();
@@ -1160,29 +1232,48 @@ async fn handle_connection(mut stream: TcpStream, peer_addr: SocketAddr, over_so
                                 tag_parts.push(format!("unparsed_at_{}", offset));
                             }
                             let tag = if tag_parts.is_empty() { None } else { Some(tag_parts.join("_")) };
+                            let (mut card_number, mut co_driver_card_number) = (None, None);
+                            let mut all_saved = true;
                             let saved_path = if !verified && !retain_failed_downloads() {
                                 log::warn!("[TCP] peer={} action=download_discarded reason=crc_mismatch bytes={} vrn={:?} note=retain_failed_downloads_off", peer_addr, download_buffer.len(), vrn);
+                                all_saved = false;
                                 None
                             } else {
                                 let company_id = company.as_deref().unwrap_or(DEFAULT_COMPANY_ID);
-                                if !download_buffer.driver_card.is_empty() {
-                                    // The card's file shares the CRC with the VU's, so only its mismatch.
-                                    save_card_section(&format!("peer={}", peer_addr), company_id, &imei_value, &download_buffer.driver_card, (!matches).then_some("crc_mismatch"));
-                                }
-                                match crate::vu_download::save_download(company_id, vrn.as_deref(), &imei_value, vu_data, tag.as_deref()) {
-                                    Ok(path) => {
-                                        log::info!("[TCP] peer={} action=download_saved path={:?} vrn={:?} verified={}", peer_addr, path, vrn, verified);
-                                        Some(path)
+                                let context = format!("peer={}", peer_addr);
+                                // The cards' files share the CRC with the VU's, so only its mismatch.
+                                let card_tag = (!matches).then_some("crc_mismatch");
+                                for (section, number) in [
+                                    (&download_buffer.driver_card, &mut card_number),
+                                    (&download_buffer.co_driver_card, &mut co_driver_card_number),
+                                ] {
+                                    if !section.is_empty() {
+                                        match save_card_section(&context, company_id, &imei_value, section, card_tag) {
+                                            Ok(saved_number) => *number = saved_number,
+                                            Err(()) => all_saved = false,
+                                        }
                                     }
-                                    Err(e) => {
-                                        log::error!("[TCP] peer={} action=download_save_failed err={}", peer_addr, e);
-                                        None
+                                }
+                                if vu_data.is_empty() {
+                                    None
+                                } else {
+                                    match crate::vu_download::save_download(company_id, vrn.as_deref(), &imei_value, vu_data, tag.as_deref()) {
+                                        Ok(path) => {
+                                            log::info!("[TCP] peer={} action=download_saved path={:?} vrn={:?} verified={}", peer_addr, path, vrn, verified);
+                                            Some(path)
+                                        }
+                                        Err(e) => {
+                                            log::error!("[TCP] peer={} action=download_save_failed err={}", peer_addr, e);
+                                            all_saved = false;
+                                            None
+                                        }
                                     }
                                 }
                             };
-                            // Only a download that's both verified and actually on disk
-                            // counts towards the once-a-day limit.
-                            let success = verified && saved_path.is_some();
+                            // Only a download that's both verified and actually on disk (all
+                            // of it: the VU's file if it had VU data, and each card's)
+                            // counts towards the download intervals.
+                            let success = verified && all_saved && !download_buffer.is_empty();
                             crate::database::record_download(crate::database::DownloadRecord {
                                 company: company.clone().unwrap_or_else(|| DEFAULT_COMPANY_ID.to_string()),
                                 imei: imei_value,
@@ -1192,6 +1283,8 @@ async fn handle_connection(mut stream: TcpStream, peer_addr: SocketAddr, over_so
                                 data_types: Some(data_types),
                                 bytes: download_buffer.len(),
                                 file_path: saved_path,
+                                card_number,
+                                co_driver_card_number,
                             }).await;
 
                             let reply = Message::DownloadAck(crate::device_protocol::DownloadAckMessage { success });

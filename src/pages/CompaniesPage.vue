@@ -30,6 +30,7 @@
                     <div class="text-caption text-grey">
                         id: {{ company.id }} · connection limit {{ company.connection_limit }} ·
                         download interval {{ intervalText(company.download_interval_days) }} ·
+                        card download interval {{ intervalText(company.card_download_interval_days) }} ·
                         {{ company.devices.length }} registered device(s)
                     </div>
                 </div>
@@ -117,6 +118,16 @@
                         :rules="[inRange(0, MAX_DOWNLOAD_INTERVAL_DAYS)]"
                         hint="Minimum days between downloads per device (max 60). 0 = no limit."
                     />
+                    <q-input
+                        v-model.number="editor.cardDownloadIntervalDays"
+                        label="Card download interval (days)"
+                        type="number"
+                        dense
+                        :min="0"
+                        :max="MAX_CARD_DOWNLOAD_INTERVAL_DAYS"
+                        :rules="[inRange(0, MAX_CARD_DOWNLOAD_INTERVAL_DAYS)]"
+                        hint="Minimum days between downloads of each driver card, in any vehicle (max 21). 0 = no limit."
+                    />
                 </q-card-section>
                 <q-card-actions align="right">
                     <q-btn flat label="Cancel" v-close-popup />
@@ -143,8 +154,9 @@ import { inRange, isIntInRange } from 'src/utils'
 
 defineOptions({ name: 'CompaniesPage' })
 
-// Matches MAX_DOWNLOAD_INTERVAL_DAYS in config.rs.
+// Match MAX_DOWNLOAD_INTERVAL_DAYS / MAX_CARD_DOWNLOAD_INTERVAL_DAYS in config.rs.
 const MAX_DOWNLOAD_INTERVAL_DAYS = 60
+const MAX_CARD_DOWNLOAD_INTERVAL_DAYS = 21
 
 const $q = useQuasar()
 const view = ref<CompaniesView>({ companies: [], unassigned_cards: [] })
@@ -199,6 +211,7 @@ const editor = reactive({
     name: '',
     connectionLimit: 10 as number | string,
     downloadIntervalDays: 7 as number | string,
+    cardDownloadIntervalDays: 7 as number | string,
     idTouched: false,
 })
 
@@ -207,7 +220,8 @@ const editorValid = computed(
         editor.name.trim() !== '' &&
         isValidId(editor.id) &&
         isIntInRange(editor.connectionLimit, 1, 65535) &&
-        isIntInRange(editor.downloadIntervalDays, 0, MAX_DOWNLOAD_INTERVAL_DAYS),
+        isIntInRange(editor.downloadIntervalDays, 0, MAX_DOWNLOAD_INTERVAL_DAYS) &&
+        isIntInRange(editor.cardDownloadIntervalDays, 0, MAX_CARD_DOWNLOAD_INTERVAL_DAYS),
 )
 
 const openCreate = () => {
@@ -217,6 +231,7 @@ const openCreate = () => {
         name: '',
         connectionLimit: 10,
         downloadIntervalDays: 7,
+        cardDownloadIntervalDays: 7,
         idTouched: false,
     })
     editorOpen.value = true
@@ -229,6 +244,7 @@ const openEdit = (company: Company) => {
         name: company.name,
         connectionLimit: company.connection_limit,
         downloadIntervalDays: company.download_interval_days,
+        cardDownloadIntervalDays: company.card_download_interval_days,
     })
     editorOpen.value = true
 }
@@ -250,6 +266,7 @@ const saveEditor = async () => {
             name: editor.name,
             connectionLimit: Number(editor.connectionLimit),
             downloadIntervalDays: Number(editor.downloadIntervalDays),
+            cardDownloadIntervalDays: Number(editor.cardDownloadIntervalDays),
             create: editor.create,
         })
         editorOpen.value = false

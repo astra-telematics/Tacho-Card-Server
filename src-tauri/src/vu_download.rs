@@ -175,37 +175,58 @@ pub enum Section {
     Vu,
     /// The driver slot's card, downloaded through the VU (`data_types::DRIVER_CARD`).
     DriverCard,
+    /// The co-driver slot's card (`data_types::CO_DRIVER_CARD`), sent by firmware
+    /// that downloads it when FMS shows a card in that slot.
+    CoDriverCard,
 }
 
 impl Section {
-    /// `None` for anything else, including the co-driver slot's 0x02, which the
-    /// firmware reserves but doesn't send.
+    /// `None` for anything else.
     pub fn from_byte(byte: u8) -> Option<Self> {
         match byte {
             0x00 => Some(Self::Vu),
             0x01 => Some(Self::DriverCard),
+            0x02 => Some(Self::CoDriverCard),
             _ => None,
+        }
+    }
+
+    fn index(self) -> usize {
+        match self {
+            Self::Vu => 0,
+            Self::DriverCard => 1,
+            Self::CoDriverCard => 2,
         }
     }
 }
 
-/// A download as it arrives: the VU's data and the driver card's, saved as
-/// separate files, and the order it arrived in, for the CRC32 the device computes
-/// over all of it in the order it was sent (without the section bytes) and for
-/// cutting it back to where a resumed download carries on from.
+/// A download as it arrives: the VU's data and each card's, saved as separate
+/// files, and the order it arrived in, for the CRC32 the device computes over all
+/// of it in the order it was sent (without the section bytes) and for cutting it
+/// back to where a resumed download carries on from.
 #[derive(Debug, Default)]
 pub struct DownloadData {
     pub vu: Vec<u8>,
     pub driver_card: Vec<u8>,
+    pub co_driver_card: Vec<u8>,
     /// Runs of consecutive bytes for one section, in the order they arrived.
     runs: Vec<(Section, usize)>,
 }
 
 impl DownloadData {
+    fn section(&self, section: Section) -> &Vec<u8> {
+        match section {
+            Section::Vu => &self.vu,
+            Section::DriverCard => &self.driver_card,
+            Section::CoDriverCard => &self.co_driver_card,
+        }
+    }
+
     fn section_mut(&mut self, section: Section) -> &mut Vec<u8> {
         match section {
             Section::Vu => &mut self.vu,
             Section::DriverCard => &mut self.driver_card,
+            Section::CoDriverCard => &mut self.co_driver_card,
         }
     }
 
@@ -221,7 +242,7 @@ impl DownloadData {
     }
 
     pub fn len(&self) -> usize {
-        self.vu.len() + self.driver_card.len()
+        self.vu.len() + self.driver_card.len() + self.co_driver_card.len()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -233,7 +254,7 @@ impl DownloadData {
     pub fn truncate(&mut self, length: usize) {
         let mut kept = 0;
         let mut kept_runs = 0;
-        let (mut vu, mut driver_card) = (0, 0);
+        let mut per_section = [0usize; 3];
         for (section, run) in self.runs.iter_mut() {
             if kept == length {
                 break;
@@ -241,28 +262,23 @@ impl DownloadData {
             *run = (*run).min(length - kept);
             kept += *run;
             kept_runs += 1;
-            match section {
-                Section::Vu => vu += *run,
-                Section::DriverCard => driver_card += *run,
-            }
+            per_section[section.index()] += *run;
         }
         if kept < length {
             return; // There were no more than `length` bytes; nothing was cut.
         }
         self.runs.truncate(kept_runs);
-        self.vu.truncate(vu);
-        self.driver_card.truncate(driver_card);
+        for section in [Section::Vu, Section::DriverCard, Section::CoDriverCard] {
+            self.section_mut(section).truncate(per_section[section.index()]);
+        }
     }
 
     pub fn crc32(&self) -> u32 {
         let mut crc = crc32fast::Hasher::new();
-        let (mut vu, mut driver_card) = (0, 0);
+        let mut offsets = [0usize; 3];
         for &(section, run) in &self.runs {
-            let (data, offset) = match section {
-                Section::Vu => (&self.vu, &mut vu),
-                Section::DriverCard => (&self.driver_card, &mut driver_card),
-            };
-            crc.update(&data[*offset..*offset + run]);
+            let offset = &mut offsets[section.index()];
+            crc.update(&self.section(section)[*offset..*offset + run]);
             *offset += run;
         }
         crc.finalize()
@@ -480,6 +496,26 @@ mod tests {
         download.truncate(0);
         assert!(download.is_empty());
         assert_eq!(download.crc32(), crc32fast::hash(&[]));
+    }
+
+    #[test]
+    fn the_co_driver_card_is_a_section_of_its_own() {
+        assert_eq!(Section::from_byte(0x02), Some(Section::CoDriverCard));
+        assert_eq!(Section::from_byte(0x03), None);
+
+        let mut download = DownloadData::default();
+        download.add(Section::Vu, &[1, 2]);
+        download.add(Section::DriverCard, &[3]);
+        download.add(Section::CoDriverCard, &[4, 5]);
+        assert_eq!(download.co_driver_card, vec![4, 5]);
+        assert_eq!(download.len(), 5);
+        assert_eq!(download.crc32(), crc32fast::hash(&[1, 2, 3, 4, 5]));
+
+        // A resume cutting back into the co-driver card's data.
+        download.truncate(4);
+        assert_eq!((download.vu.len(), download.driver_card.len(), download.co_driver_card.as_slice()), (2, 1, &[4][..]));
+        download.add(Section::CoDriverCard, &[6]);
+        assert_eq!(download.crc32(), crc32fast::hash(&[1, 2, 3, 4, 6]));
     }
 
     #[test]

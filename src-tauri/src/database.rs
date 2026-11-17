@@ -158,6 +158,17 @@ fn migrate(conn: &mut Connection) -> rusqlite::Result<()> {
         tx.pragma_update(None, "user_version", 7)?;
         tx.commit()?;
     }
+    if version < 8 {
+        let tx = conn.transaction()?;
+        tx.execute_batch(
+            "ALTER TABLE downloads ADD COLUMN card_number TEXT;           -- driver slot card in the download (see card_key), NULL if none
+             ALTER TABLE downloads ADD COLUMN co_driver_card_number TEXT; -- co-driver slot card, likewise
+             CREATE INDEX IF NOT EXISTS idx_downloads_card ON downloads (company, card_number, local_date);
+             CREATE INDEX IF NOT EXISTS idx_downloads_co_driver_card ON downloads (company, co_driver_card_number, local_date);",
+        )?;
+        tx.pragma_update(None, "user_version", 8)?;
+        tx.commit()?;
+    }
     Ok(())
 }
 
@@ -188,13 +199,39 @@ pub struct DownloadRecord {
     pub data_types: Option<u8>,
     pub bytes: usize,
     pub file_path: Option<PathBuf>,
+    /// The driver slot card's number, from the card section of the download, if it
+    /// had one. Stored as `card_key` so it compares with announced card numbers.
+    pub card_number: Option<String>,
+    /// The co-driver slot card's number, likewise.
+    pub co_driver_card_number: Option<String>,
+}
+
+/// A card number reduced to the form it's stored and compared in: the last
+/// whitespace-separated word, upper case, letters and digits only. FMS Driver
+/// Identification usually prefixes the card number with the issuing country
+/// ("UK 1234567890123456") while the card's own EF_Identification has just the
+/// number, so both come out as "1234567890123456". A country code run straight
+/// into the number (more than 16 characters) is dropped the same way. `None` if
+/// what's left is too short to be a card number (14 characters identify the
+/// driver; the full 16 add the replacement and renewal indexes).
+pub fn card_key(card_number: &str) -> Option<String> {
+    let key: String = card_number
+        .split_whitespace()
+        .last()?
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .map(|c| c.to_ascii_uppercase())
+        .collect();
+    let key = key[key.len().saturating_sub(16)..].to_string();
+    (key.len() >= 14).then_some(key)
 }
 
 fn insert_download(conn: &Connection, record: &DownloadRecord, now: DateTime<Local>) -> rusqlite::Result<()> {
     conn.execute(
         "INSERT INTO downloads
-            (company, imei, vrn, downloaded_at, local_date, verified, generation, data_types, bytes, file_path)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            (company, imei, vrn, downloaded_at, local_date, verified, generation, data_types, bytes, file_path,
+             card_number, co_driver_card_number)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
         params![
             record.company,
             record.imei,
@@ -206,16 +243,40 @@ fn insert_download(conn: &Connection, record: &DownloadRecord, now: DateTime<Loc
             record.data_types,
             record.bytes as i64,
             record.file_path.as_ref().map(|p| p.to_string_lossy().into_owned()),
+            record.card_number.as_deref().and_then(card_key),
+            record.co_driver_card_number.as_deref().and_then(card_key),
         ],
     )?;
     Ok(())
 }
 
-/// Server-local date of `imei`'s most recent verified download for `company`, if any.
+/// Server-local date of the most recent verified download, by any of `company`'s
+/// devices, that included the card `key` (a `card_key`) in either slot — cards move
+/// between vehicles and slots, so it's the card that's due, not the vehicle. A full 16-character key
+/// must match exactly (a renewed or replacement card is a different card with its
+/// own data to download); a 14-character one, the driver identification without
+/// the indexes, matches any card it begins.
+fn last_verified_card_download_date(conn: &Connection, company: &str, key: &str) -> rusqlite::Result<Option<NaiveDate>> {
+    let date: Option<String> = conn.query_row(
+        "SELECT MAX(local_date) FROM downloads
+         WHERE company = ?1 AND verified = 1
+           AND (card_number = ?2 OR (length(?2) < 16 AND substr(card_number, 1, length(?2)) = ?2)
+                OR co_driver_card_number = ?2 OR (length(?2) < 16 AND substr(co_driver_card_number, 1, length(?2)) = ?2))",
+        params![company, key],
+        |row| row.get(0),
+    )?;
+    Ok(date.and_then(|d| NaiveDate::parse_from_str(&d, "%Y-%m-%d").ok()))
+}
+
+/// Server-local date of `imei`'s most recent verified download for `company` that
+/// included the VU's own data, if any - a card-only download doesn't reset the VU's
+/// interval. (`data_types` NULL is a download from before it was recorded: those
+/// always included the VU.)
 fn last_verified_download_date(conn: &Connection, company: &str, imei: &str) -> rusqlite::Result<Option<NaiveDate>> {
     let date: Option<String> = conn.query_row(
-        "SELECT MAX(local_date) FROM downloads WHERE company = ?1 AND imei = ?2 AND verified = 1",
-        params![company, imei],
+        "SELECT MAX(local_date) FROM downloads WHERE company = ?1 AND imei = ?2 AND verified = 1
+           AND (data_types IS NULL OR (data_types & ?3) != 0)",
+        params![company, imei, crate::device_protocol::data_types::VU as i64],
         |row| row.get(0),
     )?;
     Ok(date.and_then(|d| NaiveDate::parse_from_str(&d, "%Y-%m-%d").ok()))
@@ -263,6 +324,30 @@ pub async fn next_download_allowed_at(company: &str, imei: &str, interval_days: 
         })?;
     let now = Local::now();
     if now.date_naive() >= next {
+        return None;
+    }
+    Some(start_of_day(next))
+}
+
+/// Like `next_download_allowed_at`, but for the driver card `card_number` (as the
+/// device announced it): `None` means it's due now — no limit configured, a card
+/// number too short to look up, no verified download of that card on record, or
+/// the interval has passed since the last one.
+pub async fn next_card_download_allowed_at(company: &str, card_number: &str, interval_days: u32) -> Option<DateTime<Local>> {
+    let interval_days = interval_days.min(crate::config::MAX_CARD_DOWNLOAD_INTERVAL_DAYS);
+    if interval_days == 0 {
+        return None;
+    }
+    let key = card_key(card_number)?;
+    let company = company.to_string();
+    let last = tokio::task::spawn_blocking(move || with_db(None, |conn| last_verified_card_download_date(conn, &company, &key)))
+        .await
+        .unwrap_or_else(|e| {
+            log::error!("[DB] status=check_failed err={:?}", e);
+            None
+        })?;
+    let next = next_allowed_date(last, interval_days);
+    if Local::now().date_naive() >= next {
         return None;
     }
     Some(start_of_day(next))
@@ -621,7 +706,65 @@ mod tests {
             data_types: Some(0x01),
             bytes: 1234,
             file_path: None,
+            card_number: None,
+            co_driver_card_number: None,
         }
+    }
+
+    fn with_card(mut record: DownloadRecord, card_number: &str) -> DownloadRecord {
+        record.card_number = Some(card_number.to_string());
+        record
+    }
+
+    #[test]
+    fn card_keys_drop_the_country_and_anything_but_letters_and_digits() {
+        assert_eq!(card_key("UK 1234567890123456").as_deref(), Some("1234567890123456"));
+        assert_eq!(card_key("DB12135162163822").as_deref(), Some("DB12135162163822"));
+        assert_eq!(card_key("UKDB12135162163822").as_deref(), Some("DB12135162163822"));
+        assert_eq!(card_key("  db12135162163822  ").as_deref(), Some("DB12135162163822"));
+        assert_eq!(card_key("D 12345678901234").as_deref(), Some("12345678901234"));
+        assert_eq!(card_key(""), None);
+        assert_eq!(card_key("UK 123"), None);
+    }
+
+    #[test]
+    fn a_card_is_due_by_its_own_downloads_from_any_vehicle() {
+        let conn = test_db();
+        let other_imei = "490154203237518";
+        insert_download(&conn, &with_card(record("acme", IMEI, true), "DB12135162163822"), local(2026, 9, 20, 10, 0)).unwrap();
+        // The same card later in a different vehicle of the same company.
+        insert_download(&conn, &with_card(record("acme", other_imei, true), "DB12135162163822"), local(2026, 9, 23, 10, 0)).unwrap();
+        // Later still, but unverified - must not count.
+        insert_download(&conn, &with_card(record("acme", IMEI, false), "DB12135162163822"), local(2026, 9, 25, 10, 0)).unwrap();
+        // A different card.
+        insert_download(&conn, &with_card(record("acme", IMEI, true), "DB99999999999901"), local(2026, 9, 26, 10, 0)).unwrap();
+
+        let last = |key: &str| last_verified_card_download_date(&conn, "acme", key).unwrap();
+        assert_eq!(last("DB12135162163822"), NaiveDate::from_ymd_opt(2026, 9, 23));
+        // The driver identification alone matches whatever indexes the card has...
+        assert_eq!(last("DB121351621638"), NaiveDate::from_ymd_opt(2026, 9, 23));
+        // ...but a renewed card (different full number) is a card of its own.
+        assert_eq!(last("DB12135162163823"), None);
+        assert_eq!(last_verified_card_download_date(&conn, "other", "DB12135162163822").unwrap(), None);
+    }
+
+    #[test]
+    fn a_card_downloaded_from_the_co_driver_slot_counts_too() {
+        let conn = test_db();
+        let mut co_driver = record("acme", IMEI, true);
+        co_driver.co_driver_card_number = Some("UK DB12135162163822".to_string());
+        insert_download(&conn, &co_driver, local(2026, 9, 23, 10, 0)).unwrap();
+        assert_eq!(
+            last_verified_card_download_date(&conn, "acme", "DB12135162163822").unwrap(),
+            NaiveDate::from_ymd_opt(2026, 9, 23)
+        );
+    }
+
+    #[test]
+    fn downloads_without_a_card_are_never_matched_to_one() {
+        let conn = test_db();
+        insert_download(&conn, &record("acme", IMEI, true), local(2026, 9, 23, 10, 0)).unwrap();
+        assert_eq!(last_verified_card_download_date(&conn, "acme", "DB12135162163822").unwrap(), None);
     }
 
     fn local(y: i32, m: u32, d: u32, h: u32, min: u32) -> DateTime<Local> {
@@ -643,6 +786,26 @@ mod tests {
             NaiveDate::from_ymd_opt(2026, 9, 23)
         );
         assert_eq!(last_verified_download_date(&conn, "acme", "490154203237518").unwrap(), None);
+    }
+
+    #[test]
+    fn a_card_only_download_doesnt_count_for_the_vu() {
+        let conn = test_db();
+        insert_download(&conn, &record("acme", IMEI, true), local(2026, 9, 20, 10, 0)).unwrap();
+        let mut card_only = with_card(record("acme", IMEI, true), "DB12135162163822");
+        card_only.data_types = Some(crate::device_protocol::data_types::DRIVER_CARD);
+        insert_download(&conn, &card_only, local(2026, 9, 25, 10, 0)).unwrap();
+        // A download from before data_types was recorded always had the VU's data.
+        let mut legacy = record("acme", IMEI, true);
+        legacy.data_types = None;
+        insert_download(&conn, &legacy, local(2026, 9, 18, 10, 0)).unwrap();
+
+        assert_eq!(last_verified_download_date(&conn, "acme", IMEI).unwrap(), NaiveDate::from_ymd_opt(2026, 9, 20));
+        // ...but it does for the card.
+        assert_eq!(
+            last_verified_card_download_date(&conn, "acme", "DB12135162163822").unwrap(),
+            NaiveDate::from_ymd_opt(2026, 9, 25)
+        );
     }
 
     #[test]
