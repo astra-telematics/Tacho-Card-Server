@@ -442,7 +442,7 @@ async fn send_abort_message(stream: &mut WriteHalf<'_>, reason: AbortReason) {
     if let Err(e) = stream.write_all(&abort_bytes).await {
         log::warn!(
             "[TCP] peer={} action=send_abort err={:?}",
-            stream.peer_addr().unwrap(),
+            stream.peer_addr().map(|addr| addr.to_string()).unwrap_or_else(|_| "unknown".to_string()),
             e
         );
     }
@@ -638,7 +638,10 @@ async fn handle_connection(mut stream: TcpStream, peer_addr: SocketAddr, over_so
                         let reply = Message::Pong(crate::device_protocol::PongMessage {});
                         let reply_bytes: Vec<u8> = reply.into();
                         log::debug!("[TCP] peer={} message=Ping action=reply Pong, {:?}", peer_addr, reply_bytes);
-                        write_half.write_all(&reply_bytes).await.unwrap();
+                        if let Err(e) = write_half.write_all(&reply_bytes).await {
+                            log::warn!("[TCP] peer={} message=Ping action=reply_failed err={:?}", peer_addr, e);
+                            break;
+                        }
                     },
                     Message::Pong(_) => {
                         log::debug!("[TCP] peer={} message=Pong", peer_addr);

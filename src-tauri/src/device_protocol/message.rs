@@ -31,13 +31,23 @@ pub enum Message {
 pub struct MessageReader<'a> {
     stream: tokio::net::tcp::ReadHalf<'a>,
     buffer: Vec<u8>,
+    // Captured up front: `peer_addr()` fails once the socket has dropped
+    // (ENOTCONN), and a panic there kills the connection task before its cleanup
+    // runs, leaving the download listed as active in the UI forever.
+    peer: String,
 }
 
 impl MessageReader<'_> {
     pub fn new(stream: tokio::net::tcp::ReadHalf<'_>) -> MessageReader<'_> {
+        let peer = stream
+            .as_ref()
+            .peer_addr()
+            .map(|addr| addr.to_string())
+            .unwrap_or_else(|_| "unknown".to_string());
         MessageReader {
             stream,
             buffer: Vec::new(),
+            peer,
         }
     }
 
@@ -62,7 +72,7 @@ impl MessageReader<'_> {
                     Err(_) => return None, // Read error
                 }
             }
-            log::debug!("[TCP] peer={} buffer_len={} buffer={:?}", self.stream.as_ref().peer_addr().unwrap(), self.buffer.len(), self.buffer);
+            log::debug!("[TCP] peer={} buffer_len={} buffer={:?}", self.peer, self.buffer.len(), self.buffer);
 
             // We have header; read payload length and ensure full message present
             let payload_length = u16::from_be_bytes([self.buffer[3], self.buffer[4]]) as usize;
